@@ -434,8 +434,17 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     payment_attempt += 1;
                     // Like mppx's pending settlement, release the provider's
                     // hold on the Credential, which stays valid, so a callback
-                    // paying through this provider does not wait on it.
-                    pending.release();
+                    // paying through this provider does not wait on it. Only
+                    // a callback that can return a Credential needs that:
+                    // otherwise the Credential is resent under the hold, which
+                    // keeps a session provider's concurrent payments ordered.
+                    // A callback that declines gets the released Credential
+                    // resent: providers offer no way to take the hold again,
+                    // and one taken again could not undo a payment made while
+                    // it was free.
+                    if self.events.may_supply_credential() {
+                        pending.release();
+                    }
                     let override_credential = self
                         .events
                         .emit_challenge_received(ChallengeReceivedContext {
@@ -462,12 +471,20 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         // which is refused.
                         Some(credential) => {
                             let challenge = pending.challenge().clone();
-                            pending.rollback().await.map_err(HttpError::Payment)?;
-                            let pending = PendingPayment::new(
+                            // Track the replacement first, so it is settled
+                            // (and its provider hold freed) on every exit.
+                            let replacement = PendingPayment::new(
                                 self.provider.clone(),
                                 challenge.clone(),
                                 credential.clone(),
                             );
+                            if let Err(err) = pending.rollback().await {
+                                // The replacement was never sent. Its own
+                                // failed rollback is dropped as abandoned.
+                                let _ = replacement.rollback().await;
+                                return Err(HttpError::Payment(err).into());
+                            }
+                            let pending = replacement;
                             self.events
                                 .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
                                     challenge: challenge.clone(),

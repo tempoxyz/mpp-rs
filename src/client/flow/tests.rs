@@ -2153,6 +2153,9 @@ mod new_challenge_rounds {
         paid: Arc<Mutex<Vec<String>>>,
         commits: Arc<AtomicUsize>,
         rollbacks: Arc<AtomicUsize>,
+        /// Credentials (by signature) whose rollback fails after releasing
+        /// their lease.
+        failing_rollbacks: Arc<Mutex<Vec<String>>>,
     }
 
     impl LeasingProvider {
@@ -2169,6 +2172,11 @@ mod new_challenge_rounds {
 
         fn leases(&self) -> usize {
             self.leases.lock().unwrap().len()
+        }
+
+        /// Whether the Credential signed `signature` holds its lease.
+        fn holds(&self, signature: &str) -> bool {
+            self.leases.lock().unwrap().contains_key(signature)
         }
     }
 
@@ -2207,7 +2215,11 @@ mod new_challenge_rounds {
             _: &PaymentChallenge,
             credential: &PaymentCredential,
         ) -> Result<(), MppError> {
-            self.leases.lock().unwrap().remove(&lease_key(credential));
+            let key = lease_key(credential);
+            self.leases.lock().unwrap().remove(&key);
+            if self.failing_rollbacks.lock().unwrap().contains(&key) {
+                return Err(MppError::InvalidConfig("rollback failed".into()));
+            }
             self.rollbacks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -2439,6 +2451,117 @@ mod new_challenge_rounds {
             assert_eq!(credentials[0], credentials[1], "{via:?}");
             assert_eq!(provider.settled(), (1, 0), "{via:?}");
             assert_eq!(provider.leases(), 0, "{via:?}");
+        }
+    }
+
+    /// Without a callback that can return a Credential, a Challenge offered
+    /// again gets its Credential resent under the provider's lease, so a
+    /// concurrent request on the same provider pays only once the resend is
+    /// settled, as `TempoSessionProvider` keeps vouchers ordered.
+    #[tokio::test]
+    async fn reoffered_challenge_resend_keeps_the_lease_for_concurrent_requests() {
+        // 0: no handler; 1: an `on_any` observer returning `()`.
+        for observer in 0..2 {
+            for via in BOTH {
+                let provider = LeasingProvider::default();
+                let answered = Arc::new(AtomicUsize::new(0));
+                // (signature, its lease held, payments made) per Credential
+                // the server receives.
+                let arrivals = Arc::new(Mutex::new(Vec::new()));
+                let (url, seen) = spawn_credit_server({
+                    let provider = provider.clone();
+                    let answered = answered.clone();
+                    let arrivals = arrivals.clone();
+                    move |credential| match credential {
+                        None => challenged(&[charge("charge-1", "10000")], None),
+                        Some(credential) => {
+                            let signature = lease_key(credential);
+                            arrivals.lock().unwrap().push((
+                                signature.clone(),
+                                provider.holds(&signature),
+                                provider.paid().len(),
+                            ));
+                            if answered.fetch_add(1, Ordering::SeqCst) == 0 {
+                                challenged(
+                                    &[charge("charge-1", "10000")],
+                                    Some("verification-failed"),
+                                )
+                            } else {
+                                (StatusCode::OK, "paid").into_response()
+                            }
+                        }
+                    }
+                })
+                .await;
+                let events = ClientEvents::default();
+                let _sub = (observer == 1).then(|| events.on_any(|_| async {}));
+
+                let (first, second) = tokio::join!(
+                    get_with_events(via, &url, &provider, events.clone()),
+                    get_with_events(via, &url, &provider, events.clone()),
+                );
+
+                for response in [first, second] {
+                    let response = response.unwrap_or_else(|err| panic!("{via:?}: {err}"));
+                    assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+                }
+                // The resend arrives under the first Credential's lease,
+                // before the concurrent request could pay.
+                assert_eq!(
+                    *arrivals.lock().unwrap(),
+                    [
+                        ("0x7601".to_owned(), true, 1),
+                        ("0x7601".to_owned(), true, 1),
+                        ("0x7602".to_owned(), true, 2),
+                    ],
+                    "{via:?} observer {observer}"
+                );
+                assert_eq!(credentials(&seen).len(), 3, "{via:?}");
+                assert_eq!(provider.paid(), ["charge-1", "charge-1"], "{via:?}");
+                assert_eq!(provider.settled(), (2, 0), "{via:?}");
+                assert_eq!(provider.leases(), 0, "{via:?}");
+            }
+        }
+    }
+
+    /// When the Credential a callback's replacement refuses cannot be rolled
+    /// back, the flow fails without sending the replacement and leaves no
+    /// provider lease held, so later payments do not wait forever.
+    #[tokio::test]
+    async fn failed_rollback_of_a_replaced_credential_frees_the_replacement() {
+        let (url, seen, answered) = spawn_reoffering_server().await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            answered.store(0, Ordering::SeqCst);
+            let provider = LeasingProvider::default();
+            provider
+                .failing_rollbacks
+                .lock()
+                .unwrap()
+                .push("0x7601".to_owned());
+            let events = ClientEvents::default();
+            let _sub = events.on_challenge_received({
+                let provider = provider.clone();
+                move |ctx| {
+                    let provider = provider.clone();
+                    async move { provider.pay(&ctx.challenge).await.ok() }
+                }
+            });
+
+            let result = get_with_events(via, &url, &provider, events).await;
+
+            assert!(
+                matches!(result, Err(HttpError::Payment(_))),
+                "{via:?}: {result:?}"
+            );
+            assert_eq!(provider.paid(), ["charge-1", "charge-1"], "{via:?}");
+            // Only the refused Credential was sent; the unsent replacement is
+            // rolled back and its lease freed.
+            assert_eq!(credentials(&seen).len(), 1, "{via:?}");
+            assert_eq!(provider.leases(), 0, "{via:?}");
+            assert!(provider.lock.try_lock().is_ok(), "{via:?}");
+            assert_eq!(provider.settled(), (0, 1), "{via:?}");
         }
     }
 }

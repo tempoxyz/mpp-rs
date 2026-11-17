@@ -405,8 +405,9 @@ impl<P: PaymentProvider> PendingPayment<P> {
     /// The payment is still settled later by [`commit`](Self::commit),
     /// [`rollback`](Self::rollback) or [`invalidate`](Self::invalidate). As
     /// mppx settles a Challenge offered again as pending, the payment flow
-    /// releases its Credential before a `challenge.received` callback runs, so
-    /// a callback paying through the same provider does not wait on it.
+    /// releases its Credential before a `challenge.received` callback that can
+    /// return a Credential runs, so a callback paying through the same
+    /// provider does not wait on it.
     pub fn release(&self) {
         self.provider
             .abandon_payment(&self.challenge, &self.credential);
