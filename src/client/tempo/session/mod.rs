@@ -3074,9 +3074,11 @@ impl TempoSessionProvider {
     /// in memory, so the deposit is still reported.
     ///
     /// The server already accepted the deposit, so a failure to record it
-    /// reports an unknown outcome and blocks further top-ups of the channel,
-    /// rather than a configuration error a caller could answer by paying
-    /// another offer.
+    /// reports an unknown outcome rather than a configuration error a caller
+    /// could answer by paying another offer. The deposit is raised in memory
+    /// before it is stored, so a failed store write leaves the channel usable;
+    /// only a top-up that could not be applied in memory blocks further
+    /// top-ups of the channel.
     async fn record_top_up(
         &self,
         url: &str,
@@ -3086,10 +3088,21 @@ impl TempoSessionProvider {
         self.store_top_up(url, prepared, previous)
             .await
             .map_err(|error| {
-                self.uncertain_top_ups
+                let applied = self
+                    .channels
                     .lock()
                     .unwrap()
-                    .insert(prepared.channel_id);
+                    .get(&prepared.key)
+                    .is_some_and(|entry| {
+                        entry.channel_id == prepared.channel_id
+                            && entry.deposit >= prepared.new_deposit
+                    });
+                if !applied {
+                    self.uncertain_top_ups
+                        .lock()
+                        .unwrap()
+                        .insert(prepared.channel_id);
+                }
                 MppError::SessionPaymentOutcomeUnknown {
                     context: format!("accepted top-up could not be recorded: {error}"),
                 }
@@ -3116,11 +3129,13 @@ impl TempoSessionProvider {
         let amount = prepared.new_deposit.saturating_sub(previous);
         entry.cumulative_amount = entry.cumulative_amount.max(prepared.cumulative_amount);
         entry.opened = true;
-        self.persist_channel(&entry).await?;
+        // The server accepted the deposit, so memory takes it even if the
+        // store write below fails.
         self.channels
             .lock()
             .unwrap()
             .insert(prepared.key.clone(), entry.clone());
+        self.persist_channel(&entry).await?;
         self.notify_update(&entry);
         if amount > 0 {
             self.report_deposit(url, &entry, amount, false);
@@ -7838,12 +7853,19 @@ mod tests {
         );
         assert_eq!(*sends.lock().unwrap(), 1);
         assert_eq!(*charges.lock().unwrap(), 0);
-        // The channel takes no further top-up until it is reconciled.
-        assert!(session
+        // The accepted deposit is kept in memory, so the channel stays usable
+        // and later top-ups are not blocked by the failed store write.
+        assert!(!session
             .uncertain_top_ups
             .lock()
             .unwrap()
             .contains(&channel_id));
+        let entry = session
+            .channels()
+            .into_values()
+            .find(|entry| entry.channel_id == channel_id)
+            .unwrap();
+        assert!(entry.deposit > 1_000, "deposit {}", entry.deposit);
     }
 
     #[tokio::test]
