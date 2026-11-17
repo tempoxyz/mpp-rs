@@ -429,11 +429,18 @@ where
                 Err(error) => self.caller.payment_challenges_from_error(error),
             }
             .unwrap_or_default();
-            let Some(challenge) = self.payment.select(&challenges)? else {
-                // Nothing payable after a credential is the server's final answer.
-                if let Some(previous) = previous.take() {
-                    previous.rollback().await?;
+            let selected = match self.payment.select(&challenges) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    // An expired or cross-realm Challenge ends the call, so a
+                    // refused Credential is settled as refused first.
+                    reject(previous.take()).await?;
+                    return Err(error.into());
                 }
+            };
+            let Some(challenge) = selected else {
+                // Nothing payable after a credential is the server's final answer.
+                reject(previous.take()).await?;
                 return response.map_err(McpClientError::Transport);
             };
 
@@ -505,9 +512,7 @@ where
             }
         }
         // The payment requirement answering the last round is final.
-        if let Some(previous) = previous {
-            previous.rollback().await?;
-        }
+        reject(previous).await?;
         response.map_err(McpClientError::Transport)
     }
 
@@ -516,6 +521,15 @@ where
             Ok(output) => self.caller.payment_answer_from_output(output),
             Err(error) => self.caller.payment_answer_from_error(error),
         }
+    }
+}
+
+/// Settles a previous round's Credential as refused: the server answered it
+/// with a payment requirement that the call does not answer with it again.
+async fn reject<P: PaymentProvider>(previous: Option<PendingPayment<P>>) -> Result<(), MppError> {
+    match previous {
+        Some(previous) => previous.rollback().await,
+        None => Ok(()),
     }
 }
 
@@ -1718,6 +1732,10 @@ mod tests {
             assert!(matches!(error, McpClientError::Transport(_)));
             assert_eq!(provider.paid(), ["proof-1"]);
             assert_eq!(caller.calls.lock().unwrap().len(), 2);
+            // The refused proof is rolled back, not only abandoned.
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]
@@ -1736,6 +1754,10 @@ mod tests {
             assert!(matches!(error, McpClientError::Payment(_)));
             assert_eq!(provider.paid(), ["proof-1"]);
             assert_eq!(caller.calls.lock().unwrap().len(), 2);
+            // The refused proof is rolled back, not only abandoned.
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
         }
 
         #[tokio::test]
@@ -1750,6 +1772,10 @@ mod tests {
             assert!(matches!(error, McpClientError::Payment(_)));
             assert_eq!(provider.paid(), ["proof-1"]);
             assert_eq!(caller.calls.lock().unwrap().len(), 2);
+            // The refused proof is rolled back, not only abandoned.
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
         }
 
         /// `problem` offering `challenges` in a tool result, as

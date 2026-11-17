@@ -2081,6 +2081,8 @@ mod new_challenge_rounds {
             assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
             assert_eq!(provider.paid(), ["proof-1"], "{via:?}");
             assert_eq!(credential_ids(&seen), ["proof-1"], "{via:?}");
+            // The refused proof is rolled back once; nothing is committed.
+            assert_eq!(provider.settled(), (0, 1), "{via:?}");
         }
     }
 
@@ -2106,6 +2108,8 @@ mod new_challenge_rounds {
             );
             assert_eq!(provider.paid(), ["proof-1"], "{via:?}");
             assert_eq!(credential_ids(&seen), ["proof-1"], "{via:?}");
+            // The refused proof is rolled back once; nothing is committed.
+            assert_eq!(provider.settled(), (0, 1), "{via:?}");
         }
     }
 
@@ -2132,6 +2136,8 @@ mod new_challenge_rounds {
             );
             assert_eq!(provider.paid(), ["proof-1"], "{via:?}");
             assert_eq!(credential_ids(&seen), ["proof-1"], "{via:?}");
+            // The refused proof is rolled back once; nothing is committed.
+            assert_eq!(provider.settled(), (0, 1), "{via:?}");
         }
     }
 }
