@@ -214,18 +214,26 @@ where
                 ));
             }
 
-            let paid = match management {
-                Some(management) => {
-                    self.provider
-                        .pay_with_management(&challenge, self.context.clone(), management)
-                        .await
-                }
-                None => {
-                    self.provider
-                        .pay_with_context(&challenge, self.context.clone())
-                        .await
-                }
-            };
+            // A Zone withdrawal still settling is resumed for this challenge,
+            // not paid again.
+            let paid = crate::client::resume_pending_settlement(
+                crate::client::DEFAULT_MAX_PAYMENT_RETRIES,
+                || async {
+                    match management {
+                        Some(management) => {
+                            self.provider
+                                .pay_with_management(&challenge, self.context.clone(), management)
+                                .await
+                        }
+                        None => {
+                            self.provider
+                                .pay_with_context(&challenge, self.context.clone())
+                                .await
+                        }
+                    }
+                },
+            )
+            .await;
             match paid {
                 Ok(credential) => {
                     return Ok(Some(PendingPayment::new(
@@ -236,7 +244,9 @@ where
                 }
                 Err(
                     error @ (MppError::PaymentOutcomeUnknown { .. }
-                    | MppError::SessionPaymentOutcomeUnknown { .. }),
+                    | MppError::SessionPaymentOutcomeUnknown { .. }
+                    | MppError::ZoneSettlementPending { .. }
+                    | MppError::ZoneWithdrawalBounced { .. }),
                 ) => return Err(error),
                 Err(error) => {
                     failure.get_or_insert(error);
@@ -912,7 +922,7 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct AmbiguousProvider(Arc<AtomicUsize>, bool);
+    struct AmbiguousProvider(Arc<AtomicUsize>, u8);
 
     impl PaymentProvider for AmbiguousProvider {
         fn supports(&self, method: &str, intent: &str) -> bool {
@@ -920,22 +930,26 @@ mod tests {
         }
         async fn pay(&self, _: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
             self.0.fetch_add(1, Ordering::SeqCst);
-            if self.1 {
-                Err(MppError::SessionPaymentOutcomeUnknown {
-                    context: "top-up timed out".into(),
-                })
-            } else {
-                Err(MppError::PaymentOutcomeUnknown {
+            Err(match self.1 {
+                0 => MppError::PaymentOutcomeUnknown {
                     transaction_hash: "0x1234".into(),
-                })
-            }
+                },
+                1 => MppError::SessionPaymentOutcomeUnknown {
+                    context: "top-up timed out".into(),
+                },
+                _ => MppError::ZoneWithdrawalBounced {
+                    challenge_id: "challenge-1".into(),
+                    sender_tag: "0x22".into(),
+                    zone_id: 3,
+                },
+            })
         }
     }
 
     #[tokio::test]
     async fn ambiguous_payment_does_not_try_another_offer() {
-        for session in [false, true] {
-            let provider = AmbiguousProvider(Arc::new(AtomicUsize::new(0)), session);
+        for kind in 0..3 {
+            let provider = AmbiguousProvider(Arc::new(AtomicUsize::new(0)), kind);
             let payment = McpPayment::new(provider.clone(), context());
             let first = challenge();
             let mut second = challenge();
@@ -945,6 +959,7 @@ mod tests {
                 error,
                 MppError::PaymentOutcomeUnknown { .. }
                     | MppError::SessionPaymentOutcomeUnknown { .. }
+                    | MppError::ZoneWithdrawalBounced { .. }
             ));
             assert_eq!(provider.0.load(Ordering::SeqCst), 1);
         }

@@ -29,12 +29,35 @@ where
     /// Stamp configured `opaque` and credential `header` onto an issued
     /// challenge and recompute its HMAC id. No-op when neither is configured.
     #[cfg(any(feature = "tempo", feature = "stripe"))]
-    pub(super) fn apply_pinned_opaque(&self, mut challenge: PaymentChallenge) -> PaymentChallenge {
-        if self.config.opaque.is_none() && self.config.credential_header.is_none() {
+    pub(super) fn apply_pinned_opaque(&self, challenge: PaymentChallenge) -> PaymentChallenge {
+        self.apply_issuance_opaque(challenge, false)
+    }
+
+    /// [`apply_pinned_opaque`](Self::apply_pinned_opaque) for a Tempo charge
+    /// challenge: while `zone_credential_grace` is on, its `opaque` also
+    /// carries the HMAC-bound expiry grace marker (`_mppx_expiry_grace`), as
+    /// mppx's `CredentialExpiry.issuanceMeta`. Only a challenge issued with
+    /// the marker gets the grace.
+    #[cfg(feature = "tempo")]
+    pub(super) fn apply_charge_opaque(&self, challenge: PaymentChallenge) -> PaymentChallenge {
+        self.apply_issuance_opaque(challenge, !self.config.zone_credential_grace.is_zero())
+    }
+
+    #[cfg(any(feature = "tempo", feature = "stripe"))]
+    fn apply_issuance_opaque(
+        &self,
+        mut challenge: PaymentChallenge,
+        expiry_grace: bool,
+    ) -> PaymentChallenge {
+        if self.config.opaque.is_none() && self.config.credential_header.is_none() && !expiry_grace
+        {
             return challenge;
         }
-        if let Some(opaque) = &self.config.opaque {
-            challenge.opaque = Some(opaque.clone());
+        if self.config.opaque.is_some() || expiry_grace {
+            challenge.opaque = crate::protocol::core::expiry_grace::with_expiry_grace(
+                self.config.opaque.as_ref(),
+                expiry_grace,
+            );
         }
         challenge.header = self.config.credential_header.clone();
         challenge.id = crate::protocol::core::compute_challenge_id_with_header(
@@ -166,6 +189,9 @@ where
                 validate_charge_modes(supported_modes)?;
                 details.insert("supportedModes".into(), serde_json::json!(supported_modes));
             }
+            if let Some(zones) = &self.config.zones {
+                details.insert("zones".into(), zones.clone());
+            }
             if !details.is_empty() {
                 request.method_details = Some(serde_json::Value::Object(details));
             }
@@ -177,7 +203,7 @@ where
             options.expires,
             options.description,
         )?;
-        Ok(self.apply_pinned_opaque(challenge))
+        Ok(self.apply_charge_opaque(challenge))
     }
 
     /// Generate a charge challenge with explicit parameters (base units).
@@ -211,16 +237,36 @@ where
     ) -> Result<PaymentChallenge> {
         // Verification fails closed on a missing `chainId` when one is pinned,
         // so a caller-built request must carry it like `charge()` requests do.
+        // Configured Zones bind credentials to the route the same way, so
+        // they are advertised here as `charge()` advertises them.
         let mut request = request.clone();
-        if let Some(chain_id) = self.config.chain_id {
+        if self.config.chain_id.is_some() || self.config.zones.is_some() {
             let details = request
                 .method_details
                 .get_or_insert_with(|| serde_json::json!({}));
             if let Some(details) = details.as_object_mut() {
-                details
-                    .entry("chainId")
-                    .or_insert_with(|| serde_json::json!(chain_id));
+                if let Some(chain_id) = self.config.chain_id {
+                    details
+                        .entry("chainId")
+                        .or_insert_with(|| serde_json::json!(chain_id));
+                }
+                if let Some(zones) = &self.config.zones {
+                    details.entry("zones").or_insert_with(|| zones.clone());
+                }
             }
+        }
+        // A relay does not verify Zone credentials, and a payer's Zone
+        // withdrawal cannot be undone once the relay rejects its credential.
+        if self.config.relay
+            && request
+                .method_details
+                .as_ref()
+                .and_then(|details| details.get("zones"))
+                .is_some_and(|zones| !zones.is_null())
+        {
+            return Err(crate::error::MppError::InvalidConfig(
+                "methodDetails.zones cannot be issued with relay(...): the relay does not verify Zone credentials".into(),
+            ));
         }
         let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
             &self.config.secret_key,
@@ -229,7 +275,7 @@ where
             expires,
             description,
         )?;
-        Ok(self.apply_pinned_opaque(challenge))
+        Ok(self.apply_charge_opaque(challenge))
     }
 
     /// The charge request [`charge_with_options()`](Self::charge_with_options)

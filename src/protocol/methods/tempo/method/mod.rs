@@ -56,6 +56,7 @@ mod proof_credential;
 mod receipt_logs;
 mod simulate;
 mod transaction_credential;
+mod zone_credential;
 
 pub use fee_payer::{FeePayerPolicy, FeePayerPolicyOverride};
 pub use hosted_fee_payer::RemoteFeePayer;
@@ -63,10 +64,37 @@ pub use receipt_logs::{SenderValidation, ValidateSenderCallback};
 pub use simulate::{PaymentSimulationError, PaymentSimulationPhase};
 
 use transaction_credential::ensure_transaction_credential_source;
+use zone_credential::ensure_zone_credential_has_no_source;
+
+/// A relay verifies Credentials itself, without the local check that a late
+/// `zone` Credential settled before its challenge expired, so it can't honor
+/// `zone_credential_grace` safely, as mppx refuses `zoneCredentialGraceMs`
+/// with `relay`.
+fn relay_grace_error() -> crate::error::MppError {
+    crate::error::MppError::InvalidConfig(
+        "zone_credential_grace is not supported with relay(...)".into(),
+    )
+}
+
+/// Reject a Zone credential in relay mode: the relay does not verify Zone
+/// credentials, so it must not be handed one.
+fn reject_relayed_zone_credential(credential: &PaymentCredential) -> Result<(), VerificationError> {
+    if credential
+        .charge_payload()
+        .is_ok_and(|payload| payload.is_zone())
+    {
+        return Err(VerificationError::with_code(
+            "Zone credentials are not supported with a relay.",
+            crate::protocol::traits::ErrorCode::InvalidCredential,
+        ));
+    }
+    Ok(())
+}
 
 /// Reject a credential whose submission mode the challenge does not allow.
 ///
-/// `type="hash"` is `push` mode and `type="transaction"` is `pull` mode.
+/// `type="hash"` and `type="zone"` are `push` mode and `type="transaction"` is
+/// `pull` mode.
 /// `methodDetails.supportedModes`, when present, lists the allowed modes.
 /// Proof credentials are exempt: zero-amount charges have no submission mode.
 fn ensure_submission_mode_allowed(
@@ -75,6 +103,8 @@ fn ensure_submission_mode_allowed(
 ) -> Result<(), VerificationError> {
     let (mode, kind) = if payload.is_hash() {
         ("push", "Hash")
+    } else if payload.is_zone() {
+        ("push", "Zone")
     } else if payload.is_transaction() {
         ("pull", "Transaction")
     } else {
@@ -120,6 +150,8 @@ fn ensure_submission_mode_allowed(
 ///
 /// - `hash`: Client already broadcast the transaction, provides tx hash
 /// - `transaction`: Client provides signed transaction for server to broadcast
+/// - `zone`: A Zone withdrawal settled on Tempo paid the recipient; the client
+///   provides the settlement transaction hash and the withdrawal's sender tag
 ///
 /// # Example
 ///
@@ -157,6 +189,7 @@ pub struct ChargeMethod<P> {
     relay: Option<Relay>,
     fee_payer_fee_token: Option<Address>,
     remote_fee_payer: Option<hosted_fee_payer::HostedFeePayer>,
+    zone_credential_grace: std::time::Duration,
 }
 
 impl<P> ChargeMethod<P>
@@ -197,14 +230,57 @@ where
             relay: None,
             fee_payer_fee_token: None,
             remote_fee_payer: None,
+            zone_credential_grace: std::time::Duration::ZERO,
         }
+    }
+
+    /// Accept a `zone` Credential this long after its challenge expires, as
+    /// mppx's `zoneCredentialGraceMs`. Defaults to zero.
+    ///
+    /// A Zone withdrawal can settle on Tempo shortly before its challenge
+    /// expires and reach the server only after. Within the grace, a `zone`
+    /// Credential for an expired challenge is accepted when the block of its
+    /// settlement is older than the expiry. Other Credential types get no grace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `grace` exceeds
+    /// [`MAX_ZONE_CREDENTIAL_GRACE`](super::zone::MAX_ZONE_CREDENTIAL_GRACE), the
+    /// longest a client waits before it may pay for the same terms again, or
+    /// when a relay is configured: a relay verifies Credentials without the
+    /// check that a late `zone` Credential settled before its challenge
+    /// expired.
+    pub fn with_zone_credential_grace(
+        mut self,
+        grace: std::time::Duration,
+    ) -> crate::error::Result<Self> {
+        if self.relay.is_some() && !grace.is_zero() {
+            return Err(relay_grace_error());
+        }
+        if grace > super::zone::MAX_ZONE_CREDENTIAL_GRACE {
+            return Err(crate::error::MppError::InvalidConfig(format!(
+                "zone_credential_grace must be at most {}ms, got {}ms",
+                super::zone::MAX_ZONE_CREDENTIAL_GRACE.as_millis(),
+                grace.as_millis()
+            )));
+        }
+        self.zone_credential_grace = grace;
+        Ok(self)
     }
 
     /// Delegate credential validation and finalization to a Tempo API relay.
     ///
     /// The relay broadcasts pull credentials and finalizes already-broadcast
     /// push credentials without submitting them again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid relay configuration, or when a
+    /// `zone_credential_grace` is set.
     pub fn with_relay(mut self, config: RelayConfig) -> crate::error::Result<Self> {
+        if !self.zone_credential_grace.is_zero() {
+            return Err(relay_grace_error());
+        }
         self.relay = Some(Relay::new(config)?);
         Ok(self)
     }
@@ -259,9 +335,10 @@ where
     /// in-memory store.
     ///
     /// Each verified transaction hash is recorded and subsequent attempts to
-    /// replay the same hash are rejected. Zero-amount proof challenges are
-    /// likewise made single-use per challenge id. Pass a shared backend (Redis,
-    /// SQL, etc.) when several instances verify credentials for the same realm.
+    /// replay the same hash are rejected. Zone withdrawals are likewise made
+    /// single-use per portal and sender tag, and zero-amount proof challenges
+    /// per challenge id. Pass a shared backend (Redis, SQL, etc.) when several
+    /// instances verify credentials for the same realm.
     ///
     /// The store must support atomic [`Store::put_if_absent`], else verification
     /// fails closed with `StoreError::AtomicUnsupported`.
@@ -395,6 +472,12 @@ where
                 .await?;
             payer = hash_payer;
             serde_json::json!({ "mode": "push" })
+        } else if payload.is_zone() {
+            ensure_zone_credential_has_no_source(credential.source.as_deref())?;
+            self.verify_zone(&payload, request, &credential.challenge, false)
+                .await?;
+            payer = None;
+            serde_json::json!({ "mode": "push" })
         } else if payload.is_proof() {
             if !is_zero_amount {
                 return Err(VerificationError::new(
@@ -492,6 +575,14 @@ where
         true
     }
 
+    fn zone_credential_grace(&self) -> std::time::Duration {
+        self.zone_credential_grace
+    }
+
+    fn verifies_zone_credentials(&self) -> bool {
+        self.relay.is_none()
+    }
+
     fn validate(
         &self,
         credential: &PaymentCredential,
@@ -503,7 +594,10 @@ where
         let request = request.clone();
         async move {
             match relay {
-                Some(relay) => relay.validate(&credential, &request).await,
+                Some(relay) => {
+                    reject_relayed_zone_credential(&credential)?;
+                    relay.validate(&credential, &request).await
+                }
                 None => this.validate_local(&credential, &request).await,
             }
         }
@@ -519,6 +613,7 @@ where
         let request = request.clone();
         async move {
             if let Some(relay) = &this.relay {
+                reject_relayed_zone_credential(&credential)?;
                 relay.broadcast(&credential, METHOD_NAME).await
             } else {
                 ChargeMethodTrait::verify(&this, &credential, &request).await
@@ -550,6 +645,7 @@ where
 
         async move {
             if let Some(relay) = relay {
+                reject_relayed_zone_credential(&credential)?;
                 relay.validate(&credential, &request).await?;
                 return relay.broadcast(&credential, METHOD_NAME).await;
             }
@@ -615,6 +711,10 @@ where
                 )
                 .await
                 .map(|(receipt, _)| receipt)
+            } else if charge_payload.is_zone() {
+                ensure_zone_credential_has_no_source(credential.source.as_deref())?;
+                this.verify_zone(&charge_payload, &request, &credential.challenge, true)
+                    .await
             } else if charge_payload.is_proof() {
                 if !is_zero_amount {
                     return Err(VerificationError::new(
