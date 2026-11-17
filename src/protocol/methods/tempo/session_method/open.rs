@@ -192,6 +192,14 @@ where
                     expected_token,
                     Self::resolve_operator(details)?,
                 )?;
+                precompile::verify_open_source(
+                    &*self.provider,
+                    credential.source.as_deref(),
+                    chain_id,
+                    descriptor.payer,
+                    &tx_bytes,
+                )
+                .await?;
                 (Some(descriptor), signer, deposit)
             } else {
                 let (signer, deposit) = Self::verify_open_channel_id_binding(

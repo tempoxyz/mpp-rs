@@ -396,6 +396,90 @@ pub(super) fn verify_open(
     Ok((d, signer, deposit))
 }
 
+/// Bind an opening credential's source to the payer its signed transaction
+/// authenticates.
+///
+/// A credential without a source is accepted. Otherwise the source must name
+/// the transaction's payer on this chain, proven by the transaction's
+/// signature: a direct signature by the payer, an access key the transaction
+/// itself authorizes (signed by the payer, for this chain and unexpired), or
+/// an access key the payer authorized earlier that is neither revoked nor
+/// expired on chain. Mirrors mppx's `assertCredentialSourceIsPayer`.
+pub(super) async fn verify_open_source<P: Provider<TempoNetwork>>(
+    provider: &P,
+    source: Option<&str>,
+    chain_id: u64,
+    payer: Address,
+    tx_bytes: &[u8],
+) -> Result<(), VerificationError> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    let parsed = crate::protocol::methods::tempo::proof::parse_proof_source(source)
+        .map_err(|_| VerificationError::new("credential source is invalid"))?;
+    if parsed.chain_id != chain_id {
+        return Err(VerificationError::new("credential source is invalid"));
+    }
+    if parsed.address != payer {
+        return Err(VerificationError::new(
+            "credential source does not match transaction payer",
+        ));
+    }
+    // Unavailable authorization state cannot authenticate a claimed identity.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX);
+    if !signature_authenticates_payer(provider, chain_id, payer, tx_bytes, now)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(VerificationError::new(
+            "credential source is not authenticated by transaction signature",
+        ));
+    }
+    Ok(())
+}
+
+async fn signature_authenticates_payer<P: Provider<TempoNetwork>>(
+    provider: &P,
+    chain_id: u64,
+    payer: Address,
+    tx_bytes: &[u8],
+    now: u64,
+) -> Option<bool> {
+    use tempo_alloy::provider::ext::TempoProviderExt;
+
+    let tx_data = match tx_bytes.first() {
+        Some(&tempo_alloy::primitives::transaction::TEMPO_TX_TYPE_ID) => &tx_bytes[1..],
+        _ => tx_bytes,
+    };
+    let signed = tempo_alloy::primitives::AASigned::rlp_decode(&mut &tx_data[..]).ok()?;
+    let sig_hash = signed.signature_hash();
+    let keychain = match signed.signature() {
+        TempoSignature::Primitive(signature) => {
+            return Some(signature.recover_signer(&sig_hash).ok()? == payer);
+        }
+        TempoSignature::Keychain(keychain) => keychain,
+    };
+    if keychain.user_address != payer {
+        return Some(false);
+    }
+    let access_key = keychain.key_id(&sig_hash).ok()?;
+    if let Some(authorization) = &signed.tx().key_authorization {
+        // The transaction authorizes its own access key: the payer must sign
+        // that authorization, for this chain, and it must not have expired.
+        return Some(
+            authorization.key_id == access_key
+                && authorization.recover_signer().ok()? == payer
+                && (authorization.chain_id == 0 || authorization.chain_id == chain_id)
+                && authorization.expiry.is_none_or(|expiry| expiry.get() > now),
+        );
+    }
+    let key = provider.get_keychain_key(payer, access_key).await.ok()?;
+    Some(!key.isRevoked && key.expiry > now)
+}
+
 /// Check a client-signed precompile topUp for `descriptor` and `additional_deposit`.
 pub(super) fn verify_top_up(
     tx_bytes: &[u8],
