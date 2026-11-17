@@ -252,6 +252,8 @@ where
                 Err(
                     error @ (MppError::PaymentOutcomeUnknown { .. }
                     | MppError::SessionPaymentOutcomeUnknown { .. }
+                    | MppError::UnknownPaymentOutcome { .. }
+                    | MppError::Http(_)
                     | MppError::ZoneSettlementPending { .. }
                     | MppError::ZoneWithdrawalBounced { .. }),
                 ) => return Err(error),
