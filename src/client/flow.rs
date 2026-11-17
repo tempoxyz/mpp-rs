@@ -936,7 +936,7 @@ fn session_receipt_within_authorization(receipt: &Receipt, credential: &PaymentC
 /// Tempo charge whose transaction the client already broadcast or a Zone
 /// withdrawal: releasing it would lose a payment that can still be presented,
 /// and a retry would pay again.
-fn already_settled(credential: &PaymentCredential) -> bool {
+pub(crate) fn already_settled(credential: &PaymentCredential) -> bool {
     matches!(
         credential.payload.get("type").and_then(|v| v.as_str()),
         Some("hash" | "zone")

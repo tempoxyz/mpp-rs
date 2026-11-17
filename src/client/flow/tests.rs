@@ -1511,3 +1511,471 @@ async fn settling_zone_withdrawal_is_resumed_for_the_same_challenge() {
         assert_eq!(challenged.load(Ordering::SeqCst), 1, "{via:?}");
     }
 }
+
+/// A zero-amount Tempo proof refused with a \`credit_insufficient\` 402 that
+/// offers only the real charge starts a new challenge round, as mppx's client
+/// does. These use the real [\`TempoProvider\`](crate::client::TempoProvider) to
+/// sign proofs and apply its spending policy.
+#[cfg(feature = "tempo")]
+mod new_challenge_rounds {
+    use axum::http::header::CONTENT_TYPE;
+    use axum::routing::any;
+
+    use super::*;
+    use crate::client::{TempoProvider, DEFAULT_MAX_PAYMENT_RETRIES};
+    use crate::protocol::core::parse_authorization;
+
+    const CURRENCY: &str = "0x20c0000000000000000000000000000000000000";
+    const RECIPIENT: &str = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2";
+    const CHAIN_ID: u64 = 42431;
+    const REALM: &str = "127.0.0.1";
+
+    /// Signs zero-amount proofs with a real \`TempoProvider\` and its policy,
+    /// and pays any other charge with a pull-mode transaction credential (no
+    /// RPC), recording every challenge it creates a credential for.
+    #[derive(Clone)]
+    struct CreditProvider {
+        tempo: TempoProvider,
+        paid: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl CreditProvider {
+        /// Charges are capped at 10000 base units of \`CURRENCY\`.
+        fn new() -> Self {
+            let signer = alloy::signers::local::PrivateKeySigner::random();
+            let tempo = TempoProvider::new(signer, "https://rpc.example.com")
+                .unwrap()
+                .with_expected_chain_id(CHAIN_ID)
+                .with_currencies([CURRENCY])
+                .with_max_atomic_amount(alloy::primitives::U256::from(10_000));
+            Self {
+                tempo,
+                paid: Arc::default(),
+            }
+        }
+
+        fn paid(&self) -> Vec<String> {
+            self.paid.lock().unwrap().clone()
+        }
+    }
+
+    impl PaymentProvider for CreditProvider {
+        fn supports(&self, method: &str, intent: &str) -> bool {
+            self.tempo.supports(method, intent)
+        }
+
+        fn select_challenge<'a>(
+            &self,
+            challenges: &[&'a PaymentChallenge],
+        ) -> Option<&'a PaymentChallenge> {
+            self.tempo.select_challenge(challenges)
+        }
+
+        fn trusted_tempo_proof_realm(&self, url: &reqwest::Url) -> Option<&str> {
+            self.tempo.trusted_tempo_proof_realm(url)
+        }
+
+        fn accept_payment_header(&self) -> Option<String> {
+            self.tempo.accept_payment_header()
+        }
+
+        async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+            self.paid.lock().unwrap().push(challenge.id.clone());
+            let request: crate::protocol::intents::ChargeRequest = challenge.request.decode()?;
+            if request.amount == "0" {
+                return self.tempo.pay(challenge).await;
+            }
+            Ok(PaymentCredential::new(
+                challenge.to_echo(),
+                PaymentPayload::transaction("0x76signed"),
+            ))
+        }
+    }
+
+    fn charge_in(id: &str, realm: &str, amount: &str) -> PaymentChallenge {
+        let request = Base64UrlJson::from_value(&serde_json::json!({
+            "amount": amount,
+            "currency": CURRENCY,
+            "recipient": RECIPIENT,
+            "methodDetails": { "chainId": CHAIN_ID }
+        }))
+        .unwrap();
+        PaymentChallenge::new(id, realm, "tempo", "charge", request)
+    }
+
+    fn charge(id: &str, amount: &str) -> PaymentChallenge {
+        charge_in(id, REALM, amount)
+    }
+
+    /// The server's offer before payment: a zero-amount proof, then the real charge.
+    fn proof_then_charge() -> axum::response::Response {
+        challenged(&[charge("proof-1", "0"), charge("charge-1", "10000")], None)
+    }
+
+    fn challenged(
+        challenges: &[PaymentChallenge],
+        reason: Option<&str>,
+    ) -> axum::response::Response {
+        let body = reason.map_or_else(String::new, |reason| {
+            serde_json::json!({
+                "type": format!("https://paymentauth.org/problems/{reason}"),
+                "title": "Payment Required",
+                "status": 402,
+            })
+            .to_string()
+        });
+        let mut response = (
+            StatusCode::PAYMENT_REQUIRED,
+            [(CONTENT_TYPE, "application/problem+json")],
+            body,
+        )
+            .into_response();
+        for challenge in challenges {
+            response.headers_mut().append(
+                WWW_AUTHENTICATE,
+                format_www_authenticate(challenge).unwrap().parse().unwrap(),
+            );
+        }
+        response
+    }
+
+    #[derive(Clone, Debug)]
+    struct Seen {
+        method: String,
+        body: String,
+        marker: Option<String>,
+        credential: Option<PaymentCredential>,
+    }
+
+    /// Serves \`respond\` for every request, recording each one.
+    async fn spawn_credit_server<F>(respond: F) -> (String, Arc<Mutex<Vec<Seen>>>)
+    where
+        F: Fn(Option<&PaymentCredential>) -> axum::response::Response
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+    {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new().route(
+            "/paid",
+            any({
+                let seen = seen.clone();
+                move |request: Request<Body>| async move {
+                    let (parts, body) = request.into_parts();
+                    let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+                    let credential = parts
+                        .headers
+                        .get("authorization")
+                        .map(|value| parse_authorization(value.to_str().unwrap()).unwrap());
+                    let response = respond(credential.as_ref());
+                    seen.lock().unwrap().push(Seen {
+                        method: parts.method.to_string(),
+                        body: String::from_utf8(body.to_vec()).unwrap(),
+                        marker: parts
+                            .headers
+                            .get("x-marker")
+                            .map(|value| value.to_str().unwrap().to_owned()),
+                        credential,
+                    });
+                    response
+                }
+            }),
+        );
+        (spawn_server(app).await, seen)
+    }
+
+    fn paid_id(credential: Option<&PaymentCredential>) -> Option<String> {
+        credential.map(|credential| credential.challenge.id.clone())
+    }
+
+    fn credential_ids(seen: &Mutex<Vec<Seen>>) -> Vec<String> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|seen| paid_id(seen.credential.as_ref()))
+            .collect()
+    }
+
+    async fn send(
+        via: Via,
+        request: reqwest::RequestBuilder,
+        provider: &CreditProvider,
+    ) -> Result<reqwest::Response, HttpError> {
+        match via {
+            Via::Fetch => {
+                request
+                    .send_with_payment_options(
+                        provider,
+                        &AcceptPaymentPolicy::Always,
+                        ClientEvents::default(),
+                    )
+                    .await
+            }
+            Via::Middleware => {
+                let (client, request) = request.build_split();
+                ClientBuilder::new(client.clone())
+                    .with(
+                        PaymentMiddleware::new(provider.clone())
+                            .with_accept_payment_policy(AcceptPaymentPolicy::Always),
+                    )
+                    .build()
+                    .execute(request.unwrap())
+                    .await
+                    .map_err(|err| match err {
+                        reqwest_middleware::Error::Middleware(err) => err.downcast().unwrap(),
+                        reqwest_middleware::Error::Reqwest(err) => HttpError::Request(err),
+                    })
+            }
+        }
+    }
+
+    async fn get(
+        via: Via,
+        url: &str,
+        provider: &CreditProvider,
+    ) -> Result<reqwest::Response, HttpError> {
+        send(
+            via,
+            reqwest::Client::new().get(format!("{url}/paid")),
+            provider,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn refused_proof_then_real_charge_is_paid() {
+        let (url, seen) = spawn_credit_server(|credential| match paid_id(credential).as_deref() {
+            None => proof_then_charge(),
+            Some("proof-1") => {
+                challenged(&[charge("charge-2", "10000")], Some("credit_insufficient"))
+            }
+            Some("charge-2") => (StatusCode::OK, "paid").into_response(),
+            Some(other) => panic!("unexpected credential for {other}"),
+        })
+        .await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            let provider = CreditProvider::new();
+            let request = reqwest::Client::new()
+                .post(format!("{url}/paid"))
+                .header("x-marker", "kept")
+                .body("request-body");
+            let response = send(via, request, &provider)
+                .await
+                .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+            assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+            assert_eq!(response.text().await.unwrap(), "paid", "{via:?}");
+            assert_eq!(provider.paid(), ["proof-1", "charge-2"], "{via:?}");
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 3, "{via:?}");
+            // Exactly two credentials: the proof, then the new real charge.
+            let credentials: Vec<_> = seen.iter().filter_map(|s| s.credential.clone()).collect();
+            assert_eq!(credentials.len(), 2, "{via:?}");
+            assert_eq!(credentials[0].challenge.id, "proof-1", "{via:?}");
+            assert!(
+                credentials[0].charge_payload().unwrap().is_proof(),
+                "{via:?}"
+            );
+            assert_eq!(credentials[1].challenge.id, "charge-2", "{via:?}");
+            assert!(
+                !credentials[1].charge_payload().unwrap().is_proof(),
+                "{via:?}"
+            );
+            // Every retry repeats the original method, body and headers.
+            for request in &seen {
+                assert_eq!(request.method, "POST", "{via:?}");
+                assert_eq!(request.body, "request-body", "{via:?}");
+                assert_eq!(request.marker.as_deref(), Some("kept"), "{via:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_proof_never_pays_the_real_charge() {
+        let (url, seen) = spawn_credit_server(|credential| match paid_id(credential).as_deref() {
+            None => proof_then_charge(),
+            Some("proof-1") => (StatusCode::OK, "credit").into_response(),
+            Some(other) => panic!("unexpected credential for {other}"),
+        })
+        .await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            let provider = CreditProvider::new();
+            let response = get(via, &url, &provider)
+                .await
+                .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+            assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+            assert_eq!(provider.paid(), ["proof-1"], "{via:?}");
+            assert_eq!(credential_ids(&seen), ["proof-1"], "{via:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reoffered_challenge_is_not_paid_again() {
+        for reoffered in [charge("proof-1", "0"), charge("charge-1", "10000")] {
+            let id = reoffered.id.clone();
+            let (url, seen) = spawn_credit_server(move |credential| match credential {
+                None => challenged(std::slice::from_ref(&reoffered), None),
+                Some(_) => challenged(
+                    std::slice::from_ref(&reoffered),
+                    Some("verification-failed"),
+                ),
+            })
+            .await;
+
+            for via in BOTH {
+                seen.lock().unwrap().clear();
+                let provider = CreditProvider::new();
+                let response = get(via, &url, &provider)
+                    .await
+                    .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+                assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+                assert_eq!(provider.paid(), std::slice::from_ref(&id), "{via:?}");
+                assert_eq!(credential_ids(&seen), std::slice::from_ref(&id), "{via:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refusal_without_payable_challenge_is_final() {
+        let stripe = PaymentChallenge::new(
+            "stripe-1",
+            REALM,
+            "stripe",
+            "charge",
+            Base64UrlJson::from_value(&serde_json::json!({"amount": "100"})).unwrap(),
+        );
+        for offers in [vec![], vec![stripe]] {
+            let (url, seen) = spawn_credit_server(move |credential| match credential {
+                None => proof_then_charge(),
+                Some(_) => challenged(&offers, Some("credit_insufficient")),
+            })
+            .await;
+
+            for via in BOTH {
+                seen.lock().unwrap().clear();
+                let provider = CreditProvider::new();
+                let response = get(via, &url, &provider)
+                    .await
+                    .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+                assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+                assert_eq!(provider.paid(), ["proof-1"], "{via:?}");
+                assert_eq!(seen.lock().unwrap().len(), 2, "{via:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn endless_new_challenges_stop_at_the_retry_limit() {
+        let (url, seen) = spawn_credit_server(|credential| {
+            let next = match paid_id(credential) {
+                None => 0,
+                Some(id) => id.trim_start_matches("charge-").parse::<u32>().unwrap() + 1,
+            };
+            challenged(
+                &[charge(&format!("charge-{next}"), "100")],
+                Some("credit_insufficient"),
+            )
+        })
+        .await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            let provider = CreditProvider::new();
+            let response = get(via, &url, &provider)
+                .await
+                .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+            let expected: Vec<_> = (0..DEFAULT_MAX_PAYMENT_RETRIES)
+                .map(|n| format!("charge-{n}"))
+                .collect();
+            assert_eq!(provider.paid(), expected, "{via:?}");
+            assert_eq!(credential_ids(&seen), expected, "{via:?}");
+            assert_eq!(
+                seen.lock().unwrap().len(),
+                DEFAULT_MAX_PAYMENT_RETRIES + 1,
+                "{via:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_round_challenge_over_the_spending_cap_is_not_paid() {
+        let (url, seen) = spawn_credit_server(|credential| match credential {
+            None => proof_then_charge(),
+            Some(_) => challenged(&[charge("charge-2", "20000")], Some("credit_insufficient")),
+        })
+        .await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            let provider = CreditProvider::new();
+            let response = get(via, &url, &provider)
+                .await
+                .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+            assert_eq!(provider.paid(), ["proof-1"], "{via:?}");
+            assert_eq!(credential_ids(&seen), ["proof-1"], "{via:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn new_round_proof_for_another_realm_is_not_signed() {
+        let (url, seen) = spawn_credit_server(|credential| match credential {
+            None => proof_then_charge(),
+            Some(_) => challenged(
+                &[charge_in("proof-2", "other.example.com", "0")],
+                Some("credit_insufficient"),
+            ),
+        })
+        .await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            let provider = CreditProvider::new();
+            let result = get(via, &url, &provider).await;
+
+            assert!(
+                result.is_err() || result.unwrap().status() == StatusCode::PAYMENT_REQUIRED,
+                "{via:?}"
+            );
+            assert_eq!(provider.paid(), ["proof-1"], "{via:?}");
+            assert_eq!(credential_ids(&seen), ["proof-1"], "{via:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_new_round_challenge_is_not_paid() {
+        let (url, seen) = spawn_credit_server(|credential| match credential {
+            None => proof_then_charge(),
+            Some(_) => {
+                let mut expired = charge("charge-2", "10000");
+                expired.expires = Some("2020-01-01T00:00:00Z".to_owned());
+                challenged(&[expired], Some("credit_insufficient"))
+            }
+        })
+        .await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            let provider = CreditProvider::new();
+            let result = get(via, &url, &provider).await;
+
+            assert!(
+                result.is_err() || result.unwrap().status() == StatusCode::PAYMENT_REQUIRED,
+                "{via:?}"
+            );
+            assert_eq!(provider.paid(), ["proof-1"], "{via:?}");
+            assert_eq!(credential_ids(&seen), ["proof-1"], "{via:?}");
+        }
+    }
+}
