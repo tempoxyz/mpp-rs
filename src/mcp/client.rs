@@ -8,6 +8,7 @@ use std::{future::Future, sync::Mutex};
 
 use thiserror::Error;
 
+pub use super::PaymentAnswer;
 pub use crate::client::PendingPayment;
 use crate::{
     client::{
@@ -75,6 +76,29 @@ pub trait ToolCaller: Send + Sync {
     /// have accepted the credential even when the response was lost.
     fn is_definitive_error(&self, _error: &Self::Error) -> bool {
         false
+    }
+
+    /// Classifies a JSON-RPC error answering a tool call, such as
+    /// [`error_payment_answer`](super::error_payment_answer) of its error
+    /// object when it carries payment challenges.
+    ///
+    /// Only [`PaymentAnswer::PaymentRequired`] starts a payment round. After
+    /// a paid call, [`PaymentAnswer::ServerError`] ends the call without
+    /// rolling the payment back, as the HTTP client treats a 5xx response,
+    /// since the payment may have settled. Defaults to payment required
+    /// whenever the error carries challenges.
+    fn payment_answer_from_error(&self, error: &Self::Error) -> Option<PaymentAnswer> {
+        self.payment_challenges_from_error(error)
+            .map(|_| PaymentAnswer::PaymentRequired)
+    }
+
+    /// Classifies a tool result's payment requirement like
+    /// [`payment_answer_from_error`](Self::payment_answer_from_error), such as
+    /// [`result_payment_answer`](super::result_payment_answer) of its `_meta`.
+    /// Defaults to payment required whenever the result carries challenges.
+    fn payment_answer_from_output(&self, output: &Self::Output) -> Option<PaymentAnswer> {
+        self.payment_challenges_from_output(output)
+            .map(|_| PaymentAnswer::PaymentRequired)
     }
 }
 
@@ -162,6 +186,19 @@ where
         challenges: &[PaymentChallenge],
         management: Option<&dyn ManagementTransport>,
     ) -> Result<Option<PendingPayment<P>>, MppError> {
+        match self.select(challenges)? {
+            Some(challenge) => self.pay(challenge, management).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Selects the best-ranked supported challenge, refusing an expired one
+    /// or a Tempo proof for another realm. Returns `Ok(None)` when the
+    /// provider supports none of them.
+    fn select(
+        &self,
+        challenges: &[PaymentChallenge],
+    ) -> Result<Option<PaymentChallenge>, MppError> {
         let mut preferences = self.context.headers.get_all("accept-payment").iter();
         let first = preferences.next();
         if preferences.next().is_some() {
@@ -210,7 +247,15 @@ where
                     .into(),
             ));
         }
+        Ok(Some(challenge))
+    }
 
+    /// Creates a credential for a challenge [`select`](Self::select) chose.
+    async fn pay(
+        &self,
+        challenge: PaymentChallenge,
+        management: Option<&dyn ManagementTransport>,
+    ) -> Result<PendingPayment<P>, MppError> {
         // A Zone withdrawal still settling is resumed for this challenge,
         // not paid again.
         let credential = crate::client::resume_pending_settlement(
@@ -231,11 +276,11 @@ where
             },
         )
         .await?;
-        Ok(Some(PendingPayment::new(
+        Ok(PendingPayment::new(
             self.provider.clone(),
             challenge,
             credential,
-        )))
+        ))
     }
 }
 
@@ -344,68 +389,147 @@ where
     C: ToolCaller,
     P: PaymentProvider,
 {
-    /// Calls a tool, satisfying one MCP payment challenge when necessary.
+    /// Calls a tool, satisfying MCP payment challenges when necessary.
     ///
     /// Free calls pass through unchanged. A supported, unexpired challenge is
-    /// paid once and the exact request is retried with its credential in
-    /// `_meta`. A session channel whose deposit does not cover the call is
-    /// topped up first by the same call carrying the top-up credential.
-    /// Successful retries record their receipt and commit provider state.
-    /// Definitive rejection rolls it back; cancellation and transport
-    /// ambiguity invoke only the provider's synchronous abandonment hook.
+    /// paid and the exact request is retried with its credential in `_meta`.
+    /// A session channel whose deposit does not cover the call is topped up
+    /// first by the same call carrying the top-up credential. Successful
+    /// retries record their receipt and commit provider state. Definitive
+    /// rejection rolls it back; cancellation and transport ambiguity invoke
+    /// only the provider's synchronous abandonment hook.
+    ///
+    /// As mppx's client does, a paid retry answered with a new challenge,
+    /// such as a server that refuses a zero-amount proof and then offers only
+    /// its real charge, starts another round, up to
+    /// [`DEFAULT_MAX_PAYMENT_RETRIES`](crate::client::DEFAULT_MAX_PAYMENT_RETRIES)
+    /// Credentials sent. Each round selects and checks its challenge like the
+    /// first.
+    /// A Challenge offered again gets the same Credential resent, never a new
+    /// payment. Only a payment requirement starts a round
+    /// ([`ToolCaller::payment_answer_from_output`]): any other answer, one
+    /// without a challenge the provider can pay, or a refused Credential whose
+    /// payment already settled ends the call with the server's answer. A server
+    /// failure may have settled the payment, so it is neither rolled back nor
+    /// committed.
     pub async fn call_tool(
         &self,
         params: C::Params,
     ) -> Result<C::Output, McpClientError<C::Error>> {
-        let initial = self.caller.call_tool(params.clone()).await;
-        let challenges = match &initial {
-            Ok(output) => self.caller.payment_challenges_from_output(output),
-            Err(error) => self.caller.payment_challenges_from_error(error),
-        };
-        let Some(challenges) = challenges else {
-            return initial.map_err(McpClientError::Transport);
-        };
-
-        let management = McpManagement::new(&self.caller, params.clone());
-        let Some(pending) = self
-            .payment
-            .prepare_with_management(&challenges, &management)
-            .await?
-        else {
-            return initial.map_err(McpClientError::Transport);
-        };
-
-        let mut paid = params;
-        if let Err(error) = self
-            .caller
-            .attach_credential(&mut paid, pending.credential())
-        {
-            pending.rollback().await?;
-            return Err(error.into());
+        let mut response = self.caller.call_tool(params.clone()).await;
+        // Only a payment requirement (HTTP 402) starts a payment round.
+        if self.payment_answer(&response) != Some(PaymentAnswer::PaymentRequired) {
+            return response.map_err(McpClientError::Transport);
         }
-
-        match self.caller.call_tool(paid).await {
-            Ok(output) => {
-                if self
-                    .caller
-                    .payment_challenges_from_output(&output)
-                    .is_some()
-                {
-                    pending.rollback().await?;
-                } else {
-                    if let Some(receipt) = self.caller.receipt_from_output(&output) {
-                        self.payment.record_receipt(pending.challenge(), &receipt);
-                    }
-                    pending.commit().await?;
+        // The last credential sent, answered by another payment requirement.
+        let mut previous: Option<PendingPayment<P>> = None;
+        for _ in 0..crate::client::DEFAULT_MAX_PAYMENT_RETRIES {
+            let challenges = match &response {
+                Ok(output) => self.caller.payment_challenges_from_output(output),
+                Err(error) => self.caller.payment_challenges_from_error(error),
+            }
+            .unwrap_or_default();
+            let selected = match self.payment.select(&challenges) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    // An expired or cross-realm Challenge ends the call, so a
+                    // refused Credential is settled as refused first.
+                    reject(previous.take()).await?;
+                    return Err(error.into());
                 }
-                Ok(output)
-            }
-            Err(error) if self.caller.is_definitive_error(&error) => {
+            };
+            let Some(challenge) = selected else {
+                // Nothing payable after a credential is the server's final answer.
+                reject(previous.take()).await?;
+                return response.map_err(McpClientError::Transport);
+            };
+
+            let pending = match previous.take() {
+                // The same Challenge again: resend its Credential rather than
+                // paying it twice.
+                Some(previous) if previous.challenge().id == challenge.id => previous,
+                Some(previous) => {
+                    // A refused hash or Zone credential's payment is already
+                    // on chain: paying a new challenge would pay twice.
+                    let settled = crate::client::flow::already_settled(previous.credential());
+                    previous.rollback().await?;
+                    if settled {
+                        return response.map_err(McpClientError::Transport);
+                    }
+                    let management = McpManagement::new(&self.caller, params.clone());
+                    self.payment.pay(challenge, Some(&management)).await?
+                }
+                None => {
+                    let management = McpManagement::new(&self.caller, params.clone());
+                    self.payment.pay(challenge, Some(&management)).await?
+                }
+            };
+
+            let mut paid = params.clone();
+            if let Err(error) = self
+                .caller
+                .attach_credential(&mut paid, pending.credential())
+            {
                 pending.rollback().await?;
-                Err(McpClientError::Transport(error))
+                return Err(error.into());
             }
-            Err(error) => Err(McpClientError::Transport(error)),
+
+            response = self.caller.call_tool(paid).await;
+            if let Err(error) = &response {
+                // The server may have accepted a credential whose answer was
+                // lost: leave the payment unsettled.
+                if !self.caller.is_definitive_error(error) {
+                    return response.map_err(McpClientError::Transport);
+                }
+            }
+            match self.payment_answer(&response) {
+                None => {
+                    return match response {
+                        Ok(output) => {
+                            if let Some(receipt) = self.caller.receipt_from_output(&output) {
+                                self.payment.record_receipt(pending.challenge(), &receipt);
+                            }
+                            pending.commit().await?;
+                            Ok(output)
+                        }
+                        Err(error) => {
+                            pending.rollback().await?;
+                            Err(McpClientError::Transport(error))
+                        }
+                    };
+                }
+                // The server failed after taking the credential, so the
+                // payment may have settled: like the HTTP client's 5xx, stop
+                // without paying again or rolling back.
+                Some(PaymentAnswer::ServerError) => {
+                    return response.map_err(McpClientError::Transport)
+                }
+                Some(PaymentAnswer::Rejected) => {
+                    pending.rollback().await?;
+                    return response.map_err(McpClientError::Transport);
+                }
+                Some(PaymentAnswer::PaymentRequired) => previous = Some(pending),
+            }
         }
+        // The payment requirement answering the last round is final.
+        reject(previous).await?;
+        response.map_err(McpClientError::Transport)
+    }
+
+    fn payment_answer(&self, response: &Result<C::Output, C::Error>) -> Option<PaymentAnswer> {
+        match response {
+            Ok(output) => self.caller.payment_answer_from_output(output),
+            Err(error) => self.caller.payment_answer_from_error(error),
+        }
+    }
+}
+
+/// Settles a previous round's Credential as refused: the server answered it
+/// with a payment requirement that the call does not answer with it again.
+async fn reject<P: PaymentProvider>(previous: Option<PendingPayment<P>>) -> Result<(), MppError> {
+    match previous {
+        Some(previous) => previous.rollback().await,
+        None => Ok(()),
     }
 }
 
@@ -548,6 +672,7 @@ mod tests {
     struct TestError {
         challenges: Option<Vec<PaymentChallenge>>,
         definitive: bool,
+        server_error: bool,
         message: &'static str,
     }
 
@@ -618,6 +743,22 @@ mod tests {
         fn is_definitive_error(&self, error: &Self::Error) -> bool {
             error.definitive
         }
+
+        fn payment_answer_from_error(&self, error: &Self::Error) -> Option<PaymentAnswer> {
+            if error.server_error {
+                return Some(PaymentAnswer::ServerError);
+            }
+            error
+                .challenges
+                .as_ref()
+                .map(|_| PaymentAnswer::PaymentRequired)
+        }
+
+        fn payment_answer_from_output(&self, output: &Self::Output) -> Option<PaymentAnswer> {
+            output
+                .get("_meta")
+                .and_then(crate::mcp::result_payment_answer)
+        }
     }
 
     fn receipt_result(reference: &str) -> Value {
@@ -649,6 +790,7 @@ mod tests {
         TestError {
             challenges: Some(vec![challenge()]),
             definitive,
+            server_error: false,
             message: "payment required",
         }
     }
@@ -657,6 +799,7 @@ mod tests {
         TestError {
             challenges: None,
             definitive,
+            server_error: false,
             message: "tool failed",
         }
     }
@@ -1221,5 +1364,540 @@ mod tests {
 
         assert_eq!(provider.lifecycle.rollbacks.load(Ordering::SeqCst), 0);
         assert_eq!(provider.lifecycle.abandons.load(Ordering::SeqCst), 1);
+    }
+
+    /// A zero-amount Tempo proof refused with a `credit_insufficient`
+    /// payment requirement that offers only the real charge starts a new
+    /// challenge round, as mppx's MCP client does.
+    #[cfg(feature = "tempo")]
+    mod new_challenge_rounds {
+        use super::*;
+        use crate::client::{TempoProvider, DEFAULT_MAX_PAYMENT_RETRIES};
+        use crate::error::PaymentErrorDetails;
+
+        const CURRENCY: &str = "0x20c0000000000000000000000000000000000000";
+        const REALM: &str = "mcp.example.test";
+
+        /// Signs zero-amount proofs with a real `TempoProvider` and its
+        /// policy (charges capped at 10000), and pays other charges with a
+        /// pull-mode transaction credential, recording what it pays.
+        #[derive(Clone)]
+        struct CreditProvider {
+            tempo: TempoProvider,
+            paid: Arc<Mutex<Vec<String>>>,
+            commits: Arc<AtomicUsize>,
+            rollbacks: Arc<AtomicUsize>,
+            abandons: Arc<AtomicUsize>,
+        }
+
+        impl CreditProvider {
+            fn new() -> Self {
+                let signer = alloy::signers::local::PrivateKeySigner::random();
+                Self {
+                    tempo: TempoProvider::new(signer, "https://rpc.example.com")
+                        .unwrap()
+                        .with_expected_chain_id(42431)
+                        .with_currencies([CURRENCY])
+                        .with_max_atomic_amount(alloy::primitives::U256::from(10_000)),
+                    paid: Arc::default(),
+                    commits: Arc::default(),
+                    rollbacks: Arc::default(),
+                    abandons: Arc::default(),
+                }
+            }
+
+            fn paid(&self) -> Vec<String> {
+                self.paid.lock().unwrap().clone()
+            }
+        }
+
+        impl PaymentProvider for CreditProvider {
+            fn supports(&self, method: &str, intent: &str) -> bool {
+                self.tempo.supports(method, intent)
+            }
+
+            fn select_challenge<'a>(
+                &self,
+                challenges: &[&'a PaymentChallenge],
+            ) -> Option<&'a PaymentChallenge> {
+                self.tempo.select_challenge(challenges)
+            }
+
+            async fn pay(
+                &self,
+                challenge: &PaymentChallenge,
+            ) -> Result<PaymentCredential, MppError> {
+                self.paid.lock().unwrap().push(challenge.id.clone());
+                let request: crate::protocol::intents::ChargeRequest =
+                    challenge.request.decode()?;
+                if request.amount == "0" {
+                    return self.tempo.pay(challenge).await;
+                }
+                Ok(PaymentCredential::new(
+                    challenge.to_echo(),
+                    PaymentPayload::transaction("0x76signed"),
+                ))
+            }
+
+            async fn commit_payment(
+                &self,
+                _: &PaymentChallenge,
+                _: &PaymentCredential,
+            ) -> Result<(), MppError> {
+                self.commits.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn rollback_payment(
+                &self,
+                _: &PaymentChallenge,
+                _: &PaymentCredential,
+            ) -> Result<(), MppError> {
+                self.rollbacks.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn abandon_payment(&self, _: &PaymentChallenge, _: &PaymentCredential) {
+                self.abandons.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn charge_in(id: &str, realm: &str, amount: &str) -> PaymentChallenge {
+            let request = Base64UrlJson::from_value(&json!({
+                "amount": amount,
+                "currency": CURRENCY,
+                "recipient": "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                "methodDetails": { "chainId": 42431 }
+            }))
+            .unwrap();
+            PaymentChallenge::new(id, realm, "tempo", "charge", request)
+        }
+
+        fn charge(id: &str, amount: &str) -> PaymentChallenge {
+            charge_in(id, REALM, amount)
+        }
+
+        /// A definitive payment-required error offering `challenges`.
+        fn required(challenges: Vec<PaymentChallenge>) -> TestError {
+            TestError {
+                challenges: Some(challenges),
+                definitive: true,
+                server_error: false,
+                message: "credit_insufficient",
+            }
+        }
+
+        fn proof_then_charge() -> TestError {
+            required(vec![charge("proof-1", "0"), charge("charge-1", "10000")])
+        }
+
+        fn required_result(challenges: Vec<PaymentChallenge>) -> Value {
+            payment_required_result(
+                challenges
+                    .iter()
+                    .map(|challenge| serde_json::to_value(challenge).unwrap())
+                    .collect(),
+            )
+        }
+
+        fn sent_credentials(caller: &TestCaller) -> Vec<Value> {
+            caller
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|call| call["_meta"].get(CREDENTIAL_META_KEY).cloned())
+                .collect()
+        }
+
+        fn paying_client(
+            outcomes: impl IntoIterator<Item = Result<Value, TestError>>,
+        ) -> (
+            McpClient<TestCaller, CreditProvider>,
+            TestCaller,
+            CreditProvider,
+        ) {
+            let caller = TestCaller::new(outcomes);
+            let provider = CreditProvider::new();
+            let client = McpClient::new(caller.clone(), provider.clone(), context());
+            (client, caller, provider)
+        }
+
+        #[tokio::test]
+        async fn refused_proof_then_real_charge_is_paid() {
+            // The refusal arrives as a JSON-RPC error or as a result's `_meta`.
+            for refusal in [
+                Err(required(vec![charge("charge-2", "10000")])),
+                Ok(required_result(vec![charge("charge-2", "10000")])),
+            ] {
+                let (client, caller, provider) = paying_client([
+                    Err(proof_then_charge()),
+                    refusal,
+                    Ok(json!({"content": "paid"})),
+                ]);
+
+                let result = client.call_tool(params()).await.unwrap();
+
+                assert_eq!(result["content"], "paid");
+                assert_eq!(provider.paid(), ["proof-1", "charge-2"]);
+                let credentials = sent_credentials(&caller);
+                assert_eq!(credentials.len(), 2);
+                assert_eq!(credentials[0]["challenge"]["id"], "proof-1");
+                assert_eq!(credentials[0]["payload"]["type"], "proof");
+                assert_eq!(credentials[1]["challenge"]["id"], "charge-2");
+                assert_eq!(credentials[1]["payload"]["type"], "transaction");
+                // Every retry repeats the original tool call.
+                for call in caller.calls.lock().unwrap().iter() {
+                    assert_eq!(call["name"], "paid_tool");
+                    assert_eq!(call["arguments"], json!({}));
+                }
+                assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+                assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn accepted_proof_never_pays_the_real_charge() {
+            let (client, caller, provider) =
+                paying_client([Err(proof_then_charge()), Ok(json!({"content": "credit"}))]);
+
+            let result = client.call_tool(params()).await.unwrap();
+
+            assert_eq!(result["content"], "credit");
+            assert_eq!(provider.paid(), ["proof-1"]);
+            assert_eq!(sent_credentials(&caller).len(), 1);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn reoffered_challenge_resends_the_same_credential() {
+            for reoffered in [charge("proof-1", "0"), charge("charge-1", "10000")] {
+                let id = reoffered.id.clone();
+                // The same Challenge is identified by its id, not by display
+                // fields such as its description.
+                let relabeled = reoffered.clone().with_description("try again");
+                let outcomes = std::iter::once(Err(required(vec![reoffered.clone()]))).chain(
+                    (0..DEFAULT_MAX_PAYMENT_RETRIES)
+                        .map(|_| Ok(required_result(vec![relabeled.clone()]))),
+                );
+                let (client, caller, provider) = paying_client(outcomes);
+
+                let result = client.call_tool(params()).await.unwrap();
+
+                // The last payment requirement is the final answer.
+                assert_eq!(result["isError"], true);
+                // Signed once, and that Credential resent each round, at most
+                // DEFAULT_MAX_PAYMENT_RETRIES times.
+                assert_eq!(provider.paid(), [id]);
+                let credentials = sent_credentials(&caller);
+                assert_eq!(credentials.len(), DEFAULT_MAX_PAYMENT_RETRIES);
+                assert!(credentials.iter().all(|sent| *sent == credentials[0]));
+                assert_eq!(
+                    caller.calls.lock().unwrap().len(),
+                    DEFAULT_MAX_PAYMENT_RETRIES + 1
+                );
+                assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+                assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn resent_credential_accepted_is_committed_once() {
+            let (client, caller, provider) = paying_client([
+                Err(required(vec![charge("charge-1", "10000")])),
+                Err(required(vec![charge("charge-1", "10000")])),
+                Ok(json!({"content": "paid"})),
+            ]);
+
+            let result = client.call_tool(params()).await.unwrap();
+
+            assert_eq!(result["content"], "paid");
+            assert_eq!(provider.paid(), ["charge-1"]);
+            let credentials = sent_credentials(&caller);
+            assert_eq!(credentials.len(), 2);
+            assert_eq!(credentials[0], credentials[1]);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn new_challenge_with_the_same_fields_is_paid() {
+            // A new id is a new Challenge, even with every other field equal.
+            let (client, caller, provider) = paying_client([
+                Err(required(vec![charge("charge-1", "100")])),
+                Err(required(vec![charge("charge-2", "100")])),
+                Ok(json!({"content": "paid"})),
+            ]);
+
+            let result = client.call_tool(params()).await.unwrap();
+
+            assert_eq!(result["content"], "paid");
+            assert_eq!(provider.paid(), ["charge-1", "charge-2"]);
+            assert_eq!(sent_credentials(&caller).len(), 2);
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn rejection_other_than_payment_required_is_final() {
+            // A 410 offering a new Challenge after payment is not paid.
+            let gone = PaymentErrorDetails::session("channel-not-found").with_status(410);
+            let (client, caller, provider) = paying_client([
+                Err(required(vec![charge("charge-1", "10000")])),
+                Ok(problem_result(&[charge("charge-2", "10000")], gone)),
+                Ok(json!({"content": "paid twice"})),
+            ]);
+
+            let result = client.call_tool(params()).await.unwrap();
+
+            assert_eq!(
+                result["_meta"][PAYMENT_REQUIRED_META_KEY]["httpStatus"],
+                410
+            );
+            assert_eq!(provider.paid(), ["charge-1"]);
+            assert_eq!(sent_credentials(&caller).len(), 1);
+            assert_eq!(caller.calls.lock().unwrap().len(), 2);
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn unpaid_server_error_is_not_paid() {
+            // Only a payment requirement starts the first round too.
+            let (client, caller, provider) = paying_client([Ok(problem_result(
+                &[charge("charge-1", "10000")],
+                internal_payment_error(),
+            ))]);
+
+            let result = client.call_tool(params()).await.unwrap();
+
+            assert_eq!(result["isError"], true);
+            assert!(provider.paid().is_empty());
+            assert_eq!(caller.calls.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn refusal_without_payable_challenge_is_final() {
+            // A definitive rejection without challenges is returned as is.
+            let (client, caller, provider) =
+                paying_client([Err(proof_then_charge()), Err(transport_error(true))]);
+            let error = client.call_tool(params()).await.unwrap_err();
+            assert!(matches!(error, McpClientError::Transport(_)));
+            assert_eq!(provider.paid(), ["proof-1"]);
+            assert_eq!(caller.calls.lock().unwrap().len(), 2);
+
+            // So is a refusal offering only challenges the provider cannot pay.
+            let stripe = PaymentChallenge::new(
+                "stripe-1",
+                REALM,
+                "stripe",
+                "charge",
+                Base64UrlJson::from_value(&json!({"amount": "100"})).unwrap(),
+            );
+            let (client, caller, provider) =
+                paying_client([Err(proof_then_charge()), Ok(required_result(vec![stripe]))]);
+            let result = client.call_tool(params()).await.unwrap();
+            assert_eq!(result["isError"], true);
+            assert_eq!(provider.paid(), ["proof-1"]);
+            assert_eq!(caller.calls.lock().unwrap().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn endless_new_challenges_stop_at_the_retry_limit() {
+            let outcomes = (0..=DEFAULT_MAX_PAYMENT_RETRIES)
+                .map(|n| Err(required(vec![charge(&format!("charge-{n}"), "100")])));
+            let (client, caller, provider) = paying_client(outcomes);
+
+            let error = client.call_tool(params()).await.unwrap_err();
+
+            assert!(matches!(error, McpClientError::Transport(_)));
+            let expected: Vec<_> = (0..DEFAULT_MAX_PAYMENT_RETRIES)
+                .map(|n| format!("charge-{n}"))
+                .collect();
+            assert_eq!(provider.paid(), expected);
+            assert_eq!(
+                caller.calls.lock().unwrap().len(),
+                DEFAULT_MAX_PAYMENT_RETRIES + 1
+            );
+        }
+
+        #[tokio::test]
+        async fn new_round_challenge_over_the_spending_cap_is_not_paid() {
+            let (client, caller, provider) = paying_client([
+                Err(proof_then_charge()),
+                Err(required(vec![charge("charge-2", "20000")])),
+            ]);
+
+            let error = client.call_tool(params()).await.unwrap_err();
+
+            assert!(matches!(error, McpClientError::Transport(_)));
+            assert_eq!(provider.paid(), ["proof-1"]);
+            assert_eq!(caller.calls.lock().unwrap().len(), 2);
+            // The refused proof is rolled back, not only abandoned.
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn new_round_proof_for_another_realm_is_not_signed() {
+            let (client, caller, provider) = paying_client([
+                Err(proof_then_charge()),
+                Err(required(vec![charge_in(
+                    "proof-2",
+                    "other.example.com",
+                    "0",
+                )])),
+            ]);
+
+            let error = client.call_tool(params()).await.unwrap_err();
+
+            assert!(matches!(error, McpClientError::Payment(_)));
+            assert_eq!(provider.paid(), ["proof-1"]);
+            assert_eq!(caller.calls.lock().unwrap().len(), 2);
+            // The refused proof is rolled back, not only abandoned.
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn expired_new_round_challenge_is_not_paid() {
+            let mut expired = charge("charge-2", "10000");
+            expired.expires = Some("2020-01-01T00:00:00Z".to_owned());
+            let (client, caller, provider) =
+                paying_client([Err(proof_then_charge()), Err(required(vec![expired]))]);
+
+            let error = client.call_tool(params()).await.unwrap_err();
+
+            assert!(matches!(error, McpClientError::Payment(_)));
+            assert_eq!(provider.paid(), ["proof-1"]);
+            assert_eq!(caller.calls.lock().unwrap().len(), 2);
+            // The refused proof is rolled back, not only abandoned.
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+        }
+
+        /// `problem` offering `challenges` in a tool result, as
+        /// [`payment_required_error_with_problem`](crate::mcp::payment_required_error_with_problem)
+        /// builds a server's payment requirement.
+        fn problem_result(challenges: &[PaymentChallenge], problem: PaymentErrorDetails) -> Value {
+            let mut data = crate::mcp::payment_required_error_with_problem(&challenges[0], problem)
+                .data
+                .unwrap();
+            data.challenges = challenges.to_vec();
+            json!({"_meta": {PAYMENT_REQUIRED_META_KEY: data}, "isError": true})
+        }
+
+        fn internal_payment_error() -> PaymentErrorDetails {
+            PaymentErrorDetails::core("internal-payment-error").with_status(500)
+        }
+
+        #[tokio::test]
+        async fn server_error_result_after_payment_is_returned_without_paying_again() {
+            let (client, caller, provider) = paying_client([
+                Err(required(vec![charge("charge-1", "10000")])),
+                Ok(problem_result(
+                    &[charge("charge-2", "10000")],
+                    internal_payment_error(),
+                )),
+                Ok(json!({"content": "paid twice"})),
+            ]);
+
+            let result = client.call_tool(params()).await.unwrap();
+
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["_meta"][PAYMENT_REQUIRED_META_KEY]["httpStatus"],
+                500
+            );
+            assert_eq!(provider.paid(), ["charge-1"]);
+            let credentials = sent_credentials(&caller);
+            assert_eq!(credentials.len(), 1);
+            assert_eq!(credentials[0]["payload"]["type"], "transaction");
+            assert_eq!(caller.calls.lock().unwrap().len(), 2);
+            // The pull payment may have settled: it is neither committed nor
+            // rolled back, as the HTTP client treats a 5xx.
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.abandons.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn server_error_after_payment_is_raised_without_paying_again() {
+            let server_error = TestError {
+                challenges: Some(vec![charge("charge-2", "10000")]),
+                definitive: true,
+                server_error: true,
+                message: "internal-payment-error",
+            };
+            let (client, caller, provider) = paying_client([
+                Err(required(vec![charge("charge-1", "10000")])),
+                Err(server_error),
+                Ok(json!({"content": "paid twice"})),
+            ]);
+
+            let error = client.call_tool(params()).await.unwrap_err();
+
+            assert!(matches!(
+                error,
+                McpClientError::Transport(TestError {
+                    message: "internal-payment-error",
+                    ..
+                })
+            ));
+            assert_eq!(provider.paid(), ["charge-1"]);
+            assert_eq!(sent_credentials(&caller).len(), 1);
+            assert_eq!(caller.calls.lock().unwrap().len(), 2);
+            assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+            assert_eq!(provider.abandons.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn definitive_refusal_offering_a_new_challenge_is_paid() {
+            for refusal in [
+                Ok(problem_result(
+                    &[charge("charge-2", "10000")],
+                    PaymentErrorDetails::core("credit_insufficient"),
+                )),
+                Err(required(vec![charge("charge-2", "10000")])),
+            ] {
+                let (client, caller, provider) = paying_client([
+                    Err(proof_then_charge()),
+                    refusal,
+                    Ok(json!({"content": "paid"})),
+                ]);
+
+                let result = client.call_tool(params()).await.unwrap();
+
+                assert_eq!(result["content"], "paid");
+                assert_eq!(provider.paid(), ["proof-1", "charge-2"]);
+                assert_eq!(sent_credentials(&caller).len(), 2);
+                assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 1);
+                assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_settled_payment_is_not_followed_by_another() {
+        // TestProvider pays with a broadcast hash: its funds already moved.
+        let mut next = challenge();
+        next.id = "challenge-2".to_owned();
+        let caller = TestCaller::new([
+            Err(payment_error(true)),
+            Ok(payment_required_result(vec![
+                serde_json::to_value(next).unwrap()
+            ])),
+        ]);
+        let provider = TestProvider::new();
+        let client = McpClient::new(caller.clone(), provider.clone(), context());
+
+        let result = client.call_tool(params()).await.unwrap();
+
+        assert_eq!(result["isError"], true);
+        assert_eq!(provider.lifecycle.pays.load(Ordering::SeqCst), 1);
+        assert_eq!(caller.calls.lock().unwrap().len(), 2);
     }
 }
