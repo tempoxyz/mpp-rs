@@ -1522,6 +1522,8 @@ mod new_challenge_rounds {
     use axum::routing::any;
 
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::client::{TempoProvider, DEFAULT_MAX_PAYMENT_RETRIES};
     use crate::protocol::core::parse_authorization;
 
@@ -1537,6 +1539,10 @@ mod new_challenge_rounds {
     struct CreditProvider {
         tempo: TempoProvider,
         paid: Arc<Mutex<Vec<String>>>,
+        /// Pays charges with a hash credential, settled on chain, instead.
+        hash: bool,
+        commits: Arc<AtomicUsize>,
+        rollbacks: Arc<AtomicUsize>,
     }
 
     impl CreditProvider {
@@ -1551,11 +1557,21 @@ mod new_challenge_rounds {
             Self {
                 tempo,
                 paid: Arc::default(),
+                hash: false,
+                commits: Arc::default(),
+                rollbacks: Arc::default(),
             }
         }
 
         fn paid(&self) -> Vec<String> {
             self.paid.lock().unwrap().clone()
+        }
+
+        fn settled(&self) -> (usize, usize) {
+            (
+                self.commits.load(Ordering::SeqCst),
+                self.rollbacks.load(Ordering::SeqCst),
+            )
         }
     }
 
@@ -1585,10 +1601,30 @@ mod new_challenge_rounds {
             if request.amount == "0" {
                 return self.tempo.pay(challenge).await;
             }
-            Ok(PaymentCredential::new(
-                challenge.to_echo(),
-                PaymentPayload::transaction("0x76signed"),
-            ))
+            let payload = if self.hash {
+                PaymentPayload::hash("0xsettled")
+            } else {
+                PaymentPayload::transaction("0x76signed")
+            };
+            Ok(PaymentCredential::new(challenge.to_echo(), payload))
+        }
+
+        async fn commit_payment(
+            &self,
+            _: &PaymentChallenge,
+            _: &PaymentCredential,
+        ) -> Result<(), MppError> {
+            self.commits.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn rollback_payment(
+            &self,
+            _: &PaymentChallenge,
+            _: &PaymentCredential,
+        ) -> Result<(), MppError> {
+            self.rollbacks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -1815,14 +1851,26 @@ mod new_challenge_rounds {
         }
     }
 
+    /// Every Credential sent, as JSON so resent ones compare equal.
+    fn credentials(seen: &Mutex<Vec<Seen>>) -> Vec<serde_json::Value> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|seen| seen.credential.as_ref())
+            .map(|credential| serde_json::to_value(credential).unwrap())
+            .collect()
+    }
+
     #[tokio::test]
-    async fn reoffered_challenge_is_not_paid_again() {
+    async fn reoffered_challenge_resends_the_same_credential() {
         for reoffered in [charge("proof-1", "0"), charge("charge-1", "10000")] {
             let id = reoffered.id.clone();
             let (url, seen) = spawn_credit_server(move |credential| match credential {
                 None => challenged(std::slice::from_ref(&reoffered), None),
+                // The same Challenge is identified by its id, not by display
+                // fields such as its description.
                 Some(_) => challenged(
-                    std::slice::from_ref(&reoffered),
+                    &[reoffered.clone().with_description("try again")],
                     Some("verification-failed"),
                 ),
             })
@@ -1835,10 +1883,118 @@ mod new_challenge_rounds {
                     .await
                     .unwrap_or_else(|err| panic!("{via:?}: {err}"));
 
+                // The last 402 is the final answer.
                 assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+                // Signed once, then that Credential resent each round, at most
+                // DEFAULT_MAX_PAYMENT_RETRIES times in all.
                 assert_eq!(provider.paid(), std::slice::from_ref(&id), "{via:?}");
-                assert_eq!(credential_ids(&seen), std::slice::from_ref(&id), "{via:?}");
+                let credentials = credentials(&seen);
+                assert_eq!(credentials.len(), DEFAULT_MAX_PAYMENT_RETRIES, "{via:?}");
+                assert!(
+                    credentials.iter().all(|sent| *sent == credentials[0]),
+                    "{via:?}"
+                );
+                assert_eq!(
+                    seen.lock().unwrap().len(),
+                    DEFAULT_MAX_PAYMENT_RETRIES + 1,
+                    "{via:?}"
+                );
+                assert_eq!(provider.settled(), (0, 1), "{via:?}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn resent_credential_accepted_is_committed_once() {
+        let answered = Arc::new(AtomicUsize::new(0));
+        let (url, seen) = spawn_credit_server({
+            let answered = answered.clone();
+            move |credential| match credential {
+                None => challenged(&[charge("charge-1", "10000")], None),
+                Some(_) if answered.fetch_add(1, Ordering::SeqCst) == 0 => {
+                    challenged(&[charge("charge-1", "10000")], Some("verification-failed"))
+                }
+                Some(_) => (StatusCode::OK, "paid").into_response(),
+            }
+        })
+        .await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            answered.store(0, Ordering::SeqCst);
+            let provider = CreditProvider::new();
+            let response = get(via, &url, &provider)
+                .await
+                .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+            assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+            assert_eq!(provider.paid(), ["charge-1"], "{via:?}");
+            let credentials = credentials(&seen);
+            assert_eq!(credentials.len(), 2, "{via:?}");
+            assert_eq!(credentials[0], credentials[1], "{via:?}");
+            assert_eq!(provider.settled(), (1, 0), "{via:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_hash_credential_is_not_resent_or_paid_again() {
+        let (url, seen) = spawn_credit_server(|credential| match credential {
+            None => challenged(&[charge("charge-1", "10000")], None),
+            Some(_) => challenged(&[charge("charge-1", "10000")], Some("verification-failed")),
+        })
+        .await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            let provider = CreditProvider {
+                hash: true,
+                ..CreditProvider::new()
+            };
+            let response = get(via, &url, &provider)
+                .await
+                .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+            assert_eq!(provider.paid(), ["charge-1"], "{via:?}");
+            assert_eq!(credentials(&seen).len(), 1, "{via:?}");
+            assert_eq!(seen.lock().unwrap().len(), 2, "{via:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn earlier_refused_challenge_offered_again_is_a_new_attempt() {
+        // Only the Challenge just answered is resent: A, then B, then A again
+        // gets a new Credential for A.
+        let (url, seen) = spawn_credit_server(|credential| match paid_id(credential).as_deref() {
+            None => challenged(&[charge("charge-a", "100")], None),
+            Some("charge-a") => {
+                challenged(&[charge("charge-b", "100")], Some("verification-failed"))
+            }
+            Some("charge-b") => {
+                challenged(&[charge("charge-a", "100")], Some("verification-failed"))
+            }
+            Some(other) => panic!("unexpected credential for {other}"),
+        })
+        .await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            let provider = CreditProvider::new();
+            let response = get(via, &url, &provider)
+                .await
+                .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+            assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED, "{via:?}");
+            assert_eq!(
+                provider.paid(),
+                ["charge-a", "charge-b", "charge-a"],
+                "{via:?}"
+            );
+            assert_eq!(
+                credential_ids(&seen),
+                ["charge-a", "charge-b", "charge-a"],
+                "{via:?}"
+            );
         }
     }
 

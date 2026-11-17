@@ -785,7 +785,7 @@ mod integration {
     }
 
     #[tokio::test]
-    async fn test_middleware_incremental_402_retries_do_not_pay_repeated_challenge() {
+    async fn test_middleware_incremental_402_retries_resend_repeated_challenge_credential() {
         let (_, www_auth) = test_challenge();
         let request_count = Arc::new(AtomicU32::new(0));
         let counter = request_count.clone();
@@ -813,12 +813,9 @@ mod integration {
 
         let _failed_sub = events.on_payment_failed({
             let failed_count = failed_count.clone();
-            move |ctx| {
+            move |_| {
                 failed_count.fetch_add(1, Ordering::SeqCst);
-                async move {
-                    assert!(ctx.challenge.is_some());
-                    assert!(ctx.error.contains("previously paid challenge"));
-                }
+                async move {}
             }
         });
         let client = ClientBuilder::new(reqwest::Client::new())
@@ -836,9 +833,14 @@ mod integration {
             .unwrap();
 
         assert_eq!(resp.status(), reqwest::StatusCode::PAYMENT_REQUIRED);
+        // Signed once and resent each round, as mppx does; the final 402 is
+        // the server's answer, not a payment failure.
         assert_eq!(provider.call_count(), 1);
-        assert_eq!(request_count.load(Ordering::SeqCst), 2);
-        assert_eq!(failed_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            crate::client::DEFAULT_MAX_PAYMENT_RETRIES as u32 + 1
+        );
+        assert_eq!(failed_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

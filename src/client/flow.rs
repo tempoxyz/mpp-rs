@@ -275,6 +275,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
         };
 
         let mut paid_challenge_ids = HashSet::new();
+        // Challenges whose payment was committed: never paid again.
+        let mut settled_challenge_ids = HashSet::new();
+        // The selected Challenge's id and the Credential that answered it, while
+        // the server's 402 to that Credential is being answered.
+        let mut previous: Option<(String, PendingPayment<P>)> = None;
         let mut retried_stale_session = false;
         let mut refreshed_after_provider_setup = false;
         let mut payment_attempt = 0;
@@ -284,6 +289,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             }
 
             if payment_context.url.origin() != resp.url().origin() {
+                reject(previous.take()).await?;
                 return Err(self.fail(None, HttpError::CrossOriginRedirect).await);
             }
 
@@ -295,6 +301,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 && *method != Method::HEAD
                 && exchange.redirected(&payment_context.url, &resp)
             {
+                reject(previous.take()).await?;
                 // After a paid retry the request may already have run, so hand
                 // back the redirected 402 instead of an error that reads unpaid.
                 if payment_attempt > 0 {
@@ -313,6 +320,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 .collect();
 
             if www_auth_values.is_empty() {
+                reject(previous.take()).await?;
                 if !paid_challenge_ids.is_empty() {
                     return Ok(resp);
                 }
@@ -336,6 +344,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         .supports(challenge.method.as_str(), challenge.intent.as_str())
                 }) {
                     if let Err(error) = exchange.check_challenge(challenge) {
+                        reject(previous.take()).await?;
                         return Err(self.fail(Some(challenge.clone()), error).await);
                     }
                 }
@@ -354,6 +363,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             ) {
                 Ok(challenge) => challenge.clone(),
                 Err(ChallengeSelectionError::Expired(challenge)) => {
+                    reject(previous.take()).await?;
                     let err = HttpError::Payment(expired_payment_error(&challenge));
                     let expires = challenge.expires.clone();
                     self.events
@@ -368,6 +378,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 Err(ChallengeSelectionError::NoSupportedChallenge(message)) => {
                     // A paid request answered with challenges the provider
                     // cannot pay is the server's final answer.
+                    reject(previous.take()).await?;
                     if !paid_challenge_ids.is_empty() {
                         return Ok(resp);
                     }
@@ -385,104 +396,177 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             if let Err(error) =
                 self.check_challenge(exchange, &challenge, ranking_accept.as_deref())
             {
+                reject(previous.take()).await?;
                 return Err(self.fail(Some(challenge), error).await);
             }
 
-            let challenge = match self
-                .provider
-                .prepare_http_payment_challenge(&challenge, payment_context.clone())
-                .await
-            {
-                Ok(Some(challenge)) => challenge,
-                Ok(None) => {
-                    if refreshed_after_provider_setup {
-                        return Err(HttpError::Payment(MppError::InvalidConfig(
-                            "payment provider repeatedly requested a fresh HTTP challenge"
-                                .to_owned(),
-                        ))
-                        .into());
-                    }
-                    refreshed_after_provider_setup = true;
-                    paid_challenge_ids.clear();
-                    resp = exchange
-                        .send(retry.try_clone().ok_or(HttpError::CloneFailed)?)
-                        .await
-                        .map_err(FlowError::Send)?;
-                    continue;
-                }
-                Err(err) => {
-                    return Err(self.fail(Some(challenge), HttpError::Payment(err)).await);
+            // As mppx does, the Challenge just answered, offered again, gets the
+            // same Credential resent rather than a second payment. Any other
+            // Challenge is a new attempt, so the previous one was refused.
+            let selected_id = challenge.id.clone();
+            let reused = match previous.take() {
+                Some((id, pending)) if id == selected_id => Some(pending),
+                other => {
+                    reject(other).await?;
+                    None
                 }
             };
-            if is_cross_realm_proof_with_trust(
-                &challenge,
-                &payment_context.url,
-                &payment_context.headers,
-                self.provider
-                    .trusted_tempo_proof_realm(&payment_context.url),
-            ) {
-                return Err(self.fail(Some(challenge), HttpError::CrossRealmProof).await);
-            }
-            // Preparation may replace the challenge. Recheck before creating
-            // a credential, including the charge-only owned transport's limit.
-            if let Err(error) =
-                self.check_challenge(exchange, &challenge, ranking_accept.as_deref())
-            {
-                return Err(self.fail(Some(challenge), error).await);
-            }
-            if let Err(error) = exchange.prepare_challenge(&resp, &challenge).await {
-                return Err(self.fail(Some(challenge), error).await);
-            }
-            payment_attempt += 1;
-
-            if !paid_challenge_ids.insert(challenge.id.clone()) {
-                self.events
-                    .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
-                        challenge: Some(challenge),
-                        error: "payment retry returned a previously paid challenge".to_string(),
-                        reason: None,
-                    }))
-                    .await;
-                return Ok(resp);
-            }
-
-            let override_credential = self
-                .events
-                .emit_challenge_received(ChallengeReceivedContext {
-                    challenge: challenge.clone(),
-                    challenges,
-                })
-                .await;
-
-            let credential = match override_credential {
-                Some(credential) => credential,
-                // A Zone withdrawal still settling is resumed for this
-                // challenge, not paid again.
-                None => match super::provider::resume_pending_settlement(
-                    self.max_payment_retries,
-                    || {
+            let (challenge, credential, pending) = match reused {
+                Some(pending) => {
+                    if is_cross_realm_proof_with_trust(
+                        &challenge,
+                        &payment_context.url,
+                        &payment_context.headers,
                         self.provider
-                            .pay_with_context(&challenge, payment_context.clone())
-                    },
-                )
-                .await
-                {
-                    Ok(credential) => credential,
-                    Err(err) => {
-                        return Err(self.fail(Some(challenge), HttpError::Payment(err)).await);
+                            .trusted_tempo_proof_realm(&payment_context.url),
+                    ) {
+                        pending.rollback().await.map_err(HttpError::Payment)?;
+                        return Err(self.fail(Some(challenge), HttpError::CrossRealmProof).await);
                     }
-                },
+                    if let Err(error) = exchange.prepare_challenge(&resp, &challenge).await {
+                        pending.rollback().await.map_err(HttpError::Payment)?;
+                        return Err(self.fail(Some(challenge), error).await);
+                    }
+                    payment_attempt += 1;
+                    let override_credential = self
+                        .events
+                        .emit_challenge_received(ChallengeReceivedContext {
+                            challenge: pending.challenge().clone(),
+                            challenges,
+                        })
+                        .await;
+                    match override_credential {
+                        None => (
+                            pending.challenge().clone(),
+                            pending.credential().clone(),
+                            pending,
+                        ),
+                        // A handler's own Credential replaces the one sent.
+                        Some(credential) => {
+                            let challenge = pending.challenge().clone();
+                            pending.rollback().await.map_err(HttpError::Payment)?;
+                            let pending = PendingPayment::new(
+                                self.provider.clone(),
+                                challenge.clone(),
+                                credential.clone(),
+                            );
+                            self.events
+                                .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
+                                    challenge: challenge.clone(),
+                                    credential: credential.clone(),
+                                }))
+                                .await;
+                            (challenge, credential, pending)
+                        }
+                    }
+                }
+                None => {
+                    let challenge = match self
+                        .provider
+                        .prepare_http_payment_challenge(&challenge, payment_context.clone())
+                        .await
+                    {
+                        Ok(Some(challenge)) => challenge,
+                        Ok(None) => {
+                            if refreshed_after_provider_setup {
+                                return Err(HttpError::Payment(MppError::InvalidConfig(
+                                    "payment provider repeatedly requested a fresh HTTP challenge"
+                                        .to_owned(),
+                                ))
+                                .into());
+                            }
+                            refreshed_after_provider_setup = true;
+                            paid_challenge_ids.clear();
+                            settled_challenge_ids.clear();
+                            resp = exchange
+                                .send(retry.try_clone().ok_or(HttpError::CloneFailed)?)
+                                .await
+                                .map_err(FlowError::Send)?;
+                            continue;
+                        }
+                        Err(err) => {
+                            return Err(self.fail(Some(challenge), HttpError::Payment(err)).await);
+                        }
+                    };
+                    if is_cross_realm_proof_with_trust(
+                        &challenge,
+                        &payment_context.url,
+                        &payment_context.headers,
+                        self.provider
+                            .trusted_tempo_proof_realm(&payment_context.url),
+                    ) {
+                        return Err(self.fail(Some(challenge), HttpError::CrossRealmProof).await);
+                    }
+                    // Preparation may replace the challenge. Recheck before creating
+                    // a credential, including the charge-only owned transport's limit.
+                    if let Err(error) =
+                        self.check_challenge(exchange, &challenge, ranking_accept.as_deref())
+                    {
+                        return Err(self.fail(Some(challenge), error).await);
+                    }
+                    if let Err(error) = exchange.prepare_challenge(&resp, &challenge).await {
+                        return Err(self.fail(Some(challenge), error).await);
+                    }
+                    payment_attempt += 1;
+
+                    paid_challenge_ids.insert(challenge.id.clone());
+                    if settled_challenge_ids.contains(&challenge.id) {
+                        self.events
+                            .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
+                                challenge: Some(challenge),
+                                error: "payment retry returned a previously paid challenge"
+                                    .to_string(),
+                                reason: None,
+                            }))
+                            .await;
+                        return Ok(resp);
+                    }
+
+                    let override_credential = self
+                        .events
+                        .emit_challenge_received(ChallengeReceivedContext {
+                            challenge: challenge.clone(),
+                            challenges,
+                        })
+                        .await;
+
+                    let credential = match override_credential {
+                        Some(credential) => credential,
+                        // A Zone withdrawal still settling is resumed for this
+                        // challenge, not paid again.
+                        None => match super::provider::resume_pending_settlement(
+                            self.max_payment_retries,
+                            || {
+                                self.provider
+                                    .pay_with_context(&challenge, payment_context.clone())
+                            },
+                        )
+                        .await
+                        {
+                            Ok(credential) => credential,
+                            Err(err) => {
+                                return Err(self
+                                    .fail(Some(challenge), HttpError::Payment(err))
+                                    .await);
+                            }
+                        },
+                    };
+
+                    let pending = PendingPayment::new(
+                        self.provider.clone(),
+                        challenge.clone(),
+                        credential.clone(),
+                    );
+
+                    self.events
+                        .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
+                            challenge: challenge.clone(),
+                            credential: credential.clone(),
+                        }))
+                        .await;
+                    (challenge, credential, pending)
+                }
             };
-
-            let pending =
-                PendingPayment::new(self.provider.clone(), challenge.clone(), credential.clone());
-
-            self.events
-                .emit(ClientEvent::CredentialCreated(CredentialCreatedContext {
-                    challenge: challenge.clone(),
-                    credential: credential.clone(),
-                }))
-                .await;
 
             let auth_header = match authorization_value(&credential) {
                 Ok(auth_header) => auth_header,
@@ -583,6 +667,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 }
                 retried_stale_session = true;
                 paid_challenge_ids.clear();
+                settled_challenge_ids.clear();
                 resp = exchange
                     .send(retry.try_clone().ok_or(HttpError::CloneFailed)?)
                     .await
@@ -615,23 +700,30 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 return Ok(resp);
             }
 
+            // A hash or Zone credential's payment is already on chain: paying
+            // a new challenge for the same request would pay twice, so its
+            // answer is final.
+            let settled = already_settled(&credential);
             if has_receipt {
                 if session_receipt_valid {
                     pending.commit().await.map_err(HttpError::Payment)?;
                 } else {
                     drop(pending);
                 }
+                settled_challenge_ids.insert(challenge.id.clone());
+            } else if status == StatusCode::PAYMENT_REQUIRED
+                && !settled
+                && payment_attempt < self.max_payment_retries
+            {
+                // Settled by the next round: resent if it offers this
+                // Challenge again, refused otherwise.
+                previous = Some((selected_id, pending));
+                continue;
             } else {
                 pending.rollback().await.map_err(HttpError::Payment)?;
             }
 
-            // A hash or Zone credential's payment is already on chain: paying
-            // a new challenge for the same request would pay twice, so its
-            // answer is final.
-            if credential
-                .charge_payload()
-                .is_ok_and(|payload| payload.is_hash() || payload.is_zone())
-            {
+            if settled {
                 return Ok(resp);
             }
 
@@ -941,6 +1033,17 @@ pub(crate) fn already_settled(credential: &PaymentCredential) -> bool {
         credential.payload.get("type").and_then(|v| v.as_str()),
         Some("hash" | "zone")
     )
+}
+
+/// Settles a previous attempt as refused: the server answered its Credential
+/// with a 402 that the flow does not answer with it again.
+async fn reject<P: PaymentProvider, E>(
+    previous: Option<(String, PendingPayment<P>)>,
+) -> Result<(), FlowError<E>> {
+    if let Some((_, pending)) = previous {
+        pending.rollback().await.map_err(HttpError::Payment)?;
+    }
+    Ok(())
 }
 
 /// The `payment.failed` reason for a credential that was sent without a
