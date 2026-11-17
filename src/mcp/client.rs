@@ -243,9 +243,7 @@ where
                 // Paying another offer after an uncertain outcome could pay twice.
                 Err(
                     error @ (MppError::PaymentOutcomeUnknown { .. }
-                    | MppError::SessionPaymentOutcomeUnknown { .. }
-                    | MppError::UnknownPaymentOutcome { .. }
-                    | MppError::Http(_)),
+                    | MppError::SessionPaymentOutcomeUnknown { .. }),
                 ) => return Err(error),
                 Err(error) => {
                     failure.get_or_insert(error);
