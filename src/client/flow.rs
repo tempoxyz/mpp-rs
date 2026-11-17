@@ -403,9 +403,19 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             // As mppx does, the Challenge just answered, offered again, gets the
             // same Credential resent rather than a second payment. Any other
             // Challenge is a new attempt, so the previous one was refused.
+            //
+            // A callback that can supply its own Credential may pay through
+            // this provider, which can hold a lease until the previous attempt
+            // is settled. Like mppx's `createCredential(overrideContext)`, the
+            // previous attempt is refused before such a callback runs, so it
+            // never waits on the Credential it replaces.
             let selected_id = challenge.id.clone();
             let reused = match previous.take() {
-                Some((id, pending)) if id == selected_id => Some(pending),
+                Some((id, pending))
+                    if id == selected_id && !self.events.may_supply_credential() =>
+                {
+                    Some(pending)
+                }
                 other => {
                     reject(other).await?;
                     None
@@ -441,7 +451,8 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                             pending.credential().clone(),
                             pending,
                         ),
-                        // A handler's own Credential replaces the one sent.
+                        // Only a callback registered since the check above
+                        // gets here; its Credential replaces the one sent.
                         Some(credential) => {
                             let challenge = pending.challenge().clone();
                             pending.rollback().await.map_err(HttpError::Payment)?;
