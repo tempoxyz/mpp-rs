@@ -750,6 +750,14 @@ impl TempoZone {
                     zone.forget_abandoned(&key, &withdrawal);
                     Err(WithdrawalFailure::Abandoned)
                 });
+                // A failure before the transaction was sent paid nothing, so
+                // its entry is forgotten here rather than only by an awaiting
+                // payment: one cancelled before the request finished would
+                // otherwise leave the failure cached, and later payments for
+                // these terms would keep failing.
+                if matches!(outcome, Err(WithdrawalFailure::Retryable(_))) {
+                    zone.forget(&key, &withdrawal);
+                }
                 (outcome, own_error)
             })
         };

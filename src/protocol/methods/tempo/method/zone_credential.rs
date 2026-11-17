@@ -72,6 +72,14 @@ pub(super) fn ensure_zone_credential_has_no_source(
     Ok(())
 }
 
+/// Whether a block produced at `settled_at_ms` (Unix milliseconds) precedes
+/// `expires_at`. The comparison keeps the expiry's sub-millisecond part, so
+/// a block in the expiry's own millisecond but before its fraction counts as
+/// earlier.
+fn settled_before(settled_at_ms: u64, expires_at: time::OffsetDateTime) -> bool {
+    i128::from(settled_at_ms) * 1_000_000 < expires_at.unix_timestamp_nanos()
+}
+
 fn zone_withdrawal_not_found() -> VerificationError {
     VerificationError::new("Payment verification failed: Zone withdrawal not found.")
 }
@@ -84,8 +92,7 @@ where
     /// `WithdrawalProcessed` event pays the recipient, and the withdrawal's
     /// memo in the `processWithdrawals` calldata binds it to this challenge.
     ///
-    /// Refuse a settlement whose block is not older than `expires_at`, at the
-    /// block's millisecond precision.
+    /// Refuse a settlement whose block is not older than `expires_at`.
     async fn ensure_settled_before(
         &self,
         receipt: &<TempoNetwork as alloy::network::Network>::ReceiptResponse,
@@ -105,9 +112,7 @@ where
         // Tempo blocks have millisecond timestamps: `BlockHeader::timestamp`
         // is only the seconds, so a settlement later in the expiry's second
         // would pass as earlier.
-        let settled_at = i128::from(block.header.inner.inner.timestamp_millis());
-        let expires_ms = expires_at.unix_timestamp_nanos() / 1_000_000;
-        if settled_at >= expires_ms {
+        if !settled_before(block.header.inner.inner.timestamp_millis(), expires_at) {
             return Err(VerificationError::expired(
                 "Payment expired: the Zone withdrawal settled after its challenge expired.",
             ));
@@ -262,5 +267,23 @@ where
             METHOD_NAME,
             format!("{:#x}", receipt.transaction_hash()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod settled_before_tests {
+    use super::settled_before;
+
+    #[test]
+    fn keeps_the_expiry_sub_millisecond_part() {
+        let expires =
+            time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_000_500_000).unwrap();
+        // The expiry's own millisecond, before its 500 µs fraction.
+        assert!(settled_before(1_700_000_000_000, expires));
+        assert!(!settled_before(1_700_000_000_001, expires));
+        let exact =
+            time::OffsetDateTime::from_unix_timestamp_nanos(1_700_000_000_000_000_000).unwrap();
+        assert!(settled_before(1_699_999_999_999, exact));
+        assert!(!settled_before(1_700_000_000_000, exact));
     }
 }
