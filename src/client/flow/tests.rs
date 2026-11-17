@@ -1512,9 +1512,9 @@ async fn settling_zone_withdrawal_is_resumed_for_the_same_challenge() {
     }
 }
 
-/// A zero-amount Tempo proof refused with a \`credit_insufficient\` 402 that
+/// A zero-amount Tempo proof refused with a `credit_insufficient` 402 that
 /// offers only the real charge starts a new challenge round, as mppx's client
-/// does. These use the real [\`TempoProvider\`](crate::client::TempoProvider) to
+/// does. These use the real [`TempoProvider`](crate::client::TempoProvider) to
 /// sign proofs and apply its spending policy.
 #[cfg(feature = "tempo")]
 mod new_challenge_rounds {
@@ -1530,7 +1530,7 @@ mod new_challenge_rounds {
     const CHAIN_ID: u64 = 42431;
     const REALM: &str = "127.0.0.1";
 
-    /// Signs zero-amount proofs with a real \`TempoProvider\` and its policy,
+    /// Signs zero-amount proofs with a real `TempoProvider` and its policy,
     /// and pays any other charge with a pull-mode transaction credential (no
     /// RPC), recording every challenge it creates a credential for.
     #[derive(Clone)]
@@ -1540,7 +1540,7 @@ mod new_challenge_rounds {
     }
 
     impl CreditProvider {
-        /// Charges are capped at 10000 base units of \`CURRENCY\`.
+        /// Charges are capped at 10000 base units of `CURRENCY`.
         fn new() -> Self {
             let signer = alloy::signers::local::PrivateKeySigner::random();
             let tempo = TempoProvider::new(signer, "https://rpc.example.com")
@@ -1647,7 +1647,7 @@ mod new_challenge_rounds {
         credential: Option<PaymentCredential>,
     }
 
-    /// Serves \`respond\` for every request, recording each one.
+    /// Serves `respond` for every request, recording each one.
     async fn spawn_credit_server<F>(respond: F) -> (String, Arc<Mutex<Vec<Seen>>>)
     where
         F: Fn(Option<&PaymentCredential>) -> axum::response::Response
