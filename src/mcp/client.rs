@@ -425,7 +425,7 @@ mod tests {
     use super::*;
     use crate::{
         mcp::{
-            extract_receipt, extract_result_payment_challenges, CREDENTIAL_META_KEY,
+            extract_receipt, extract_result_challenges, CREDENTIAL_META_KEY,
             PAYMENT_REQUIRED_META_KEY, RECEIPT_META_KEY,
         },
         Base64UrlJson, PaymentPayload,
@@ -599,9 +599,7 @@ mod tests {
             &self,
             output: &Self::Output,
         ) -> Option<Vec<PaymentChallenge>> {
-            output
-                .get("_meta")
-                .and_then(extract_result_payment_challenges)
+            output.get("_meta").and_then(extract_result_challenges)
         }
 
         fn receipt_from_output(&self, output: &Self::Output) -> Option<Receipt> {

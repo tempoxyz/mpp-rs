@@ -1839,7 +1839,18 @@ mod tests {
         challenge.header = Some("Cookie".to_string());
         let credential =
             PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
-        let header = format_authorization(&credential).unwrap();
+        // Formatting refuses the value, so encode it as a peer could.
+        assert!(format_authorization(&credential).is_err());
+        let mut json = serde_json::to_value(PaymentCredential::new(
+            test_challenge().to_echo(),
+            PaymentPayload::transaction("0xabc"),
+        ))
+        .unwrap();
+        json["challenge"]["header"] = "Cookie".into();
+        let header = format!(
+            "Payment {}",
+            base64url_encode(serde_json::to_string(&json).unwrap().as_bytes())
+        );
         assert!(matches!(
             parse_authorization(&header),
             Err(MppError::MalformedCredential(_))

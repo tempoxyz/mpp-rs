@@ -5,7 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::binding::is_payment_authorization_header;
+use super::binding::{
+    is_authorization_shorthand, is_payment_authorization_header, omit_credential_header,
+    serialize_credential_header,
+};
 use super::types::{Base64UrlJson, IntentName, MethodName};
 
 // These lived in this module before it was split; the paths stay valid.
@@ -80,8 +83,14 @@ pub struct PaymentChallenge {
     /// When omitted, clients send the credential in `Authorization`. When
     /// present, the value is `Payment-Authorization` so `Authorization` can
     /// remain in use for ordinary application authentication.
-    /// `Authorization` is the implicit default and is never advertised.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `Authorization` is the implicit default and is never advertised: set
+    /// here (any case), it is omitted when serialized. Serializing any other
+    /// value fails.
+    #[serde(
+        default,
+        skip_serializing_if = "omit_credential_header",
+        serialize_with = "serialize_credential_header"
+    )]
     pub header: Option<String>,
 }
 
@@ -365,7 +374,12 @@ impl PaymentChallenge {
             description: self.description.clone(),
             digest: self.digest.clone(),
             opaque: self.opaque.clone(),
-            header: self.header.clone(),
+            // The `Authorization` shorthand selects the default, which the
+            // echo omits as the challenge's own serialization does.
+            header: self
+                .header
+                .clone()
+                .filter(|header| !is_authorization_shorthand(header)),
         }
     }
 
@@ -571,8 +585,13 @@ pub struct ChallengeEcho {
     /// HTTP field that must carry the Payment credential.
     ///
     /// Echoed from the challenge when present. Omitted when the challenge
-    /// used the default `Authorization` field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// used the default `Authorization` field, including when set here to
+    /// `Authorization` (any case). Serializing any other value fails.
+    #[serde(
+        default,
+        skip_serializing_if = "omit_credential_header",
+        serialize_with = "serialize_credential_header"
+    )]
     pub header: Option<String>,
 }
 
@@ -1383,6 +1402,73 @@ pub(super) mod tests {
         assigned.header = Some("Cookie".to_string());
         assert_eq!(assigned.credential_header(), "Authorization");
         assert!(assigned.to_header().is_err());
+    }
+
+    #[test]
+    fn test_authorization_shorthand_is_omitted_when_serialized() {
+        for name in ["Authorization", "authorization", "AUTHORIZATION"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+
+            let json = serde_json::to_value(&challenge).unwrap();
+            assert!(json.get("header").is_none(), "{name}: {json}");
+            let received: PaymentChallenge = serde_json::from_value(json).unwrap();
+            assert!(received.header.is_none(), "{name}");
+            assert!(
+                !challenge.to_header().unwrap().contains("header="),
+                "{name}"
+            );
+
+            let echo = challenge.to_echo();
+            assert!(echo.header.is_none(), "{name}");
+            let mut assigned = echo.clone();
+            assigned.header = Some(name.to_string());
+            let json = serde_json::to_value(&assigned).unwrap();
+            assert!(json.get("header").is_none(), "{name}: {json}");
+
+            let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x1"));
+            let parsed = super::super::parse_authorization(
+                &super::super::format_authorization(&credential).unwrap(),
+            )
+            .unwrap();
+            assert!(parsed.challenge.header.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_payment_authorization_header_is_serialized_as_bound() {
+        for name in ["Payment-Authorization", "payment-authorization"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+
+            let json = serde_json::to_value(&challenge).unwrap();
+            assert_eq!(json["header"], name);
+            let received: PaymentChallenge = serde_json::from_value(json).unwrap();
+            assert_eq!(received.header.as_deref(), Some(name));
+            assert_eq!(received.credential_header(), "Payment-Authorization");
+
+            let echo = serde_json::to_value(challenge.to_echo()).unwrap();
+            assert_eq!(echo["header"], name);
+        }
+    }
+
+    #[test]
+    fn test_unsupported_credential_header_fails_to_serialize() {
+        for name in ["", "X-Payment", "Cookie"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+            assert!(serde_json::to_value(&challenge).is_err(), "{name:?}");
+            assert!(challenge.to_header().is_err(), "{name:?}");
+
+            let echo = challenge.to_echo();
+            assert_eq!(echo.header.as_deref(), Some(name));
+            assert!(serde_json::to_value(&echo).is_err(), "{name:?}");
+            let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x1"));
+            assert!(
+                super::super::format_authorization(&credential).is_err(),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]

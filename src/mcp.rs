@@ -269,8 +269,8 @@ pub fn extract_challenges(error: &serde_json::Value) -> Option<Vec<PaymentChalle
 ///
 /// A challenge whose `header` selects anything but `Payment-Authorization`
 /// is skipped too, as no credential may be sent for it. Returns `None` when
-/// no valid challenge remains; see [`extract_result_payment_challenges`] to
-/// keep such a payment requirement.
+/// no valid challenge remains; [`extract_result_challenges`] instead keeps
+/// such a payment requirement in a tool result.
 pub fn extract_challenges_from_data(
     payment_required: &serde_json::Value,
 ) -> Option<Vec<PaymentChallenge>> {
@@ -289,26 +289,13 @@ pub fn extract_receipt(meta: &serde_json::Value) -> Option<Receipt> {
 /// Extract challenges from an MCP tool result's payment-required metadata.
 ///
 /// Expects the result `_meta` object (not the complete tool result). Returns
-/// `None` when the metadata key is absent or it lists no valid challenge.
+/// `None` when the metadata key is absent or it lists no valid challenge,
+/// except that it returns `Some` with an empty list when every listed
+/// challenge was skipped and at least one of them selected a credential header
+/// other than `Payment-Authorization`. The result still requires payment, so
+/// [`McpClient`](client::McpClient) returns it unpaid, and rolls back a paid
+/// retry answered with it instead of committing it.
 pub fn extract_result_challenges(meta: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
-    extract_challenges_from_data(meta.get(PAYMENT_REQUIRED_META_KEY)?)
-}
-
-/// Extracts challenges from an MCP tool result's payment-required metadata,
-/// keeping the payment requirement when no challenge is usable because of its
-/// credential header.
-///
-/// Returns what [`extract_result_challenges`] returns, except that it returns
-/// `Some` with an empty list when every listed challenge was skipped and at
-/// least one of them selected a credential header other than
-/// `Payment-Authorization`. Use it in
-/// [`ToolCaller::payment_challenges_from_output`](client::ToolCaller::payment_challenges_from_output)
-/// so that [`McpClient`](client::McpClient) treats such a result as offering no
-/// supported challenge: it returns the result unpaid, and rolls back a paid
-/// retry instead of committing it.
-pub fn extract_result_payment_challenges(
-    meta: &serde_json::Value,
-) -> Option<Vec<PaymentChallenge>> {
     let entries = meta
         .get(PAYMENT_REQUIRED_META_KEY)?
         .get("challenges")?
@@ -627,9 +614,8 @@ mod tests {
                 let data = serde_json::json!({ "challenges": challenges });
                 assert!(extract_challenges_from_data(&data).is_none(), "{header:?}");
                 let meta = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: data });
-                assert!(extract_result_challenges(&meta).is_none(), "{header:?}");
                 assert_eq!(
-                    extract_result_payment_challenges(&meta).map(|c| c.len()),
+                    extract_result_challenges(&meta).map(|c| c.len()),
                     Some(0),
                     "{header:?}"
                 );
@@ -645,12 +631,11 @@ mod tests {
             Some("payment-authorization")
         );
         let meta = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: data });
-        assert_eq!(extract_result_payment_challenges(&meta).unwrap().len(), 1);
+        assert_eq!(extract_result_challenges(&meta).unwrap().len(), 1);
 
         let malformed = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: {"challenges": [{}]} });
         assert!(extract_result_challenges(&malformed).is_none());
-        assert!(extract_result_payment_challenges(&malformed).is_none());
-        assert!(extract_result_payment_challenges(&serde_json::json!({})).is_none());
+        assert!(extract_result_challenges(&serde_json::json!({})).is_none());
     }
 
     #[test]

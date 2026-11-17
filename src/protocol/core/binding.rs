@@ -152,8 +152,37 @@ pub(super) fn local_credential_header(
     header: Option<&str>,
 ) -> crate::error::Result<Option<String>> {
     match header {
-        Some(name) if name.eq_ignore_ascii_case(super::AUTHORIZATION_HEADER) => Ok(None),
+        Some(name) if is_authorization_shorthand(name) => Ok(None),
         _ => parse_advertised_credential_header(header),
+    }
+}
+
+/// Returns whether a locally set credential header is the `Authorization`
+/// shorthand (any case) for the default, which is never emitted.
+pub(super) fn is_authorization_shorthand(header: &str) -> bool {
+    header.eq_ignore_ascii_case(super::AUTHORIZATION_HEADER)
+}
+
+/// Serde `skip_serializing_if` for a `header` field: omits it when absent or
+/// the `Authorization` shorthand, as `WWW-Authenticate` formatting does.
+pub(super) fn omit_credential_header(header: &Option<String>) -> bool {
+    header.as_deref().is_none_or(is_authorization_shorthand)
+}
+
+/// Serde `serialize_with` for a `header` field: emits
+/// `Payment-Authorization` in the spelling stored, which the challenge id
+/// binds, and fails for any other value instead of sending a header that
+/// receivers reject.
+pub(super) fn serialize_credential_header<S>(
+    header: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match local_credential_header(header.as_deref()).map_err(serde::ser::Error::custom)? {
+        Some(name) => serializer.serialize_some(&name),
+        None => serializer.serialize_none(),
     }
 }
 
