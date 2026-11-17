@@ -114,6 +114,7 @@ pub mod transaction;
 pub mod transfers;
 pub mod types;
 pub mod voucher;
+pub mod zone;
 
 #[cfg(feature = "server")]
 pub mod method;

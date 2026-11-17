@@ -71,6 +71,7 @@ mod auth_params;
 mod binding;
 pub mod challenge;
 mod credential;
+pub(crate) mod expiry_grace;
 pub mod headers;
 mod receipt;
 pub mod types;
