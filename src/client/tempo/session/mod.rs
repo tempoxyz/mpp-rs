@@ -312,6 +312,9 @@ struct SessionPaymentLease {
     /// Channel the leased credential pays from, so commit and rollback are
     /// routed to the provider whose lease matches the credential's channel.
     channel_id: Option<String>,
+    /// Payload of the leased credential, so settling another credential for
+    /// the same challenge (one it replaced) leaves this lease held.
+    payload: Option<serde_json::Value>,
     _process: tokio::sync::OwnedMutexGuard<()>,
     _store: Box<dyn ChannelStoreLease>,
 }
@@ -1014,10 +1017,35 @@ impl TempoSessionProvider {
             challenge_id.to_owned(),
             SessionPaymentLease {
                 channel_id: channel_id.map(str::to_owned),
+                payload: None,
                 _process: process,
                 _store: store,
             },
         );
+    }
+
+    /// Removes the payment lease for `challenge` that `credential` holds.
+    ///
+    /// A Challenge offered again may be paid again while its previous
+    /// credential, already released, is still unsettled: settling that
+    /// previous credential must not free the new one's lease.
+    fn take_lease(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Option<SessionPaymentLease> {
+        let mut leases = self.pending_payment_leases.lock().unwrap();
+        let held = leases.get(&challenge.id).is_some_and(|lease| {
+            lease
+                .payload
+                .as_ref()
+                .is_none_or(|payload| *payload == credential.payload)
+        });
+        if held {
+            leases.remove(&challenge.id)
+        } else {
+            None
+        }
     }
 
     /// Whether a payment lease for `challenge_id` is pending.
@@ -3918,6 +3946,7 @@ impl TempoSessionProvider {
             challenge.id.clone(),
             SessionPaymentLease {
                 channel_id: Self::credential_channel_id(&credential),
+                payload: Some(credential.payload.clone()),
                 _process: process_lease,
                 _store: store_lease,
             },
@@ -4600,11 +4629,7 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
-        let lease = self
-            .pending_payment_leases
-            .lock()
-            .unwrap()
-            .remove(&challenge.id);
+        let lease = self.take_lease(challenge, credential);
         if let Some(id) = Self::credential_channel_id(credential) {
             let entry = {
                 let key = self.channel_id_to_key.lock().unwrap().get(&id).cloned();
@@ -4628,11 +4653,7 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
-        let lease = self
-            .pending_payment_leases
-            .lock()
-            .unwrap()
-            .remove(&challenge.id);
+        let lease = self.take_lease(challenge, credential);
         let result = self.rollback_credential(challenge, credential).await;
         drop(lease);
         result
@@ -4643,21 +4664,14 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
-        let lease = self
-            .pending_payment_leases
-            .lock()
-            .unwrap()
-            .remove(&challenge.id);
+        let lease = self.take_lease(challenge, credential);
         let result = self.invalidate_credential(challenge, credential).await;
         drop(lease);
         result
     }
 
-    fn abandon_payment(&self, challenge: &PaymentChallenge, _credential: &PaymentCredential) {
-        self.pending_payment_leases
-            .lock()
-            .unwrap()
-            .remove(&challenge.id);
+    fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
+        drop(self.take_lease(challenge, credential));
     }
 
     async fn prepaid_credential(
@@ -9622,6 +9636,43 @@ mod tests {
             if cumulative_amount.parse::<u128>().unwrap() > channel.cumulative_amount)
         );
         provider.abandon_payment(&challenge, &next);
+    }
+
+    /// A Challenge offered again may be paid again after its previous
+    /// credential was released: settling the previous credential leaves the
+    /// new one's payment lease held.
+    #[tokio::test]
+    async fn settling_a_replaced_credential_keeps_the_replacement_lease() {
+        let provider = make_test_provider();
+        let challenge = make_scoped_challenge(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0x33),
+        );
+        let replaced = PaymentCredential::new(challenge.to_echo(), serde_json::json!({ "n": 1 }));
+        let replacement =
+            PaymentCredential::new(challenge.to_echo(), serde_json::json!({ "n": 2 }));
+        provider.hold_test_lease(&challenge.id, None).await;
+        provider
+            .pending_payment_leases
+            .lock()
+            .unwrap()
+            .get_mut(&challenge.id)
+            .unwrap()
+            .payload = Some(replacement.payload.clone());
+
+        provider.abandon_payment(&challenge, &replaced);
+        provider
+            .rollback_payment(&challenge, &replaced)
+            .await
+            .unwrap();
+        assert!(provider.has_pending_lease(&challenge.id));
+
+        provider
+            .commit_payment(&challenge, &replacement)
+            .await
+            .unwrap();
+        assert!(!provider.has_pending_lease(&challenge.id));
     }
 
     #[tokio::test]

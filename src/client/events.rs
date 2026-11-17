@@ -267,16 +267,7 @@ impl Drop for ClientEventSubscription {
 struct ClientEventsInner {
     next_id: AtomicUsize,
     challenge_received: Mutex<Vec<(usize, ChallengeReceivedHandler)>>,
-    event_handlers: Mutex<Vec<RegisteredEventHandler>>,
-}
-
-struct RegisteredEventHandler {
-    id: usize,
-    kind: Option<ClientEventKind>,
-    /// Whether it can answer `challenge.received` with a Credential: it
-    /// receives that event and returns something other than `()`.
-    supplies_credential: bool,
-    handler: EventHandler,
+    event_handlers: Mutex<Vec<(usize, Option<ClientEventKind>, EventHandler)>>,
 }
 
 /// Cloneable registry for client payment event callbacks.
@@ -317,12 +308,12 @@ impl ClientEvents {
     /// Returning `Some(credential)` bypasses the provider's default payment
     /// flow for this challenge.
     ///
-    /// While a callback that can return a Credential is registered, a
-    /// Challenge offered again after its Credential was sent is a new
-    /// attempt: the previous Credential is rolled back before the callback
-    /// runs, so the callback may pay through the same provider, and the
-    /// provider pays again when it returns `None`. Without one, the previous
-    /// Credential is resent.
+    /// As in mppx, a Challenge offered again after its Credential was sent
+    /// keeps that Credential: it is released before the callback runs, so the
+    /// callback may pay through the same provider. Returning a different
+    /// Credential rolls the previous one back and sends the new one; returning
+    /// `None` (or the same Credential) resends the previous Credential, never a
+    /// second payment.
     pub fn on_challenge_received<F, Fut>(&self, handler: F) -> ClientEventSubscription
     where
         F: Fn(ChallengeReceivedContext) -> Fut + Send + Sync + 'static,
@@ -467,19 +458,6 @@ impl ClientEvents {
         override_credential
     }
 
-    /// Whether a registered callback can answer `challenge.received` with its
-    /// own Credential. Observers returning `()` cannot.
-    pub(crate) fn may_supply_credential(&self) -> bool {
-        !self.inner.challenge_received.lock().unwrap().is_empty()
-            || self
-                .inner
-                .event_handlers
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|registered| registered.supplies_credential)
-    }
-
     pub(crate) async fn emit(&self, event: ClientEvent) -> Option<PaymentCredential> {
         let handlers: Vec<_> = self
             .inner
@@ -487,8 +465,8 @@ impl ClientEvents {
             .lock()
             .unwrap()
             .iter()
-            .filter(|registered| registered.kind.is_none_or(|kind| kind == event.kind()))
-            .map(|registered| registered.handler.clone())
+            .filter(|(_, kind, _)| kind.is_none_or(|kind| kind == event.kind()))
+            .map(|(_, _, handler)| handler.clone())
             .collect();
 
         let mut override_credential = None;
@@ -512,9 +490,6 @@ impl ClientEvents {
         R: IntoClientEventResult + Send + 'static,
     {
         let id = self.next_id();
-        let supplies_credential = kind
-            .is_none_or(|kind| kind == ClientEventKind::ChallengeReceived)
-            && std::any::TypeId::of::<R>() != std::any::TypeId::of::<()>();
         let wrapped: EventHandler = Arc::new(move |event| {
             let future = handler(event);
             Box::pin(async move { future.await.into_credential() })
@@ -524,19 +499,14 @@ impl ClientEvents {
             .event_handlers
             .lock()
             .unwrap()
-            .push(RegisteredEventHandler {
-                id,
-                kind,
-                supplies_credential,
-                handler: wrapped,
-            });
+            .push((id, kind, wrapped));
         let inner = self.inner.clone();
         ClientEventSubscription::new(move || {
             inner
                 .event_handlers
                 .lock()
                 .unwrap()
-                .retain(|registered| registered.id != id);
+                .retain(|(handler_id, _, _)| *handler_id != id);
         })
     }
 

@@ -274,11 +274,14 @@ pub trait PaymentProvider: Clone + Send + Sync {
         self.rollback_payment(challenge, credential)
     }
 
-    /// Release transient delivery state when a paid request future is dropped.
+    /// Release transient delivery state when a paid request future is dropped,
+    /// or when its Credential is kept to be sent again
+    /// ([`PendingPayment::release`]).
     ///
     /// This hook is synchronous because cancellation is observed from `Drop`.
     /// Providers must preserve any durable or ambiguously delivered payment
-    /// state; this is only for resources such as delivery-ordering leases.
+    /// state, and the Credential must stay valid to send again; this is only
+    /// for resources such as delivery-ordering leases.
     fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
         let _ = (challenge, credential);
     }
@@ -394,6 +397,19 @@ impl<P: PaymentProvider> PendingPayment<P> {
     /// Returns the credential to send to the server.
     pub fn credential(&self) -> &PaymentCredential {
         &self.credential
+    }
+
+    /// Releases transient delivery state, such as a delivery-ordering lease,
+    /// while the Credential stays valid to send again.
+    ///
+    /// The payment is still settled later by [`commit`](Self::commit),
+    /// [`rollback`](Self::rollback) or [`invalidate`](Self::invalidate). As
+    /// mppx settles a Challenge offered again as pending, the payment flow
+    /// releases its Credential before a `challenge.received` callback runs, so
+    /// a callback paying through the same provider does not wait on it.
+    pub fn release(&self) {
+        self.provider
+            .abandon_payment(&self.challenge, &self.credential);
     }
 
     /// Commits provider state after the server accepts the credential.

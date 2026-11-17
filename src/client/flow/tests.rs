@@ -2142,9 +2142,10 @@ mod new_challenge_rounds {
         }
     }
 
-    /// Holds one payment lock from `pay` until the payment is settled, as
-    /// `TempoSessionProvider` holds its payment lease until the server's
-    /// answer is reconciled.
+    /// Holds one payment lock from `pay` until the payment is settled or
+    /// released, as `TempoSessionProvider` holds its payment lease until the
+    /// server's answer is reconciled. Leases are keyed by Credential, so
+    /// settling a replaced Credential leaves its replacement's lease held.
     #[derive(Clone, Default)]
     struct LeasingProvider {
         lock: Arc<tokio::sync::Mutex<()>>,
@@ -2183,39 +2184,44 @@ mod new_challenge_rounds {
                 paid.push(challenge.id.clone());
                 paid.len()
             };
-            self.leases
-                .lock()
-                .unwrap()
-                .insert(challenge.id.clone(), lease);
+            let signature = format!("0x76{count:02}");
+            self.leases.lock().unwrap().insert(signature.clone(), lease);
             Ok(PaymentCredential::new(
                 challenge.to_echo(),
-                PaymentPayload::transaction(format!("0x76{count:02}")),
+                PaymentPayload::transaction(signature),
             ))
         }
 
         async fn commit_payment(
             &self,
-            challenge: &PaymentChallenge,
-            _: &PaymentCredential,
+            _: &PaymentChallenge,
+            credential: &PaymentCredential,
         ) -> Result<(), MppError> {
-            self.leases.lock().unwrap().remove(&challenge.id);
+            self.leases.lock().unwrap().remove(&lease_key(credential));
             self.commits.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
         async fn rollback_payment(
             &self,
-            challenge: &PaymentChallenge,
-            _: &PaymentCredential,
+            _: &PaymentChallenge,
+            credential: &PaymentCredential,
         ) -> Result<(), MppError> {
-            self.leases.lock().unwrap().remove(&challenge.id);
+            self.leases.lock().unwrap().remove(&lease_key(credential));
             self.rollbacks.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
-        fn abandon_payment(&self, challenge: &PaymentChallenge, _: &PaymentCredential) {
-            self.leases.lock().unwrap().remove(&challenge.id);
+        fn abandon_payment(&self, _: &PaymentChallenge, credential: &PaymentCredential) {
+            self.leases.lock().unwrap().remove(&lease_key(credential));
         }
+    }
+
+    fn lease_key(credential: &PaymentCredential) -> String {
+        credential.payload["signature"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
     }
 
     async fn get_with_events(
@@ -2275,7 +2281,8 @@ mod new_challenge_rounds {
 
     /// A `challenge.received` handler that pays through the provider, like
     /// mppx's `createCredential(overrideContext)`, is not left waiting on the
-    /// lease of the Credential it replaces.
+    /// lease of the Credential it replaces: that Credential is released
+    /// before the handler runs, then rolled back once the replacement exists.
     #[tokio::test]
     async fn reoffered_challenge_override_paid_through_the_provider_completes() {
         let (url, seen, answered) = spawn_reoffering_server().await;
@@ -2285,11 +2292,17 @@ mod new_challenge_rounds {
             answered.store(0, Ordering::SeqCst);
             let provider = LeasingProvider::default();
             let events = ClientEvents::default();
+            let leases_seen = Arc::new(Mutex::new(Vec::new()));
             let _sub = events.on_challenge_received({
                 let provider = provider.clone();
+                let leases_seen = leases_seen.clone();
                 move |ctx| {
                     let provider = provider.clone();
-                    async move { provider.pay(&ctx.challenge).await.ok() }
+                    let leases_seen = leases_seen.clone();
+                    async move {
+                        leases_seen.lock().unwrap().push(provider.leases());
+                        provider.pay(&ctx.challenge).await.ok()
+                    }
                 }
             });
 
@@ -2299,8 +2312,12 @@ mod new_challenge_rounds {
 
             assert_eq!(response.status(), StatusCode::OK, "{via:?}");
             assert_eq!(provider.paid(), ["charge-1", "charge-1"], "{via:?}");
-            // The refused Credential is rolled back once, before the handler's
-            // replacement is created, and the replacement is what is sent.
+            // Called on the first 402 and on the re-offer, after the refused
+            // Credential's lease was released.
+            assert_eq!(*leases_seen.lock().unwrap(), [0, 0], "{via:?}");
+            // The first 402's handler pays once (a Credential the flow sends);
+            // on the re-offer the handler's replacement is sent and the
+            // refused Credential is rolled back once.
             let credentials = credentials(&seen);
             assert_eq!(credentials.len(), 2, "{via:?}");
             assert_ne!(credentials[0], credentials[1], "{via:?}");
@@ -2310,28 +2327,35 @@ mod new_challenge_rounds {
         }
     }
 
-    /// Without a handler that can supply a Credential, a Challenge offered
-    /// again gets the same Credential resent, still under its lease.
+    /// With no handler, or only an `on_any` observer (even one whose return
+    /// type could carry a Credential), a Challenge offered again gets the same
+    /// Credential resent, never a second payment.
     #[tokio::test]
     async fn reoffered_challenge_without_override_handler_resends_the_credential() {
         let (url, seen, answered) = spawn_reoffering_server().await;
 
-        for observe in [false, true] {
+        // 0: no handler; 1: `on_any` returning `()`; 2: `on_any` returning
+        // `Option<PaymentCredential>`, always `None`.
+        for observer in 0..3 {
+            let observe = observer > 0;
             for via in BOTH {
                 seen.lock().unwrap().clear();
                 answered.store(0, Ordering::SeqCst);
                 let provider = LeasingProvider::default();
                 let events = ClientEvents::default();
                 let observed = Arc::new(AtomicUsize::new(0));
-                let _sub = observe.then(|| {
-                    events.on_any({
-                        let observed = observed.clone();
-                        move |_| {
-                            observed.fetch_add(1, Ordering::SeqCst);
-                            async {}
-                        }
-                    })
-                });
+                let observed_by = observed.clone();
+                let _sub = match observer {
+                    1 => Some(events.on_any(move |_| {
+                        observed_by.fetch_add(1, Ordering::SeqCst);
+                        async {}
+                    })),
+                    2 => Some(events.on_any(move |_| {
+                        observed_by.fetch_add(1, Ordering::SeqCst);
+                        async { None::<PaymentCredential> }
+                    })),
+                    _ => None,
+                };
 
                 let response = get_with_events(via, &url, &provider, events)
                     .await
@@ -2349,10 +2373,10 @@ mod new_challenge_rounds {
         }
     }
 
-    /// A handler that could have supplied a Credential but did not leaves the
-    /// refused one rolled back, so the provider pays the Challenge again.
+    /// A handler that returns the Credential already sent (as a session
+    /// provider replays a released open) resends it rather than voiding it.
     #[tokio::test]
-    async fn reoffered_challenge_declined_by_handler_is_paid_again() {
+    async fn reoffered_challenge_handler_returning_the_sent_credential_resends_it() {
         let (url, seen, answered) = spawn_reoffering_server().await;
 
         for via in BOTH {
@@ -2360,18 +2384,60 @@ mod new_challenge_rounds {
             answered.store(0, Ordering::SeqCst);
             let provider = LeasingProvider::default();
             let events = ClientEvents::default();
-            let _sub = events.on_challenge_received(|_| async { None });
+            let _sub = events.on_challenge_received(|ctx| async move {
+                Some(PaymentCredential::new(
+                    ctx.challenge.to_echo(),
+                    PaymentPayload::transaction("0x7699"),
+                ))
+            });
 
             let response = get_with_events(via, &url, &provider, events)
                 .await
                 .unwrap_or_else(|err| panic!("{via:?}: {err}"));
 
             assert_eq!(response.status(), StatusCode::OK, "{via:?}");
-            assert_eq!(provider.paid(), ["charge-1", "charge-1"], "{via:?}");
+            assert!(provider.paid().is_empty(), "{via:?}");
             let credentials = credentials(&seen);
             assert_eq!(credentials.len(), 2, "{via:?}");
-            assert_ne!(credentials[0], credentials[1], "{via:?}");
-            assert_eq!(provider.settled(), (1, 1), "{via:?}");
+            assert_eq!(credentials[0], credentials[1], "{via:?}");
+            assert_eq!(provider.settled(), (1, 0), "{via:?}");
+        }
+    }
+
+    /// A handler that declines (returns `None`) on a Challenge offered again
+    /// gets the same Credential resent, as mppx resends the previous
+    /// Credential, rather than a second payment for the same Challenge.
+    #[tokio::test]
+    async fn reoffered_challenge_declined_by_handler_resends_the_credential() {
+        let (url, seen, answered) = spawn_reoffering_server().await;
+
+        for via in BOTH {
+            seen.lock().unwrap().clear();
+            answered.store(0, Ordering::SeqCst);
+            let provider = LeasingProvider::default();
+            let events = ClientEvents::default();
+            let leases_seen = Arc::new(Mutex::new(Vec::new()));
+            let _sub = events.on_challenge_received({
+                let provider = provider.clone();
+                let leases_seen = leases_seen.clone();
+                move |_| {
+                    leases_seen.lock().unwrap().push(provider.leases());
+                    async { None }
+                }
+            });
+
+            let response = get_with_events(via, &url, &provider, events)
+                .await
+                .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+
+            assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+            assert_eq!(provider.paid(), ["charge-1"], "{via:?}");
+            // The handler ran on the re-offer with the lease released.
+            assert_eq!(*leases_seen.lock().unwrap(), [0, 0], "{via:?}");
+            let credentials = credentials(&seen);
+            assert_eq!(credentials.len(), 2, "{via:?}");
+            assert_eq!(credentials[0], credentials[1], "{via:?}");
+            assert_eq!(provider.settled(), (1, 0), "{via:?}");
             assert_eq!(provider.leases(), 0, "{via:?}");
         }
     }

@@ -275,8 +275,10 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
         };
 
         let mut paid_challenge_ids = HashSet::new();
-        // Challenges whose payment was committed: never paid again.
-        let mut settled_challenge_ids = HashSet::new();
+        // Challenges whose Credential was sent and not voided (committed, or
+        // left unsettled because the payment may have settled): never paid
+        // again by the provider. A Credential rolled back is void.
+        let mut unvoided_challenge_ids = HashSet::new();
         // The selected Challenge's id and the Credential that answered it, while
         // the server's 402 to that Credential is being answered.
         let mut previous: Option<(String, PendingPayment<P>)> = None;
@@ -403,23 +405,15 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
             // As mppx does, the Challenge just answered, offered again, gets the
             // same Credential resent rather than a second payment. Any other
             // Challenge is a new attempt, so the previous one was refused.
-            //
-            // A callback that can supply its own Credential may pay through
-            // this provider, which can hold a lease until the previous attempt
-            // is settled. Like mppx's `createCredential(overrideContext)`, the
-            // previous attempt is refused before such a callback runs, so it
-            // never waits on the Credential it replaces.
             let selected_id = challenge.id.clone();
             let reused = match previous.take() {
-                Some((id, pending))
-                    if id == selected_id && !self.events.may_supply_credential() =>
-                {
-                    Some(pending)
-                }
-                other => {
-                    reject(other).await?;
+                Some((id, pending)) if id == selected_id => Some(pending),
+                Some((id, pending)) => {
+                    pending.rollback().await.map_err(HttpError::Payment)?;
+                    unvoided_challenge_ids.remove(&id);
                     None
                 }
+                None => None,
             };
             let (challenge, credential, pending) = match reused {
                 Some(pending) => {
@@ -438,6 +432,10 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         return Err(self.fail(Some(challenge), error).await);
                     }
                     payment_attempt += 1;
+                    // Like mppx's pending settlement, release the provider's
+                    // hold on the Credential, which stays valid, so a callback
+                    // paying through this provider does not wait on it.
+                    pending.release();
                     let override_credential = self
                         .events
                         .emit_challenge_received(ChallengeReceivedContext {
@@ -446,13 +444,22 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                         })
                         .await;
                     match override_credential {
+                        // Declined, or no callback: resend the same Credential.
+                        // A callback that returns that Credential (a provider
+                        // may sign a released open again unchanged) resends it
+                        // too, rather than voiding what it sends.
                         None => (
                             pending.challenge().clone(),
                             pending.credential().clone(),
                             pending,
                         ),
-                        // Only a callback registered since the check above
-                        // gets here; its Credential replaces the one sent.
+                        Some(credential) if same_credential(&credential, pending.credential()) => (
+                            pending.challenge().clone(),
+                            pending.credential().clone(),
+                            pending,
+                        ),
+                        // The callback's own Credential replaces the one sent,
+                        // which is refused.
                         Some(credential) => {
                             let challenge = pending.challenge().clone();
                             pending.rollback().await.map_err(HttpError::Payment)?;
@@ -488,7 +495,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                             }
                             refreshed_after_provider_setup = true;
                             paid_challenge_ids.clear();
-                            settled_challenge_ids.clear();
+                            unvoided_challenge_ids.clear();
                             resp = exchange
                                 .send(retry.try_clone().ok_or(HttpError::CloneFailed)?)
                                 .await
@@ -521,7 +528,9 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     payment_attempt += 1;
 
                     paid_challenge_ids.insert(challenge.id.clone());
-                    if settled_challenge_ids.contains(&challenge.id) {
+                    // A Credential that was sent and not voided may already
+                    // pay this Challenge.
+                    if !unvoided_challenge_ids.insert(challenge.id.clone()) {
                         self.events
                             .emit(ClientEvent::PaymentFailed(PaymentFailedContext {
                                 challenge: Some(challenge),
@@ -678,7 +687,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 }
                 retried_stale_session = true;
                 paid_challenge_ids.clear();
-                settled_challenge_ids.clear();
+                unvoided_challenge_ids.clear();
                 resp = exchange
                     .send(retry.try_clone().ok_or(HttpError::CloneFailed)?)
                     .await
@@ -721,7 +730,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 } else {
                     drop(pending);
                 }
-                settled_challenge_ids.insert(challenge.id.clone());
+                unvoided_challenge_ids.insert(challenge.id.clone());
             } else if status == StatusCode::PAYMENT_REQUIRED
                 && !settled
                 && payment_attempt < self.max_payment_retries
@@ -732,6 +741,7 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 continue;
             } else {
                 pending.rollback().await.map_err(HttpError::Payment)?;
+                unvoided_challenge_ids.remove(&challenge.id);
             }
 
             if settled {
@@ -1044,6 +1054,15 @@ pub(crate) fn already_settled(credential: &PaymentCredential) -> bool {
         credential.payload.get("type").and_then(|v| v.as_str()),
         Some("hash" | "zone")
     )
+}
+
+/// Whether two Credentials serialize identically, so sending either is the
+/// same payment.
+fn same_credential(a: &PaymentCredential, b: &PaymentCredential) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Settles a previous attempt as refused: the server answered its Credential
