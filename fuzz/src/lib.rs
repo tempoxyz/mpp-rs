@@ -2,8 +2,7 @@
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use mpp::protocol::core::{
-    advertised_credential_header, is_default_credential_header, Base64UrlJson, ChallengeEcho,
-    MethodName, PaymentChallenge,
+    advertised_credential_header, Base64UrlJson, ChallengeEcho, MethodName, PaymentChallenge,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -325,9 +324,17 @@ pub fn quoted_values(challenge: &PaymentChallenge) -> Vec<&str> {
     values
 }
 
-/// Whether the `header` field names a credential header the SDK supports.
+/// Whether a received challenge or Credential echo may carry this `header`
+/// field: absent, or `Payment-Authorization` in any case.
 pub fn has_supported_header(header: Option<&str>) -> bool {
-    is_default_credential_header(header) || advertised_credential_header(header).is_some()
+    header.is_none() || advertised_credential_header(header).is_some()
+}
+
+/// Whether a challenge with this `header` field formats: a supported one, or
+/// `Authorization` in any case as shorthand for the default.
+pub fn has_formattable_header(header: Option<&str>) -> bool {
+    has_supported_header(header)
+        || header.is_some_and(|name| name.eq_ignore_ascii_case("Authorization"))
 }
 
 /// The `header` field as the wire carries it: `Authorization` is the implicit

@@ -462,6 +462,75 @@ async fn custom_header_offer_falls_back_to_safe_challenge() {
     }
 }
 
+/// Serves a 402 with `challenges` until a request carries a credential.
+async fn spawn_challenging_server(challenges: String) -> String {
+    let app = Router::new().route(
+        "/paid",
+        get(move |request: Request<Body>| {
+            let challenges = challenges.clone();
+            async move {
+                if is_paid(&request) {
+                    StatusCode::OK.into_response()
+                } else {
+                    (
+                        StatusCode::PAYMENT_REQUIRED,
+                        [(WWW_AUTHENTICATE, challenges)],
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    spawn_server(app).await
+}
+
+/// A challenge whose raw `header` auth-param selects `name`.
+fn www_authenticate_with_header(id: &str, name: &str) -> String {
+    format!(
+        r#"{}, header="{name}""#,
+        www_authenticate(id, "tempo", "charge")
+    )
+}
+
+#[tokio::test]
+async fn unsupported_credential_header_offer_is_skipped_for_valid_challenge() {
+    for name in ["Authorization", "X-Payment"] {
+        let url = spawn_challenging_server(format!(
+            "{}, {}",
+            www_authenticate_with_header("unsupported", name),
+            www_authenticate("valid", "tempo", "charge"),
+        ))
+        .await;
+        for via in BOTH {
+            let provider = TestProvider::default();
+            let request = reqwest::Client::new().get(format!("{url}/paid"));
+            let response = via
+                .send(request, &provider, ClientEvents::default())
+                .await
+                .unwrap_or_else(|err| panic!("{name} {via:?}: {err}"));
+            assert_eq!(response.status(), StatusCode::OK, "{name} {via:?}");
+            assert_eq!(provider.paid(), ["valid"], "{name} {via:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn only_unsupported_credential_header_offer_is_never_paid() {
+    for name in ["Authorization", "X-Payment"] {
+        let url = spawn_challenging_server(www_authenticate_with_header("unsupported", name)).await;
+        for via in BOTH {
+            let provider = TestProvider::default();
+            let request = reqwest::Client::new().get(format!("{url}/paid"));
+            let result = via.send(request, &provider, ClientEvents::default()).await;
+            assert!(
+                matches!(result, Err(HttpError::NoSupportedChallenge(_))),
+                "{name} {via:?}: {result:?}"
+            );
+            assert!(provider.paid().is_empty(), "{name} {via:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn unchallenged_402_after_payment_is_returned() {
     let app = Router::new().route(

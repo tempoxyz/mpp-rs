@@ -128,11 +128,18 @@ pub struct McpPaymentErrorData {
 /// Extract a payment credential from MCP request metadata (`_meta`).
 ///
 /// Expects the `_meta` object (not the full params). Returns `None` if the
-/// credential key is missing or the value cannot be deserialized.
+/// credential key is missing or the value cannot be deserialized, including
+/// when its echoed challenge selects a credential header other than
+/// `Payment-Authorization`.
 pub fn extract_credential(meta: &serde_json::Value) -> Option<PaymentCredential> {
     let mut credential = meta.get(CREDENTIAL_META_KEY)?.clone();
     normalize_wire_challenge(credential.get_mut("challenge")?)?;
-    serde_json::from_value(credential).ok()
+    let mut credential: PaymentCredential = serde_json::from_value(credential).ok()?;
+    credential.challenge.header = crate::protocol::core::parse_advertised_credential_header(
+        credential.challenge.header.as_deref(),
+    )
+    .ok()?;
+    Some(credential)
 }
 
 /// Create an MCP payment-required error response.
@@ -259,6 +266,11 @@ pub fn extract_challenges(error: &serde_json::Value) -> Option<Vec<PaymentChalle
 /// Accepts MCP's expanded JSON `request` object and normalizes it to the
 /// base64url representation retained by the core protocol types. Malformed
 /// entries are skipped so that the remaining alternatives stay usable.
+///
+/// A challenge whose `header` selects anything but `Payment-Authorization`
+/// is skipped too, as no credential may be sent for it. Returns `None` when
+/// no valid challenge remains; [`extract_result_challenges`] instead keeps
+/// such a payment requirement in a tool result.
 pub fn extract_challenges_from_data(
     payment_required: &serde_json::Value,
 ) -> Option<Vec<PaymentChallenge>> {
@@ -277,19 +289,42 @@ pub fn extract_receipt(meta: &serde_json::Value) -> Option<Receipt> {
 /// Extract challenges from an MCP tool result's payment-required metadata.
 ///
 /// Expects the result `_meta` object (not the complete tool result). Returns
-/// `None` when the metadata key is absent or it lists no valid challenge.
+/// `None` when the metadata key is absent or it lists no valid challenge,
+/// except that it returns `Some` with an empty list when every listed
+/// challenge was skipped and at least one of them selected a credential header
+/// other than `Payment-Authorization`. The result still requires payment, so
+/// [`McpClient`](client::McpClient) returns it unpaid, and rolls back a paid
+/// retry answered with it instead of committing it.
 pub fn extract_result_challenges(meta: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
-    extract_challenges_from_data(meta.get(PAYMENT_REQUIRED_META_KEY)?)
+    let entries = meta
+        .get(PAYMENT_REQUIRED_META_KEY)?
+        .get("challenges")?
+        .as_array()?;
+    let challenges = parse_wire_challenges(entries);
+    (!challenges.is_empty() || entries.iter().any(has_unsupported_credential_header))
+        .then_some(challenges)
 }
 
 fn extract_wire_challenges(value: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
-    let challenges: Vec<_> = value
-        .as_array()?
+    let challenges = parse_wire_challenges(value.as_array()?);
+    (!challenges.is_empty()).then_some(challenges)
+}
+
+fn parse_wire_challenges(entries: &[serde_json::Value]) -> Vec<PaymentChallenge> {
+    entries
         .iter()
         .cloned()
         .filter_map(parse_wire_challenge)
-        .collect();
-    (!challenges.is_empty()).then_some(challenges)
+        .collect()
+}
+
+/// Returns whether a wire challenge selects a credential header other than
+/// `Payment-Authorization`, which clients must not send a credential for.
+fn has_unsupported_credential_header(challenge: &serde_json::Value) -> bool {
+    challenge.get("header").is_some_and(|header| {
+        let header = header.as_str().unwrap_or_default();
+        crate::protocol::core::parse_advertised_credential_header(Some(header)).is_err()
+    })
 }
 
 fn parse_wire_challenge(mut challenge: serde_json::Value) -> Option<PaymentChallenge> {
@@ -548,6 +583,77 @@ mod tests {
                 http_status,
                 "{problem_type}"
             );
+        }
+    }
+
+    // ---- credential header ----
+
+    fn wire_challenge_with_header(id: &str, header: &str) -> serde_json::Value {
+        let mut value = serde_json::to_value(test_challenge()).unwrap();
+        value["id"] = id.into();
+        value["header"] = header.into();
+        value
+    }
+
+    #[test]
+    fn test_extract_challenges_skips_unsupported_credential_header() {
+        for header in ["Authorization", "", "X-Payment"] {
+            let valid = serde_json::to_value(test_challenge()).unwrap();
+            let data = serde_json::json!({
+                "challenges": [wire_challenge_with_header("unsupported", header), valid]
+            });
+            let challenges = extract_challenges_from_data(&data).unwrap();
+            assert_eq!(challenges.len(), 1, "{header:?}");
+            assert_ne!(challenges[0].id, "unsupported", "{header:?}");
+
+            let rejected = wire_challenge_with_header("unsupported", header);
+            for challenges in [
+                serde_json::json!([rejected]),
+                serde_json::json!([rejected, {}]),
+            ] {
+                let data = serde_json::json!({ "challenges": challenges });
+                assert!(extract_challenges_from_data(&data).is_none(), "{header:?}");
+                let meta = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: data });
+                assert_eq!(
+                    extract_result_challenges(&meta).map(|c| c.len()),
+                    Some(0),
+                    "{header:?}"
+                );
+            }
+        }
+
+        let data = serde_json::json!({
+            "challenges": [wire_challenge_with_header("lower", "payment-authorization")]
+        });
+        let challenges = extract_challenges_from_data(&data).unwrap();
+        assert_eq!(
+            challenges[0].header.as_deref(),
+            Some("payment-authorization")
+        );
+        let meta = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: data });
+        assert_eq!(extract_result_challenges(&meta).unwrap().len(), 1);
+
+        let malformed = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: {"challenges": [{}]} });
+        assert!(extract_result_challenges(&malformed).is_none());
+        assert!(extract_result_challenges(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn test_extract_credential_rejects_unsupported_echoed_header() {
+        let challenge = test_challenge().with_header("Payment-Authorization");
+        let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0x1"));
+        let mut meta = serde_json::json!({CREDENTIAL_META_KEY: credential});
+        assert_eq!(
+            extract_credential(&meta)
+                .unwrap()
+                .challenge
+                .header
+                .as_deref(),
+            Some("Payment-Authorization")
+        );
+        for header in ["Authorization", "", "X-Payment"] {
+            meta[CREDENTIAL_META_KEY]["challenge"]["header"] = header.into();
+            assert!(extract_credential(&meta).is_none(), "{header:?}");
         }
     }
 

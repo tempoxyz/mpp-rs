@@ -4,7 +4,9 @@
 //!   server helpers emit, with one node replaced or removed.
 //! - A challenge sent with `payment_required_error` is extracted unchanged;
 //!   its `request` travels as a JSON object and is re-canonicalized to the
-//!   same bytes. A malformed challenge is skipped.
+//!   same bytes. A malformed challenge is skipped. `Authorization` in
+//!   `header` is sent as the default, and any other unsupported value
+//!   fails to serialize.
 //! - A credential attached with `try_attach_credential` is extracted
 //!   unchanged.
 //! - A receipt attached with `try_attach_receipt` reads back unchanged.
@@ -16,7 +18,8 @@ use libfuzzer_sys::fuzz_target;
 use mpp::mcp::{self, McpReceipt};
 use mpp::{Base64UrlJson, PaymentCredential, PaymentErrorDetails, Receipt};
 use mpp_fuzz::{
-    assert_same, has_supported_header, is_well_formed, wire_header, ChallengeInput, Json,
+    assert_same, has_formattable_header, has_supported_header, is_well_formed, wire_header,
+    ChallengeInput, Json,
 };
 use serde_json::{json, Value};
 
@@ -90,10 +93,14 @@ fuzz_target!(|input: Input| {
             PaymentErrorDetails::core("verification-failed").with_detail(detail),
         ),
     };
-    let mut error = serde_json::to_value(&error).expect("payment error serializes");
+    let formattable = has_formattable_header(challenge.header.as_deref());
+    // Only a `header` that cannot be emitted fails to serialize.
+    let serialized = serde_json::to_value(&error);
+    assert_eq!(serialized.is_ok(), formattable, "{challenge:?}");
+    let mut error = serialized.unwrap_or(Value::Null);
     // The same payload can arrive in a tool result's `_meta`.
     let mut meta = json!({ mcp::PAYMENT_REQUIRED_META_KEY: error["data"] });
-    let valid = is_well_formed(&challenge) && has_supported_header(challenge.header.as_deref());
+    let valid = is_well_formed(&challenge) && formattable;
     let mut expected = challenge.clone();
     expected.header = wire_header(challenge.header.as_deref());
     for extracted in [
@@ -108,15 +115,20 @@ fuzz_target!(|input: Input| {
             assert!(extracted.is_none(), "extracted {challenge:?}");
         }
     }
-    assert!(mcp::is_payment_required(&error));
+    assert_eq!(mcp::is_payment_required(&error), formattable);
 
     let mut credential = PaymentCredential::new(challenge.to_echo(), input.payload.to_value());
     credential.source = input.source.clone();
     let mut params = json!({ "name": "tool" });
-    // Fails when `opaque` is not base64url JSON; it has no MCP form then.
+    // Fails when `opaque` is not base64url JSON or the echoed `header`
+    // cannot be emitted; it has no MCP form then.
     if mcp::try_attach_credential(&mut params, &credential).is_ok() {
-        let extracted = mcp::extract_credential(&params["_meta"]).expect("credential is present");
-        assert_same(&extracted, &credential);
+        let extracted = mcp::extract_credential(&params["_meta"]);
+        if has_supported_header(credential.challenge.header.as_deref()) {
+            assert_same(&extracted.expect("credential is present"), &credential);
+        } else {
+            assert!(extracted.is_none(), "extracted {credential:?}");
+        }
     }
 
     let receipt = Receipt::success(challenge.method.clone(), &input.reference);
