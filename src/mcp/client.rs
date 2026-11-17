@@ -120,18 +120,12 @@ impl<P> McpPayment<P>
 where
     P: PaymentProvider,
 {
-    /// Selects and pays one supported challenge.
+    /// Selects and pays one supported challenge: the best-ranked by the
+    /// caller's or provider's preferences.
     ///
-    /// When paying the preferred challenge fails, for example because the
-    /// wallet cannot fund a session's suggested deposit, the next supported
-    /// challenge in preference order is paid instead, such as the server's
-    /// one-time charge. The first failure is returned when none can be paid.
-    ///
-    /// A failure that cannot prove no payment happened stops here instead of
-    /// trying another offer: [`MppError::PaymentOutcomeUnknown`],
-    /// [`MppError::SessionPaymentOutcomeUnknown`],
-    /// [`MppError::UnknownPaymentOutcome`] and [`MppError::Http`], whose
-    /// lost response may hide a payment that went through.
+    /// As in mppx, a failure to pay it is returned as is, without paying
+    /// another offer: a failed payment cannot always prove no funds moved,
+    /// so a second offer could pay twice.
     ///
     /// Returns `Ok(None)` when the provider supports none of the challenges,
     /// so the caller can preserve the original MCP result or error.
@@ -187,86 +181,61 @@ where
         } else {
             self.provider.accept_payment_header()
         };
-        let mut remaining = challenges.to_vec();
-        let mut failure = None;
-        loop {
-            let challenge = match select_supported_challenge(
-                &remaining,
-                ranking.as_deref(),
-                |challenge| {
-                    self.provider
-                        .supports(challenge.method.as_str(), challenge.intent.as_str())
-                },
-                |candidates| self.provider.select_challenge(candidates),
-            ) {
-                Ok(challenge) => challenge.clone(),
-                Err(ChallengeSelectionError::Expired(challenge)) => {
-                    return Err(failure.unwrap_or_else(|| expired_payment_error(&challenge)));
-                }
-                Err(ChallengeSelectionError::NoSupportedChallenge(_)) => {
-                    return failure.map_or(Ok(None), Err);
-                }
-            };
-
-            if crate::client::is_cross_realm_proof_with_trust(
-                &challenge,
-                &self.context.url,
-                &self.context.headers,
-                self.provider.trusted_tempo_proof_realm(&self.context.url),
-            ) {
-                return Err(MppError::InvalidConfig(
-                    "refusing to sign a Tempo proof or session payment for a different HTTP realm"
-                        .into(),
-                ));
+        // As mppx does, pay only the best-ranked offer and return its error
+        // as is: trying another offer after a failure could pay twice.
+        let challenge = match select_supported_challenge(
+            challenges,
+            ranking.as_deref(),
+            |challenge| {
+                self.provider
+                    .supports(challenge.method.as_str(), challenge.intent.as_str())
+            },
+            |candidates| self.provider.select_challenge(candidates),
+        ) {
+            Ok(challenge) => challenge.clone(),
+            Err(ChallengeSelectionError::Expired(challenge)) => {
+                return Err(expired_payment_error(&challenge));
             }
+            Err(ChallengeSelectionError::NoSupportedChallenge(_)) => return Ok(None),
+        };
 
-            // A Zone withdrawal still settling is resumed for this challenge,
-            // not paid again.
-            let paid = crate::client::resume_pending_settlement(
-                crate::client::DEFAULT_MAX_PAYMENT_RETRIES,
-                || async {
-                    match management {
-                        Some(management) => {
-                            self.provider
-                                .pay_with_management(&challenge, self.context.clone(), management)
-                                .await
-                        }
-                        None => {
-                            self.provider
-                                .pay_with_context(&challenge, self.context.clone())
-                                .await
-                        }
-                    }
-                },
-            )
-            .await;
-            match paid {
-                Ok(credential) => {
-                    return Ok(Some(PendingPayment::new(
-                        self.provider.clone(),
-                        challenge,
-                        credential,
-                    )));
-                }
-                // Paying another offer after an uncertain outcome could pay twice.
-                Err(
-                    error @ (MppError::PaymentOutcomeUnknown { .. }
-                    | MppError::SessionPaymentOutcomeUnknown { .. }
-                    | MppError::UnknownPaymentOutcome { .. }
-                    | MppError::Http(_)
-                    | MppError::ZoneSettlementPending { .. }
-                    | MppError::ZoneWithdrawalBounced { .. }),
-                ) => return Err(error),
-                Err(error) => {
-                    failure.get_or_insert(error);
-                    remaining.retain(|candidate| {
-                        candidate.id != challenge.id
-                            || candidate.method != challenge.method
-                            || candidate.intent != challenge.intent
-                    });
-                }
-            }
+        if crate::client::is_cross_realm_proof_with_trust(
+            &challenge,
+            &self.context.url,
+            &self.context.headers,
+            self.provider.trusted_tempo_proof_realm(&self.context.url),
+        ) {
+            return Err(MppError::InvalidConfig(
+                "refusing to sign a Tempo proof or session payment for a different HTTP realm"
+                    .into(),
+            ));
         }
+
+        // A Zone withdrawal still settling is resumed for this challenge,
+        // not paid again.
+        let credential = crate::client::resume_pending_settlement(
+            crate::client::DEFAULT_MAX_PAYMENT_RETRIES,
+            || async {
+                match management {
+                    Some(management) => {
+                        self.provider
+                            .pay_with_management(&challenge, self.context.clone(), management)
+                            .await
+                    }
+                    None => {
+                        self.provider
+                            .pay_with_context(&challenge, self.context.clone())
+                            .await
+                    }
+                }
+            },
+        )
+        .await?;
+        Ok(Some(PendingPayment::new(
+            self.provider.clone(),
+            challenge,
+            credential,
+        )))
     }
 }
 
@@ -902,7 +871,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpayable_preferred_challenges_fall_back_to_the_next() {
+    async fn unpayable_preferred_challenge_is_not_replaced_by_the_next() {
         let session = PaymentChallenge::new(
             "session-1",
             "mcp.example.test",
@@ -913,21 +882,15 @@ mod tests {
         let provider = UnfundedSessionProvider::default();
         let payment = McpPayment::new(provider.clone(), context());
 
-        let pending = payment
-            .prepare(&[session.clone(), challenge()])
+        // As in mppx, only the preferred offer is paid and its error returned.
+        let error = payment
+            .prepare(&[session, challenge()])
             .await
-            .unwrap()
+            .err()
             .unwrap();
 
-        assert_eq!(pending.challenge().id, "challenge-1");
-        assert_eq!(
-            *provider.paid.lock().unwrap(),
-            vec!["challenge-1".to_owned()]
-        );
-        pending.commit().await.unwrap();
-
-        let error = payment.prepare(&[session]).await.err().unwrap();
         assert!(error.to_string().contains("insufficient balance"));
+        assert!(provider.paid.lock().unwrap().is_empty());
     }
 
     #[derive(Clone, Default)]
@@ -1029,14 +992,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn definitive_failures_still_try_another_offer() {
+    async fn definitive_failures_do_not_try_another_offer() {
         let provider = FailingProvider::new(|| MppError::InsufficientBalance(Some("empty".into())));
         let payment = McpPayment::new(provider.clone(), context());
         let error = payment.prepare(&two_offers()).await.err().unwrap();
         assert!(matches!(error, MppError::InsufficientBalance(_)));
         assert_eq!(
             *provider.attempts.lock().unwrap(),
-            vec!["challenge-1".to_owned(), "second-offer".to_owned()]
+            vec!["challenge-1".to_owned()]
         );
     }
 
