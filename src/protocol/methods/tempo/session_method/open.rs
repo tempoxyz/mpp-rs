@@ -21,8 +21,8 @@ where
 {
     /// Verify that the open transaction's derived channel ID matches the claimed channelId.
     ///
-    /// Returns the address that signs the channel's vouchers and the deposit
-    /// the transaction opens it with.
+    /// Returns the address that signs the channel's vouchers, the deposit
+    /// the transaction opens it with, and the payer (the transaction's sender).
     pub(super) fn verify_open_channel_id_binding(
         tx_bytes: &[u8],
         claimed_channel_id: B256,
@@ -30,7 +30,7 @@ where
         chain_id: u64,
         expected_payee: Address,
         expected_token: Address,
-    ) -> Result<(Address, u128), VerificationError> {
+    ) -> Result<(Address, u128, Address), VerificationError> {
         use alloy::consensus::transaction::SignerRecoverable;
         use alloy::sol_types::SolCall;
 
@@ -90,7 +90,7 @@ where
             decoded.authorizedSigner
         };
 
-        Ok((voucher_signer, decoded.deposit))
+        Ok((voucher_signer, decoded.deposit, sender))
     }
 
     /// Handle 'open' action.
@@ -202,7 +202,7 @@ where
                 .await?;
                 (Some(descriptor), signer, deposit)
             } else {
-                let (signer, deposit) = Self::verify_open_channel_id_binding(
+                let (signer, deposit, payer) = Self::verify_open_channel_id_binding(
                     &tx_bytes,
                     channel_id_b256,
                     escrow,
@@ -210,6 +210,15 @@ where
                     expected_payee,
                     expected_token,
                 )?;
+                // mppx has no legacy escrow; bind the source here too so every open is covered.
+                precompile::verify_open_source(
+                    &*self.provider,
+                    credential.source.as_deref(),
+                    chain_id,
+                    payer,
+                    &tx_bytes,
+                )
+                .await?;
                 (None, signer, deposit)
             };
 

@@ -229,8 +229,9 @@ fn test_open_channel_id_binding_rejects_mismatch() {
         chain_id,
     );
 
-    // Should pass with correct channel ID.
-    assert!(
+    // Should pass with correct channel ID, naming the sender as the payer
+    // that a credential source must match.
+    let (_, _, payer) =
         SessionMethod::<alloy::providers::RootProvider<TempoNetwork>>::verify_open_channel_id_binding(
             &tx_bytes,
             correct_id,
@@ -239,8 +240,8 @@ fn test_open_channel_id_binding_rejects_mismatch() {
             payee,
             token,
         )
-        .is_ok()
-    );
+        .unwrap();
+    assert_eq!(payer, signer.address());
 
     // Should fail with a different channel ID.
     let fake_id = B256::from([0x01u8; 32]);
