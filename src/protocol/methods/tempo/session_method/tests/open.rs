@@ -558,18 +558,34 @@ mod open_source {
         chain_id: u64,
         expiry: Option<u64>,
     ) -> Vec<u8> {
-        let mut authorization =
-            KeyAuthorization::unrestricted(chain_id, SignatureType::Secp256k1, key.address());
+        inline_signed_by(payer, payer.address(), key, key, chain_id, expiry)
+    }
+
+    /// A transaction signed by \`signer\` for \`account\`, carrying an inline
+    /// authorization of \`authorized\` signed by \`authorizer\`.
+    fn inline_signed_by(
+        authorizer: &PrivateKeySigner,
+        account: Address,
+        authorized: &PrivateKeySigner,
+        signer: &PrivateKeySigner,
+        chain_id: u64,
+        expiry: Option<u64>,
+    ) -> Vec<u8> {
+        let mut authorization = KeyAuthorization::unrestricted(
+            chain_id,
+            SignatureType::Secp256k1,
+            authorized.address(),
+        );
         if let Some(expiry) = expiry {
             authorization = authorization.with_expiry(expiry);
         }
-        let signature = payer
+        let signature = authorizer
             .sign_hash_sync(&authorization.signature_hash())
             .unwrap();
         let mut tx = tx();
         tx.key_authorization =
             Some(authorization.into_signed(PrimitiveSignature::Secp256k1(signature)));
-        keychain(tx, payer.address(), key)
+        keychain(tx, account, signer)
     }
 
     fn source(address: Address) -> String {
@@ -645,24 +661,41 @@ mod open_source {
         push_key(&revoked, key.address(), u64::MAX, true);
         let expired = none();
         push_key(&expired, key.address(), 1, false);
-        let unavailable = none();
-        unavailable.push_failure_msg("unavailable");
+        // The keychain reports a key it does not hold as all zeroes.
+        let missing = || {
+            let asserter = none();
+            push_key(&asserter, Address::ZERO, 0, false);
+            asserter
+        };
+        let other = PrivateKeySigner::random();
 
+        // An inline authorization that does not prove the signing key falls
+        // back to the keychain, where these keys are not active.
         let cases: Vec<(&str, alloy::providers::mock::Asserter, Vec<u8>)> = vec![
             ("key signs directly", none(), direct(&key)),
             ("revoked key", revoked, keyed.clone()),
             ("expired key", expired, keyed.clone()),
-            ("unknown key", unavailable, keyed),
-            ("wrong chain", none(), inline(&payer, &key, 999, None)),
+            ("unknown key", missing(), keyed),
+            ("wrong chain", missing(), inline(&payer, &key, 999, None)),
             (
                 "expired authorization",
-                none(),
+                missing(),
                 inline(&payer, &key, CHAIN_ID, Some(1)),
             ),
             (
-                "authorized by another account",
-                none(),
-                inline(&key, &key, CHAIN_ID, None),
+                "authorization signed by someone other than the payer",
+                missing(),
+                inline_signed_by(&other, payer.address(), &key, &key, CHAIN_ID, None),
+            ),
+            (
+                "authorized by the signing key itself",
+                missing(),
+                inline_signed_by(&key, payer.address(), &key, &key, CHAIN_ID, None),
+            ),
+            (
+                "authorization for another key",
+                missing(),
+                inline_signed_by(&payer, payer.address(), &other, &key, CHAIN_ID, None),
             ),
             ("not a transaction", none(), vec![0x76, 0x01]),
         ];
@@ -671,6 +704,49 @@ mod open_source {
                 .await
                 .unwrap_err();
             assert_eq!(err.message, NOT_AUTHENTICATED, "{name}");
+        }
+    }
+
+    /// A key already active for the payer authenticates it even when the
+    /// transaction's inline authorization does not prove that key (one an
+    /// admin key signed, or one for another key).
+    #[tokio::test]
+    async fn inline_authorization_falls_back_to_the_keychain() {
+        let payer = PrivateKeySigner::random();
+        let key = PrivateKeySigner::random();
+        let admin = PrivateKeySigner::random();
+        let src = source(payer.address());
+        for tx in [
+            inline_signed_by(&admin, payer.address(), &key, &key, CHAIN_ID, None),
+            inline_signed_by(&payer, payer.address(), &admin, &key, CHAIN_ID, None),
+        ] {
+            let active = alloy::providers::mock::Asserter::new();
+            push_key(&active, key.address(), u64::MAX, false);
+            check(active.clone(), Some(&src), payer.address(), &tx)
+                .await
+                .unwrap();
+            assert!(active.read_q().is_empty(), "keychain was not consulted");
+        }
+    }
+
+    /// A keychain lookup that fails says nothing about the key: the client
+    /// may retry rather than being told it is unauthorized.
+    #[tokio::test]
+    async fn keychain_lookup_failure_is_retryable() {
+        let payer = PrivateKeySigner::random();
+        let key = PrivateKeySigner::random();
+        let src = source(payer.address());
+        for tx in [
+            keychain(tx(), payer.address(), &key),
+            inline_signed_by(&key, payer.address(), &key, &key, CHAIN_ID, None),
+        ] {
+            let unavailable = alloy::providers::mock::Asserter::new();
+            unavailable.push_failure_msg("unavailable");
+            let err = check(unavailable, Some(&src), payer.address(), &tx)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, Some(ErrorCode::NetworkError), "{}", err.message);
+            assert!(err.retryable);
         }
     }
 
@@ -690,5 +766,53 @@ mod open_source {
             err.message,
             "credential source does not match transaction payer"
         );
+    }
+}
+
+/// handle_open binds a sourced open credential to the payer its transaction
+/// signature authenticates, before broadcasting anything.
+#[tokio::test]
+async fn test_open_binds_credential_source_before_broadcast() {
+    let payer = alloy::signers::local::PrivateKeySigner::random();
+    let other = alloy::signers::local::PrivateKeySigner::random();
+    let did = |chain_id: u64, address: Address| {
+        format!("did:pkh:eip155:{chain_id}:{}", address.to_checksum(None))
+    };
+
+    // The payer's own source opens the channel.
+    let (channel_id, request, mut credential) =
+        open_credential(&payer, Address::ZERO, 10_000, &payer, 1_000).await;
+    credential.source = Some(did(42431, payer.address()));
+    let store = Arc::new(InMemoryChannelStore::new());
+    let asserter = alloy::providers::mock::Asserter::new();
+    push_mined_transaction(&asserter);
+    push_on_chain_channel(&asserter, payer.address(), Address::ZERO, 10_000);
+    let method = mocked_session_method(store.clone(), asserter);
+    method.verify_session(&credential, &request).await.unwrap();
+    assert!(store.get_channel_sync(&channel_id).is_some());
+
+    for (source, expected) in [
+        ("not-a-did".to_string(), "credential source is invalid"),
+        (did(4217, payer.address()), "credential source is invalid"),
+        (
+            did(42431, other.address()),
+            "credential source does not match transaction payer",
+        ),
+    ] {
+        let (channel_id, request, mut credential) =
+            open_credential(&payer, Address::ZERO, 10_000, &payer, 1_000).await;
+        credential.source = Some(source.clone());
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_mined_transaction(&asserter);
+        let queued = asserter.read_q().len();
+        let method = mocked_session_method(store.clone(), asserter.clone());
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, expected, "{source}");
+        assert_eq!(asserter.read_q().len(), queued, "transaction was broadcast");
+        assert!(store.get_channel_sync(&channel_id).is_none());
     }
 }
