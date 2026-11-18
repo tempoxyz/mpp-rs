@@ -12,7 +12,7 @@ fn opening(state: &ChannelState, cumulative_amount: u128) -> Opening {
         settlement_route: None,
         cumulative_amount,
         signature: vec![0xAA; 65],
-        signer_snapshot: None,
+        opening_commitment: None,
     }
 }
 

@@ -72,8 +72,8 @@ pub struct SessionMethod<P> {
     /// Accept TIP-1166 configurable account vouchers; see
     /// [`with_configurable_vouchers`](Self::with_configurable_vouchers).
     configurable_vouchers: bool,
-    /// TIP-1166 signer snapshots looked up on chain, by channel ID.
-    signer_snapshots: Arc<
+    /// TIP-1166 opening commitments looked up on chain, by channel ID.
+    opening_commitments: Arc<
         std::sync::Mutex<
             std::collections::HashMap<alloy::primitives::B256, alloy::primitives::B256>,
         >,
@@ -96,7 +96,7 @@ where
             close_signer: None,
             stream_checks: Arc::default(),
             configurable_vouchers: false,
-            signer_snapshots: Arc::default(),
+            opening_commitments: Arc::default(),
         }
     }
 
@@ -117,14 +117,14 @@ where
         self.configurable_vouchers
     }
 
-    /// Voucher verification options for a channel with `signer_snapshot`.
+    /// Voucher verification options for a channel with `opening_commitment`.
     pub(super) fn voucher_options(
         &self,
-        signer_snapshot: Option<alloy::primitives::B256>,
+        opening_commitment: Option<alloy::primitives::B256>,
     ) -> crate::protocol::methods::tempo::precompile_voucher::VoucherVerifyOptions {
         crate::protocol::methods::tempo::precompile_voucher::VoucherVerifyOptions {
             configurable: self.configurable_vouchers,
-            signer_snapshot,
+            opening_commitment,
         }
     }
 

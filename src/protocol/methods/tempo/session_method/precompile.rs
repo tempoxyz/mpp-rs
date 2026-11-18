@@ -34,43 +34,43 @@ impl<P> SessionMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
 {
-    /// The channel's TIP-1166 signer snapshot, looked up on chain when it is
-    /// unknown (see [`find_signer_snapshot`]) and then recorded on the
+    /// The channel's TIP-1166 opening commitment, looked up on chain when it is
+    /// unknown (see [`find_opening_commitment`]) and then recorded on the
     /// channel and cached by channel ID, so each channel is looked up once.
     ///
-    /// A missing snapshot is unknown, never zero: a zero snapshot accepts
+    /// A missing opening commitment is unknown, never zero: a zero opening commitment accepts
     /// primitive vouchers, which the escrow does not settle on a channel bound
     /// to a configurable account. A failed lookup rejects the credential.
-    /// Channels on the legacy escrow have no snapshot.
-    pub(super) async fn resolve_signer_snapshot(
+    /// Channels on the legacy escrow have no opening commitment.
+    pub(super) async fn resolve_opening_commitment(
         &self,
         channel: &ChannelState,
     ) -> Result<Option<B256>, VerificationError> {
-        if channel.signer_snapshot.is_some() || !is_precompile(channel.escrow_contract) {
-            return Ok(channel.signer_snapshot);
+        if channel.opening_commitment.is_some() || !is_precompile(channel.escrow_contract) {
+            return Ok(channel.opening_commitment);
         }
         let channel_id = Self::parse_channel_id(&channel.channel_id)?;
         let cached = self
-            .signer_snapshots
+            .opening_commitments
             .lock()
-            .map_err(|_| VerificationError::internal("signer snapshot cache poisoned"))?
+            .map_err(|_| VerificationError::internal("opening commitment cache poisoned"))?
             .get(&channel_id)
             .copied();
-        let snapshot = match cached {
-            Some(snapshot) => snapshot,
+        let opening_commitment = match cached {
+            Some(opening_commitment) => opening_commitment,
             None => {
-                let snapshot = find_signer_snapshot(
+                let opening_commitment = find_opening_commitment(
                     self.provider.as_ref(),
                     channel.escrow_contract,
                     channel_id,
                     channel.authorized_signer,
                 )
                 .await?;
-                self.signer_snapshots
+                self.opening_commitments
                     .lock()
-                    .map_err(|_| VerificationError::internal("signer snapshot cache poisoned"))?
-                    .insert(channel_id, snapshot);
-                snapshot
+                    .map_err(|_| VerificationError::internal("opening commitment cache poisoned"))?
+                    .insert(channel_id, opening_commitment);
+                opening_commitment
             }
         };
         self.store
@@ -78,15 +78,15 @@ where
                 &channel.channel_id,
                 Box::new(move |current| {
                     Ok(current.map(|mut state| {
-                        if state.signer_snapshot.is_none() {
-                            state.signer_snapshot = Some(snapshot);
+                        if state.opening_commitment.is_none() {
+                            state.opening_commitment = Some(opening_commitment);
                         }
                         state
                     }))
                 }),
             )
             .await?;
-        Ok(Some(snapshot))
+        Ok(Some(opening_commitment))
     }
 
     /// Read on-chain channel state from the legacy escrow or, given the
@@ -242,7 +242,7 @@ pub(super) fn parse_signature_for<P>(
 }
 
 /// Verify a voucher with the scheme of `escrow`. `options` (configurable
-/// account vouchers and the channel's signer snapshot) apply only to the
+/// account vouchers and the channel's opening commitment) apply only to the
 /// precompile.
 pub(super) fn verify_voucher_for(
     escrow: Address,
@@ -313,10 +313,10 @@ alloy::sol! {
         }
         function getChannelState(bytes32 channelId) external view returns (ChannelState memory);
 
-        /// TIP-1166 (T15): `open` cached the voucher signer's configurable
+        /// TIP-1166 (T15): `open` recorded the voucher signer's configurable
         /// account commitment, which the descriptor's salt holds.
-        event SignerSnapshotCached(bytes32 indexed channelId, address indexed signer, bytes32 commitment);
-        /// TIP-1166 (T15): a nonzero `topUp` after the snapshotted signer's
+        event OpeningCommitmentRecorded(bytes32 indexed channelId, address indexed signer, bytes32 commitment);
+        /// TIP-1166 (T15): a nonzero `topUp` after the voucher signer's
         /// configuration changed.
         error SignerConfigChanged(address signer);
         /// TIP-1166 (T15): `open` with a salt other than the signer's commitment.
@@ -363,16 +363,16 @@ pub(super) async fn get_config_commitment<P: Provider<TempoNetwork>>(
     )
 }
 
-/// The TIP-1166 signer snapshot of an open channel whose open receipt this
+/// The TIP-1166 opening commitment of an open channel whose open receipt this
 /// server did not see (a reused channel, or state recorded before the field
-/// existed): the commitment of the channel's `SignerSnapshotCached` event, or
+/// existed): the commitment of the channel's `OpeningCommitmentRecorded` event, or
 /// zero when the escrow emitted none.
 ///
 /// A `signer` without a configuration commitment now had none at open, since
-/// commitments never return to zero, so its snapshot is zero without a log
-/// search. Any read failure is an error: an unknown snapshot is never taken
+/// commitments never return to zero, so its opening commitment is zero without a log
+/// search. Any read failure is an error: an unknown opening commitment is never taken
 /// to be zero.
-pub(super) async fn find_signer_snapshot<P: Provider<TempoNetwork>>(
+pub(super) async fn find_opening_commitment<P: Provider<TempoNetwork>>(
     provider: &P,
     escrow: Address,
     channel_id: B256,
@@ -385,18 +385,19 @@ pub(super) async fn find_signer_snapshot<P: Provider<TempoNetwork>>(
     }
     let filter = alloy::rpc::types::Filter::new()
         .address(escrow)
-        .event_signature(IChannelReserveState::SignerSnapshotCached::SIGNATURE_HASH)
+        .event_signature(IChannelReserveState::OpeningCommitmentRecorded::SIGNATURE_HASH)
         .topic1(channel_id)
         .from_block(alloy::eips::BlockNumberOrTag::Earliest)
         .to_block(alloy::eips::BlockNumberOrTag::Latest);
     let logs = provider.get_logs(&filter).await.map_err(|e| {
-        VerificationError::network_error(format!("failed to read signer snapshot logs: {e}"))
+        VerificationError::network_error(format!("failed to read opening commitment logs: {e}"))
     })?;
     for log in logs
         .iter()
         .filter(|log| !log.removed && log.address() == escrow)
     {
-        let Ok(event) = IChannelReserveState::SignerSnapshotCached::decode_log(&log.inner) else {
+        let Ok(event) = IChannelReserveState::OpeningCommitmentRecorded::decode_log(&log.inner)
+        else {
             continue;
         };
         if event.channelId != channel_id {
@@ -404,7 +405,7 @@ pub(super) async fn find_signer_snapshot<P: Provider<TempoNetwork>>(
         }
         if event.signer != signer || event.commitment.is_zero() {
             return Err(VerificationError::invalid_signature(
-                "channel signer snapshot does not match its authorized signer",
+                "channel opening commitment does not match its authorized signer",
             ));
         }
         return Ok(event.commitment);
@@ -412,10 +413,10 @@ pub(super) async fn find_signer_snapshot<P: Provider<TempoNetwork>>(
     Ok(B256::ZERO)
 }
 
-/// The TIP-1166 signer snapshot an open transaction's receipt reports for
-/// `channel_id`: the commitment of its `SignerSnapshotCached` event from
+/// The TIP-1166 opening commitment an open transaction's receipt reports for
+/// `channel_id`: the commitment of its `OpeningCommitmentRecorded` event from
 /// `escrow`, or `None` when the signer had no commitment.
-pub(super) fn signer_snapshot_from_logs(
+pub(super) fn opening_commitment_from_logs(
     logs: &[alloy::rpc::types::Log],
     escrow: Address,
     channel_id: B256,
@@ -425,7 +426,8 @@ pub(super) fn signer_snapshot_from_logs(
     logs.iter()
         .filter(|log| log.address() == escrow)
         .find_map(|log| {
-            let event = IChannelReserveState::SignerSnapshotCached::decode_log(&log.inner).ok()?;
+            let event =
+                IChannelReserveState::OpeningCommitmentRecorded::decode_log(&log.inner).ok()?;
             (event.channelId == channel_id && !event.commitment.is_zero())
                 .then_some(event.commitment)
         })

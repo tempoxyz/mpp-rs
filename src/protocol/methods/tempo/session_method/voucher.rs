@@ -190,10 +190,10 @@ where
                 }));
             }
         }
-        // A TIP-1034 channel recorded without its signer snapshot gets it
+        // A TIP-1034 channel recorded without its opening commitment gets it
         // from chain first; the transition below reads the recorded one.
-        let resolved_snapshot = match self.store.get_channel(channel_id_str).await? {
-            Some(channel) => self.resolve_signer_snapshot(&channel).await?,
+        let resolved_commitment = match self.store.get_channel(channel_id_str).await? {
+            Some(channel) => self.resolve_opening_commitment(&channel).await?,
             None => None,
         };
         let channel_id = channel_id_str.to_owned();
@@ -205,8 +205,8 @@ where
                 Box::new(move |current| {
                     let mut state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
-                    if state.signer_snapshot.is_none() {
-                        state.signer_snapshot = resolved_snapshot;
+                    if state.opening_commitment.is_none() {
+                        state.opening_commitment = resolved_commitment;
                     }
                     let state = match on_chain {
                         Some(on_chain) => ChannelState {
@@ -270,7 +270,7 @@ where
                 channel.authorized_signer,
                 &crate::protocol::methods::tempo::precompile_voucher::VoucherVerifyOptions {
                     configurable: configurable_vouchers,
-                    signer_snapshot: channel.signer_snapshot,
+                    opening_commitment: channel.opening_commitment,
                 },
             );
             if !is_valid {

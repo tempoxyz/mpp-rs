@@ -5,8 +5,8 @@
 //! reach the account's threshold. [`ConfigurableVoucherSigner`] holds the
 //! account, its configuration and enough owner keys to sign such vouchers.
 //!
-//! A channel snapshots the signer's configuration commitment when it opens
-//! (the descriptor's salt must equal it), so a channel whose signer later
+//! A channel records the signer's configuration commitment as its opening
+//! commitment when it opens (the descriptor's salt must equal it), so a channel whose signer later
 //! changes its configuration can no longer be topped up: close it and open a
 //! new one.
 
@@ -149,9 +149,9 @@ impl ConfigurableVoucherSigner {
     /// with descriptor salt `salt` (TIP-1166).
     ///
     /// A channel opened while the account had a configuration commitment has
-    /// that commitment as its salt and signer snapshot, so the signer must
+    /// that commitment as its salt and opening commitment, so the signer must
     /// present the configuration whose commitment equals the salt. Any other
-    /// channel has a zero snapshot, where the escrow accepts `0x05` only from
+    /// channel has a zero opening commitment, where the escrow accepts `0x05` only from
     /// the version-0 configuration that derives the account address, and
     /// otherwise only a secp256k1 signature by the account's own key, which
     /// this signer does not hold.
@@ -164,7 +164,7 @@ impl ConfigurableVoucherSigner {
         }
         Err(MppError::InvalidConfig(format!(
             "configurable account {} cannot sign vouchers for a channel with salt {salt}: \
-             the channel's signer snapshot is not the commitment {} of the signer's \
+             the channel's opening commitment is not the commitment {} of the signer's \
              configuration, and only a version-0 configuration that derives the account \
              address signs on a channel without one; sign with the account's own \
              secp256k1 key, or close the channel and open a new one",
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(sig[0], 0x05);
         let options = VoucherVerifyOptions {
             configurable: true,
-            signer_snapshot: None,
+            opening_commitment: None,
         };
         assert!(verify_precompile_voucher_signature_with(
             &sig,
@@ -354,9 +354,9 @@ mod tests {
             &options,
         )
         .unwrap());
-        let snapshot = VoucherVerifyOptions {
+        let committed = VoucherVerifyOptions {
             configurable: true,
-            signer_snapshot: Some(signer.commitment()),
+            opening_commitment: Some(signer.commitment()),
         };
         assert!(verify_precompile_voucher_signature_with(
             &sig,
@@ -365,7 +365,7 @@ mod tests {
             10,
             TIP20_CHANNEL_RESERVE_ADDRESS,
             4217,
-            &snapshot,
+            &committed,
         )
         .unwrap());
     }
@@ -384,20 +384,20 @@ mod tests {
     }
 
     #[test]
-    fn signs_only_vouchers_the_channel_snapshot_settles() {
+    fn signs_only_vouchers_the_channel_opening_commitment_settles() {
         let (owners, config) = setup(&[1], 1);
         let account = config.account_address().unwrap();
         let derived =
             ConfigurableVoucherSigner::new(account, config.clone(), owners.clone()).unwrap();
-        // The version-0 config that derives the account signs on a zero
-        // snapshot channel (random salt) and on its own commitment.
+        // The version-0 config that derives the account signs on a channel
+        // with a zero opening commitment (random salt) and on its own commitment.
         derived.ensure_can_sign_channel(B256::random()).unwrap();
         derived.ensure_can_sign_channel(B256::ZERO).unwrap();
         derived
             .ensure_can_sign_channel(derived.commitment())
             .unwrap();
 
-        // A rotated config signs only where the channel cached it.
+        // A rotated config signs only where the channel recorded it.
         let rotated_config = ConfigurableAccountConfig {
             version: 1,
             ..config

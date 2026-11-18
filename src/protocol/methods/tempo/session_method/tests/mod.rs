@@ -43,7 +43,7 @@ fn test_channel_state(channel_id: &str) -> ChannelState {
         pending_close: None,
         close_requested_at: 0,
         created_at: "2025-01-01T00:00:00Z".to_string(),
-        signer_snapshot: None,
+        opening_commitment: None,
     }
 }
 
@@ -371,21 +371,21 @@ fn test_configurable_vouchers_advertised_only_when_enabled() {
     assert_eq!(details["configurableVouchers"], serde_json::json!(true));
     let options = method.voucher_options(Some(B256::repeat_byte(1)));
     assert!(options.configurable);
-    assert_eq!(options.signer_snapshot, Some(B256::repeat_byte(1)));
+    assert_eq!(options.opening_commitment, Some(B256::repeat_byte(1)));
 }
 
 #[test]
-fn test_signer_snapshot_from_open_receipt_logs() {
+fn test_opening_commitment_from_open_receipt_logs() {
     use alloy::sol_types::SolEvent;
     let escrow = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
     let channel_id = B256::repeat_byte(0x21);
     let commitment = B256::repeat_byte(0x42);
-    let event = precompile::IChannelReserveState::SignerSnapshotCached {
+    let event = precompile::IChannelReserveState::OpeningCommitmentRecorded {
         channelId: channel_id,
         signer: alloy::primitives::Address::repeat_byte(3),
         commitment,
     };
-    let log = |address, event: &precompile::IChannelReserveState::SignerSnapshotCached| {
+    let log = |address, event: &precompile::IChannelReserveState::OpeningCommitmentRecorded| {
         alloy::rpc::types::Log {
             inner: alloy::primitives::Log {
                 address,
@@ -396,21 +396,21 @@ fn test_signer_snapshot_from_open_receipt_logs() {
     };
     let logs = vec![log(escrow, &event)];
     assert_eq!(
-        precompile::signer_snapshot_from_logs(&logs, escrow, channel_id),
+        precompile::opening_commitment_from_logs(&logs, escrow, channel_id),
         Some(commitment)
     );
-    // Another channel, another emitter, or no event: no snapshot.
+    // Another channel, another emitter, or no event: no opening commitment.
     assert_eq!(
-        precompile::signer_snapshot_from_logs(&logs, escrow, B256::ZERO),
+        precompile::opening_commitment_from_logs(&logs, escrow, B256::ZERO),
         None
     );
     let foreign = vec![log(alloy::primitives::Address::repeat_byte(9), &event)];
     assert_eq!(
-        precompile::signer_snapshot_from_logs(&foreign, escrow, channel_id),
+        precompile::opening_commitment_from_logs(&foreign, escrow, channel_id),
         None
     );
     assert_eq!(
-        precompile::signer_snapshot_from_logs(&[], escrow, channel_id),
+        precompile::opening_commitment_from_logs(&[], escrow, channel_id),
         None
     );
 }
@@ -418,10 +418,10 @@ fn test_signer_snapshot_from_open_receipt_logs() {
 const PRECOMPILE: alloy::primitives::Address =
     tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
-/// A `SignerSnapshotCached` log from the escrow, as `eth_getLogs` returns it.
-fn snapshot_log(channel_id: B256, signer: Address, commitment: B256) -> serde_json::Value {
+/// An `OpeningCommitmentRecorded` log from the escrow, as `eth_getLogs` returns it.
+fn commitment_log(channel_id: B256, signer: Address, commitment: B256) -> serde_json::Value {
     use alloy::sol_types::SolEvent;
-    let event = precompile::IChannelReserveState::SignerSnapshotCached {
+    let event = precompile::IChannelReserveState::OpeningCommitmentRecorded {
         channelId: channel_id,
         signer,
         commitment,
@@ -446,7 +446,7 @@ fn commitment_result(commitment: B256) -> Bytes {
 }
 
 #[tokio::test]
-async fn test_find_signer_snapshot_found_absent_and_failed() {
+async fn test_find_opening_commitment_found_absent_and_failed() {
     let provider = |asserter: &alloy::providers::mock::Asserter| {
         alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
             .connect_mocked_client(asserter.clone())
@@ -459,7 +459,7 @@ async fn test_find_signer_snapshot_found_absent_and_failed() {
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&commitment_result(B256::ZERO));
     let found =
-        precompile::find_signer_snapshot(&provider(&asserter), PRECOMPILE, channel_id, signer)
+        precompile::find_opening_commitment(&provider(&asserter), PRECOMPILE, channel_id, signer)
             .await
             .unwrap();
     assert_eq!(found, B256::ZERO);
@@ -468,9 +468,9 @@ async fn test_find_signer_snapshot_found_absent_and_failed() {
     // A commitment now and the channel's event: its commitment.
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&commitment_result(B256::repeat_byte(0x77)));
-    asserter.push_success(&vec![snapshot_log(channel_id, signer, commitment)]);
+    asserter.push_success(&vec![commitment_log(channel_id, signer, commitment)]);
     let found =
-        precompile::find_signer_snapshot(&provider(&asserter), PRECOMPILE, channel_id, signer)
+        precompile::find_opening_commitment(&provider(&asserter), PRECOMPILE, channel_id, signer)
             .await
             .unwrap();
     assert_eq!(found, commitment);
@@ -480,46 +480,55 @@ async fn test_find_signer_snapshot_found_absent_and_failed() {
     asserter.push_success(&commitment_result(commitment));
     asserter.push_success(&Vec::<serde_json::Value>::new());
     let found =
-        precompile::find_signer_snapshot(&provider(&asserter), PRECOMPILE, channel_id, signer)
+        precompile::find_opening_commitment(&provider(&asserter), PRECOMPILE, channel_id, signer)
             .await
             .unwrap();
     assert_eq!(found, B256::ZERO);
 
-    // An event for another signer is not this channel's snapshot.
+    // An event for another signer is not this channel's opening commitment.
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&commitment_result(commitment));
-    asserter.push_success(&vec![snapshot_log(
+    asserter.push_success(&vec![commitment_log(
         channel_id,
         Address::repeat_byte(0x99),
         commitment,
     )]);
-    assert!(
-        precompile::find_signer_snapshot(&provider(&asserter), PRECOMPILE, channel_id, signer)
-            .await
-            .is_err()
-    );
+    assert!(precompile::find_opening_commitment(
+        &provider(&asserter),
+        PRECOMPILE,
+        channel_id,
+        signer
+    )
+    .await
+    .is_err());
 
-    // A failed read is an error, never a zero snapshot.
+    // A failed read is an error, never a zero opening commitment.
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_failure_msg("rpc unavailable");
-    assert!(
-        precompile::find_signer_snapshot(&provider(&asserter), PRECOMPILE, channel_id, signer)
-            .await
-            .is_err()
-    );
+    assert!(precompile::find_opening_commitment(
+        &provider(&asserter),
+        PRECOMPILE,
+        channel_id,
+        signer
+    )
+    .await
+    .is_err());
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&commitment_result(commitment));
     asserter.push_failure_msg("query exceeds max results");
-    assert!(
-        precompile::find_signer_snapshot(&provider(&asserter), PRECOMPILE, channel_id, signer)
-            .await
-            .is_err()
-    );
+    assert!(precompile::find_opening_commitment(
+        &provider(&asserter),
+        PRECOMPILE,
+        channel_id,
+        signer
+    )
+    .await
+    .is_err());
 }
 
-/// A TIP-1034 channel stored without its signer snapshot, and a primitive
+/// A TIP-1034 channel stored without its opening commitment, and a primitive
 /// voucher its authorized signer signed for it.
-fn unknown_snapshot_channel(
+fn unknown_commitment_channel(
     amount: u128,
 ) -> (
     String,
@@ -533,7 +542,7 @@ fn unknown_snapshot_channel(
     let mut state = test_channel_state(&channel_id.to_string());
     state.escrow_contract = PRECOMPILE;
     state.authorized_signer = signer.address();
-    state.signer_snapshot = None;
+    state.opening_commitment = None;
     let hash = crate::protocol::methods::tempo::precompile_voucher::precompile_voucher_signing_hash_with_escrow(
         channel_id,
         amount,
@@ -547,8 +556,8 @@ fn unknown_snapshot_channel(
 }
 
 #[tokio::test]
-async fn test_unknown_signer_snapshot_without_event_is_resolved_zero_once() {
-    let (channel_id, state, _, signature) = unknown_snapshot_channel(1_000);
+async fn test_unknown_opening_commitment_without_event_is_resolved_zero_once() {
+    let (channel_id, state, _, signature) = unknown_commitment_channel(1_000);
     let store = Arc::new(InMemoryChannelStore::new());
     store.insert(&channel_id, state);
     let asserter = alloy::providers::mock::Asserter::new();
@@ -560,12 +569,12 @@ async fn test_unknown_signer_snapshot_without_event_is_resolved_zero_once() {
         .verify_and_accept_voucher(&channel_id, None, 1_000, &signature, 0)
         .await
         .unwrap();
-    assert_eq!(accepted.signer_snapshot, Some(B256::ZERO));
+    assert_eq!(accepted.opening_commitment, Some(B256::ZERO));
     assert!(asserter.read_q().is_empty(), "both lookups were made");
 
-    // The resolved snapshot is recorded: later vouchers need no lookup.
+    // The resolved opening commitment is recorded: later vouchers need no lookup.
     let stored = store.get_channel(&channel_id).await.unwrap().unwrap();
-    assert_eq!(stored.signer_snapshot, Some(B256::ZERO));
+    assert_eq!(stored.opening_commitment, Some(B256::ZERO));
     // With no RPC response queued, a lookup would fail as a network error.
     let replay = method
         .verify_and_accept_voucher(&channel_id, None, 1_000, &signature, 0)
@@ -575,14 +584,14 @@ async fn test_unknown_signer_snapshot_without_event_is_resolved_zero_once() {
 }
 
 #[tokio::test]
-async fn test_unknown_signer_snapshot_with_event_rejects_primitive_voucher() {
-    let (channel_id, state, signer, signature) = unknown_snapshot_channel(1_000);
+async fn test_unknown_opening_commitment_with_event_rejects_primitive_voucher() {
+    let (channel_id, state, signer, signature) = unknown_commitment_channel(1_000);
     let commitment = B256::repeat_byte(0x42);
     let store = Arc::new(InMemoryChannelStore::new());
     store.insert(&channel_id, state);
     let asserter = alloy::providers::mock::Asserter::new();
     asserter.push_success(&commitment_result(commitment));
-    asserter.push_success(&vec![snapshot_log(
+    asserter.push_success(&vec![commitment_log(
         channel_id.parse().unwrap(),
         signer.address(),
         commitment,
@@ -595,14 +604,14 @@ async fn test_unknown_signer_snapshot_with_event_rejects_primitive_voucher() {
         .unwrap_err();
     assert_eq!(err.code, Some(ErrorCode::InvalidSignature));
     let stored = store.get_channel(&channel_id).await.unwrap().unwrap();
-    assert_eq!(stored.signer_snapshot, Some(commitment));
+    assert_eq!(stored.opening_commitment, Some(commitment));
     assert_eq!(stored.highest_voucher_amount, 0);
     assert!(asserter.read_q().is_empty());
 }
 
 #[tokio::test]
-async fn test_unknown_signer_snapshot_lookup_failure_rejects_voucher() {
-    let (channel_id, state, _, signature) = unknown_snapshot_channel(1_000);
+async fn test_unknown_opening_commitment_lookup_failure_rejects_voucher() {
+    let (channel_id, state, _, signature) = unknown_commitment_channel(1_000);
     let store = Arc::new(InMemoryChannelStore::new());
     store.insert(&channel_id, state);
     let asserter = alloy::providers::mock::Asserter::new();
@@ -615,8 +624,8 @@ async fn test_unknown_signer_snapshot_lookup_failure_rejects_voucher() {
         .is_err());
     let stored = store.get_channel(&channel_id).await.unwrap().unwrap();
     assert_eq!(
-        stored.signer_snapshot, None,
-        "an unknown snapshot stays unknown"
+        stored.opening_commitment, None,
+        "an unknown opening commitment stays unknown"
     );
     assert_eq!(stored.highest_voucher_amount, 0);
 }
@@ -661,24 +670,24 @@ async fn test_precompile_vouchers_still_accept_p256_primitives() {
     };
 
     // As before configurable vouchers: P-256 primitives verify under the
-    // defaults and on a zero snapshot, with or without configurable vouchers.
+    // defaults and on a zero opening commitment, with or without configurable vouchers.
     // Session servers accepted them before this change, so they still do.
     assert!(verify(VoucherVerifyOptions::default()));
     for configurable in [false, true] {
         assert!(verify(VoucherVerifyOptions {
             configurable,
-            signer_snapshot: Some(B256::ZERO),
+            opening_commitment: Some(B256::ZERO),
         }));
-        // A nonzero snapshot accepts only `0x05`.
+        // A nonzero opening commitment accepts only `0x05`.
         assert!(!verify(VoucherVerifyOptions {
             configurable,
-            signer_snapshot: Some(B256::repeat_byte(0x42)),
+            opening_commitment: Some(B256::repeat_byte(0x42)),
         }));
     }
 
-    // Through the server, on a channel stored with or without its snapshot
+    // Through the server, on a channel stored with or without its opening commitment
     // and with configurable vouchers off (the default) or on.
-    for (snapshot, configurable) in [
+    for (opening_commitment, configurable) in [
         (Some(B256::ZERO), false),
         (None, false),
         (Some(B256::ZERO), true),
@@ -687,11 +696,11 @@ async fn test_precompile_vouchers_still_accept_p256_primitives() {
         let mut state = test_channel_state(&channel_id_hex);
         state.escrow_contract = PRECOMPILE;
         state.authorized_signer = signer.address();
-        state.signer_snapshot = snapshot;
+        state.opening_commitment = opening_commitment;
         let store = Arc::new(InMemoryChannelStore::new());
         store.insert(&channel_id_hex, state);
         let asserter = alloy::providers::mock::Asserter::new();
-        if snapshot.is_none() {
+        if opening_commitment.is_none() {
             // The lookup finds a zero commitment for the P-256 key.
             asserter.push_success(&commitment_result(B256::ZERO));
         }
@@ -708,7 +717,7 @@ async fn test_precompile_vouchers_still_accept_p256_primitives() {
             .await
             .unwrap();
         assert_eq!(accepted.highest_voucher_amount, 1_000);
-        assert_eq!(accepted.signer_snapshot, Some(B256::ZERO));
+        assert_eq!(accepted.opening_commitment, Some(B256::ZERO));
         assert!(asserter.read_q().is_empty());
     }
 }

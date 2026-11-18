@@ -40,11 +40,11 @@ alloy::sol! {
     /// TIP-1166 (T15) additions to the TIP-1034 channel reserve precompile.
     #[derive(Debug, PartialEq, Eq)]
     interface ITIP1166ChannelReserve {
-        /// `open` cached the voucher signer's configurable account
+        /// `open` recorded the voucher signer's configurable account
         /// commitment, which the descriptor's salt holds, as the channel's
-        /// signer snapshot.
-        event SignerSnapshotCached(bytes32 indexed channelId, address indexed signer, bytes32 commitment);
-        /// A nonzero `topUp` after the snapshotted signer's configuration changed.
+        /// opening commitment.
+        event OpeningCommitmentRecorded(bytes32 indexed channelId, address indexed signer, bytes32 commitment);
+        /// A nonzero `topUp` after the voucher signer's configuration changed.
         error SignerConfigChanged(address signer);
         /// `open` with a salt other than the voucher signer's nonzero commitment.
         error SaltNotSignerCommitment(address signer, bytes32 commitment);

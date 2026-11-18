@@ -311,12 +311,12 @@ pub struct VoucherVerifyOptions {
     /// Accept TIP-1166 configurable account (`0x05`) vouchers, which the
     /// channel reserve precompile settles from T15.
     pub configurable: bool,
-    /// The channel's signer snapshot: the commitment the voucher signer's
+    /// The channel's opening commitment: the commitment the voucher signer's
     /// configurable account had when the channel opened, which the open
-    /// receipt's `SignerSnapshotCached` event reports, or zero when the signer
-    /// had none. `None` is treated as zero, so a caller whose snapshot is
+    /// receipt's `OpeningCommitmentRecorded` event reports, or zero when the signer
+    /// had none. `None` is treated as zero, so a caller whose opening commitment is
     /// unknown must look it up first (the session server does).
-    pub signer_snapshot: Option<B256>,
+    pub opening_commitment: Option<B256>,
 }
 
 /// Verify a canonical TIP-1020 primitive signature over a TIP-1034 voucher.
@@ -343,12 +343,12 @@ pub fn verify_precompile_voucher_signature(
 /// Verify a TIP-1034 voucher signature as the channel reserve precompile
 /// settles it from T15 (TIP-1166):
 ///
-/// - A nonzero signer snapshot accepts only a `0x05` signature (with
+/// - A nonzero opening commitment accepts only a `0x05` signature (with
 ///   [`VoucherVerifyOptions::configurable`]) for the expected signer whose
-///   configuration commits to the snapshot and whose owners reach the
+///   configuration commits to the opening commitment and whose owners reach the
 ///   threshold. Primitive signatures are rejected: the signer's root key was
 ///   retired.
-/// - A zero snapshot accepts a primitive signature that recovers to the
+/// - A zero opening commitment accepts a primitive signature that recovers to the
 ///   expected signer, or (with [`VoucherVerifyOptions::configurable`]) a
 ///   `0x05` signature for the expected signer presenting the version-0
 ///   configuration its address derives from.
@@ -372,18 +372,18 @@ pub fn verify_precompile_voucher_signature_with(
         escrow_contract,
         chain_id,
     )?;
-    let snapshot = options.signer_snapshot.unwrap_or_default();
+    let opening_commitment = options.opening_commitment.unwrap_or_default();
     if options.configurable {
         if let Some(decoded) = ConfigurableAccountSignature::from_bytes(signature) {
             let Ok(configurable) = decoded else {
                 return Ok(false);
             };
             return Ok(configurable.account() == expected_signer
-                && configurable.validate_account_commitment(snapshot)
+                && configurable.validate_account_commitment(opening_commitment)
                 && configurable.verify_approvals(signing_hash));
         }
     }
-    if !snapshot.is_zero() {
+    if !opening_commitment.is_zero() {
         return Ok(false);
     }
     let primitive = PrimitiveSignature::from_bytes(signature)
@@ -765,32 +765,32 @@ mod tests {
             .unwrap_or(false)
         }
 
-        fn enabled(snapshot: Option<B256>) -> VoucherVerifyOptions {
+        fn enabled(opening_commitment: Option<B256>) -> VoucherVerifyOptions {
             VoucherVerifyOptions {
                 configurable: true,
-                signer_snapshot: snapshot,
+                opening_commitment,
             }
         }
 
         #[test]
-        fn accepts_configurable_voucher_matching_snapshot() {
+        fn accepts_configurable_voucher_matching_opening_commitment() {
             let keys = owners(2);
             let mut cfg = config(&keys, 2);
             let account = cfg.account_address().unwrap();
             cfg.version = 3;
-            let snapshot = cfg.commitment().unwrap();
+            let opening_commitment = cfg.commitment().unwrap();
             let sig = sign(&[&keys[0], &keys[1]], account, &cfg, digest(10)).to_bytes();
-            assert!(verify(&sig, account, enabled(Some(snapshot))));
+            assert!(verify(&sig, account, enabled(Some(opening_commitment))));
             // Wrong signer, wrong amount, or too few approvals fail.
             assert!(!verify(
                 &sig,
                 Address::repeat_byte(1),
-                enabled(Some(snapshot))
+                enabled(Some(opening_commitment))
             ));
             let short = sign(&[&keys[0]], account, &cfg, digest(10)).to_bytes();
-            assert!(!verify(&short, account, enabled(Some(snapshot))));
+            assert!(!verify(&short, account, enabled(Some(opening_commitment))));
             let other = sign(&[&keys[0], &keys[1]], account, &cfg, digest(11)).to_bytes();
-            assert!(!verify(&other, account, enabled(Some(snapshot))));
+            assert!(!verify(&other, account, enabled(Some(opening_commitment))));
         }
 
         #[test]
@@ -799,17 +799,17 @@ mod tests {
             let mut cfg = config(&keys, 1);
             let account = cfg.account_address().unwrap();
             cfg.version = 1;
-            let snapshot = cfg.commitment().unwrap();
+            let opening_commitment = cfg.commitment().unwrap();
             // The account rotated to version 2; vouchers signed with it no
-            // longer match the channel's snapshot.
+            // longer match the channel's opening commitment.
             cfg.version = 2;
             let sig = sign(&[&keys[0]], account, &cfg, digest(10)).to_bytes();
-            assert!(!verify(&sig, account, enabled(Some(snapshot))));
+            assert!(!verify(&sig, account, enabled(Some(opening_commitment))));
             assert!(!verify(&sig, account, enabled(None)));
         }
 
         #[test]
-        fn rejects_primitive_voucher_when_snapshot_is_nonzero() {
+        fn rejects_primitive_voucher_when_opening_commitment_is_nonzero() {
             let key = alloy::signers::local::PrivateKeySigner::random();
             let sig = key.sign_hash_sync(&digest(10)).unwrap().as_bytes();
             assert!(verify(&sig, key.address(), enabled(None)));
@@ -819,19 +819,19 @@ mod tests {
                 key.address(),
                 enabled(Some(B256::repeat_byte(7)))
             ));
-            // The snapshot applies even without configurable vouchers enabled.
+            // The opening commitment applies even without configurable vouchers enabled.
             assert!(!verify(
                 &sig,
                 key.address(),
                 VoucherVerifyOptions {
                     configurable: false,
-                    signer_snapshot: Some(B256::repeat_byte(7)),
+                    opening_commitment: Some(B256::repeat_byte(7)),
                 }
             ));
         }
 
         #[test]
-        fn zero_snapshot_accepts_only_version_zero_derived_config() {
+        fn zero_opening_commitment_accepts_only_version_zero_derived_config() {
             let keys = owners(1);
             let cfg = config(&keys, 1);
             let account = cfg.account_address().unwrap();
@@ -841,7 +841,7 @@ mod tests {
             let other = Address::repeat_byte(0x99);
             let foreign = sign(&[&keys[0]], other, &cfg, digest(10)).to_bytes();
             assert!(!verify(&foreign, other, enabled(None)));
-            // A later version needs a snapshot.
+            // A later version needs an opening commitment.
             let mut rotated = cfg.clone();
             rotated.version = 1;
             let sig = sign(&[&keys[0]], account, &rotated, digest(10)).to_bytes();
