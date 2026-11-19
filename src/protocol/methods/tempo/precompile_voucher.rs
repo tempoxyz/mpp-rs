@@ -319,6 +319,30 @@ pub struct VoucherVerifyOptions {
     pub opening_commitment: Option<B256>,
 }
 
+/// Verify a TIP-1166 configurable account (`0x05`) signature by
+/// `expected_signer` over `inner_digest`, checking its configuration against
+/// the channel's `opening_commitment`. `None` when `signature` is not a
+/// `0x05` signature.
+#[cfg(feature = "tempo")]
+pub fn verify_configurable_account_signature(
+    signature: &[u8],
+    expected_signer: Address,
+    inner_digest: B256,
+    opening_commitment: B256,
+) -> Option<bool> {
+    use super::configurable_account::ConfigurableAccountSignature;
+
+    let decoded = ConfigurableAccountSignature::from_bytes(signature)?;
+    let Ok(configurable) = decoded else {
+        return Some(false);
+    };
+    Some(
+        configurable.account() == expected_signer
+            && configurable.validate_account_commitment(opening_commitment)
+            && configurable.verify_approvals(inner_digest),
+    )
+}
+
 /// Verify a canonical TIP-1020 primitive signature over a TIP-1034 voucher.
 #[cfg(feature = "tempo")]
 pub fn verify_precompile_voucher_signature(
@@ -364,8 +388,6 @@ pub fn verify_precompile_voucher_signature_with(
     chain_id: u64,
     options: &VoucherVerifyOptions,
 ) -> Result<bool> {
-    use super::configurable_account::ConfigurableAccountSignature;
-
     let signing_hash = precompile_voucher_signing_hash_with_escrow(
         channel_id,
         cumulative_amount,
@@ -374,13 +396,13 @@ pub fn verify_precompile_voucher_signature_with(
     )?;
     let opening_commitment = options.opening_commitment.unwrap_or_default();
     if options.configurable {
-        if let Some(decoded) = ConfigurableAccountSignature::from_bytes(signature) {
-            let Ok(configurable) = decoded else {
-                return Ok(false);
-            };
-            return Ok(configurable.account() == expected_signer
-                && configurable.validate_account_commitment(opening_commitment)
-                && configurable.verify_approvals(signing_hash));
+        if let Some(valid) = verify_configurable_account_signature(
+            signature,
+            expected_signer,
+            signing_hash,
+            opening_commitment,
+        ) {
+            return Ok(valid);
         }
     }
     if !opening_commitment.is_zero() {
@@ -399,6 +421,42 @@ pub fn verify_precompile_voucher_signature_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn configurable_vouchers_still_verify_secp256k1_starting_with_0x05() {
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let signer = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xab);
+        let (amount, signature) = (1u128..)
+            .find_map(|amount| {
+                let hash = precompile_voucher_signing_hash_with_escrow(
+                    channel_id,
+                    amount,
+                    TIP20_CHANNEL_RESERVE_ADDRESS,
+                    42431,
+                )
+                .unwrap();
+                let signature = signer.sign_hash_sync(&hash).unwrap().as_bytes();
+                (signature[0] == 0x05).then_some((amount, signature))
+            })
+            .unwrap();
+        assert!(verify_precompile_voucher_signature_with(
+            &signature,
+            signer.address(),
+            channel_id,
+            amount,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+            &VoucherVerifyOptions {
+                configurable: true,
+                opening_commitment: Some(B256::ZERO),
+            },
+        )
+        .unwrap());
+    }
 
     #[cfg(feature = "tempo")]
     #[test]

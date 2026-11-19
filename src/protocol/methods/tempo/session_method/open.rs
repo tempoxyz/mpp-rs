@@ -239,7 +239,8 @@ where
             .as_ref()
             .map(|descriptor| descriptor.salt)
             .filter(|salt| self.configurable_vouchers() && !salt.is_zero());
-        if !verify_open_voucher(voucher_signer, None)
+        let valid_without_commitment = verify_open_voucher(voucher_signer, None);
+        if !valid_without_commitment
             && !salt_commitment.is_some_and(|salt| verify_open_voucher(voucher_signer, Some(salt)))
         {
             return Err(VerificationError::invalid_signature(
@@ -335,9 +336,11 @@ where
         }
 
         // The signature was verified against the transaction's signer above;
-        // only a channel that reports a different signer, or a signer
-        // opening commitment, needs another check.
+        // only a channel that reports a different signer, a signer opening
+        // commitment, or a voucher that was only valid with the payer-chosen
+        // salt as commitment needs another check.
         if (authorized_signer != voucher_signer
+            || !valid_without_commitment
             || opening_commitment.is_some_and(|commitment| !commitment.is_zero()))
             && !verify_open_voucher(authorized_signer, opening_commitment)
         {

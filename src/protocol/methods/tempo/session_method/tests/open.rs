@@ -461,6 +461,143 @@ async fn test_open_stores_channel_after_broadcast() {
     assert_eq!(stored.highest_voucher_amount, 1_000);
 }
 
+/// With configurable vouchers on, a `0x05` opening voucher can verify against
+/// the payer-chosen descriptor salt before broadcast. When the open receipt
+/// then records no opening commitment, that voucher is invalid for the
+/// channel and the open is rejected instead of stored.
+#[tokio::test]
+async fn test_precompile_open_rechecks_salt_voucher_against_receipt() {
+    use crate::protocol::core::{Base64UrlJson, PaymentChallenge, PaymentCredential};
+    use crate::protocol::intents::SessionRequest;
+    use crate::protocol::methods::tempo::configurable_account::tests::{config, owners, sign};
+    use crate::protocol::methods::tempo::precompile_voucher::{
+        compute_precompile_channel_id_with_escrow, precompile_voucher_signing_hash_with_escrow,
+    };
+    use alloy::consensus::SignableTransaction;
+    use alloy::eips::Encodable2718;
+    use alloy::primitives::aliases::U96;
+    use alloy::signers::SignerSync;
+    use alloy::sol_types::{SolCall, SolValue};
+    use tempo_alloy::contracts::precompiles::{
+        ITIP20ChannelReserve, TIP20_CHANNEL_RESERVE_ADDRESS as RESERVE,
+    };
+    use tempo_alloy::primitives::transaction::Call;
+    use tempo_alloy::primitives::TempoTransaction;
+
+    let payer = alloy::signers::local::PrivateKeySigner::random();
+    let keys = owners(1);
+    let mut cfg = config(&keys, 1);
+    let account = cfg.account_address().unwrap();
+    // A configuration the account never registered, chosen by the payer.
+    cfg.version = 1;
+    let salt = cfg.commitment().unwrap();
+
+    let open = ITIP20ChannelReserve::openCall {
+        payee: TEST_PAYEE,
+        operator: Address::ZERO,
+        token: TEST_TOKEN,
+        deposit: U96::from(10_000u64),
+        salt,
+        authorizedSigner: account,
+    };
+    let tx = TempoTransaction {
+        chain_id: 42431,
+        gas_limit: 500_000,
+        max_fee_per_gas: 1_000_000_000,
+        max_priority_fee_per_gas: 1_000_000_000,
+        calls: vec![Call {
+            to: alloy::primitives::TxKind::Call(RESERVE),
+            value: alloy::primitives::U256::ZERO,
+            input: Bytes::from(open.abi_encode()),
+        }],
+        ..Default::default()
+    };
+    let mut buf = Vec::new();
+    tx.encode_for_signing(&mut buf);
+    buf.extend_from_slice(payer.address().as_slice());
+    let expiring_nonce_hash = alloy::primitives::keccak256(buf);
+    let signature = payer.sign_hash_sync(&tx.signature_hash()).unwrap();
+    let transaction = alloy::hex::encode_prefixed(tx.into_signed(signature.into()).encoded_2718());
+
+    let channel_id = compute_precompile_channel_id_with_escrow(
+        payer.address(),
+        TEST_PAYEE,
+        Address::ZERO,
+        TEST_TOKEN,
+        salt,
+        account,
+        expiring_nonce_hash,
+        RESERVE,
+        42431,
+    );
+    let digest =
+        precompile_voucher_signing_hash_with_escrow(channel_id, 1_000, RESERVE, 42431).unwrap();
+    let voucher = sign(&[&keys[0]], account, &cfg, digest).to_bytes();
+
+    let request = SessionRequest {
+        amount: "1000".to_string(),
+        currency: TEST_TOKEN.to_string(),
+        recipient: Some(TEST_PAYEE.to_string()),
+        method_details: Some(serde_json::json!({
+            "escrowContract": RESERVE.to_string(),
+            "chainId": 42431,
+        })),
+        ..Default::default()
+    };
+    let challenge = PaymentChallenge::new(
+        "test-id",
+        "api.example.com",
+        METHOD_NAME,
+        INTENT_SESSION,
+        Base64UrlJson::from_typed(&request).unwrap(),
+    );
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        SessionCredentialPayload::Open {
+            payload_type: "transaction".to_string(),
+            channel_id: channel_id.to_string(),
+            transaction,
+            descriptor: Some(
+                crate::protocol::methods::tempo::session::ChannelDescriptor {
+                    payer: payer.address().to_string(),
+                    payee: TEST_PAYEE.to_string(),
+                    operator: Address::ZERO.to_string(),
+                    token: TEST_TOKEN.to_string(),
+                    salt: salt.to_string(),
+                    authorized_signer: account.to_string(),
+                    expiring_nonce_hash: expiring_nonce_hash.to_string(),
+                },
+            ),
+            settlement_route: None,
+            authorized_signer: None,
+            cumulative_amount: "1000".to_string(),
+            signature: alloy::hex::encode_prefixed(&voucher),
+        },
+    );
+
+    let store = Arc::new(InMemoryChannelStore::new());
+    let asserter = alloy::providers::mock::Asserter::new();
+    // Mined, with no `OpeningCommitmentRecorded` log: the opening commitment is zero.
+    push_mined_transaction(&asserter);
+    asserter.push_success(&Bytes::from(
+        (U96::ZERO, U96::from(10_000u64), 0u32).abi_encode_params(),
+    ));
+    let method =
+        mocked_session_method(store.clone(), asserter.clone()).with_configurable_vouchers(true);
+
+    let err = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        Some(ErrorCode::InvalidSignature),
+        "{}",
+        err.message
+    );
+    assert!(store.get_channel_sync(&channel_id.to_string()).is_none());
+}
+
 #[tokio::test]
 async fn unsupported_store_rejects_open_before_transaction_processing() {
     use alloy::providers::{mock::Asserter, ProviderBuilder};

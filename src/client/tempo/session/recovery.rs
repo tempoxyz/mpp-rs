@@ -21,7 +21,10 @@ use super::{
 use crate::{
     error::{MppError, ResultExt},
     protocol::methods::tempo::{
-        precompile_voucher::verify_precompile_voucher_signature,
+        precompile_voucher::{
+            precompile_voucher_signing_hash_with_escrow, verify_configurable_account_signature,
+            verify_precompile_voucher_signature,
+        },
         session::{ChannelDescriptor, SessionSnapshot},
     },
 };
@@ -172,14 +175,33 @@ pub(crate) fn validate_snapshot_voucher(snapshot: &SessionSnapshot) -> Result<u1
     let signature = alloy::hex::decode(signed.signature.trim_start_matches("0x"))
         .map_err(|e| invalid(format!("invalid snapshot voucher signature: {e}")))?;
     let authority = descriptor_authority(&snapshot.descriptor)?;
-    if !verify_precompile_voucher_signature(
+    // A TIP-1166 configurable account (`0x05`) voucher is checked against the
+    // descriptor salt: a signer with a configuration commitment can only open
+    // with it as salt, so it is the channel's opening commitment.
+    let salt = parse_b256("descriptor salt", &snapshot.descriptor.salt)?;
+    let configurable = verify_configurable_account_signature(
         &signature,
         authority,
-        channel_id,
-        voucher_cumulative,
-        escrow,
-        snapshot.chain_id,
-    )? {
+        precompile_voucher_signing_hash_with_escrow(
+            channel_id,
+            voucher_cumulative,
+            escrow,
+            snapshot.chain_id,
+        )?,
+        salt,
+    );
+    let valid = match configurable {
+        Some(valid) => valid,
+        None => verify_precompile_voucher_signature(
+            &signature,
+            authority,
+            channel_id,
+            voucher_cumulative,
+            escrow,
+            snapshot.chain_id,
+        )?,
+    };
+    if !valid {
         return Err(invalid("snapshot highest voucher signature is invalid"));
     }
 
@@ -534,6 +556,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(entry.cumulative_amount, 200);
+    }
+
+    #[tokio::test]
+    async fn snapshot_hydration_verifies_configurable_account_voucher() {
+        use crate::client::tempo::session::configurable::ConfigurableVoucherSigner;
+        use crate::protocol::methods::tempo::configurable_account::tests::{config, owners};
+
+        let keys = owners(2);
+        let config = config(&keys, 2);
+        let account = config.account_address().unwrap();
+        let voucher_signer =
+            ConfigurableVoucherSigner::new(account, config.clone(), keys.clone()).unwrap();
+        let descriptor = build_channel_descriptor(
+            Address::repeat_byte(0x10),
+            Address::repeat_byte(0x20),
+            Address::ZERO,
+            Address::repeat_byte(0x30),
+            config.commitment().unwrap(),
+            account,
+            B256::repeat_byte(0x50),
+        );
+        let channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+            &descriptor,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            4217,
+        )
+        .unwrap();
+        let signature = voucher_signer
+            .sign_digest(
+                precompile_voucher_signing_hash_with_escrow(
+                    channel_id,
+                    200,
+                    TIP20_CHANNEL_RESERVE_ADDRESS,
+                    4217,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = |descriptor: ChannelDescriptor| SessionSnapshot {
+            accepted_cumulative: "200".into(),
+            chain_id: 4217,
+            channel_id: format!("{channel_id:#x}"),
+            close_requested_at: None,
+            deposit: "1000".into(),
+            descriptor,
+            settlement_route: None,
+            escrow: format!("{TIP20_CHANNEL_RESERVE_ADDRESS:#x}"),
+            highest_voucher: Some(SnapshotVoucher {
+                channel_id: format!("{channel_id:#x}"),
+                cumulative_amount: "200".into(),
+                signature: alloy::hex::encode_prefixed(&signature),
+            }),
+            required_cumulative: "250".into(),
+            settled: "0".into(),
+            spent: "200".into(),
+            units: None,
+        };
+        assert_eq!(
+            validate_snapshot_voucher(&snapshot(descriptor.clone())).unwrap(),
+            200
+        );
+
+        // A configuration other than the channel's opening commitment is rejected.
+        let mut other_salt = descriptor;
+        other_salt.salt = B256::repeat_byte(0x40).to_string();
+        assert!(validate_snapshot_voucher(&snapshot(other_salt)).is_err());
     }
 
     #[tokio::test]

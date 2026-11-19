@@ -22,6 +22,7 @@ use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id, compute_precompile_channel_id_with_escrow,
+    precompile_close_authorization_signing_hash_with_escrow,
     sign_precompile_close_authorization_primitive_with_escrow,
     sign_precompile_close_authorization_with_escrow, sign_precompile_voucher,
     sign_precompile_voucher_primitive, sign_precompile_voucher_primitive_with_escrow,
@@ -574,13 +575,14 @@ pub async fn create_precompile_close_payload_with_descriptor_primitive(
     })
 }
 
-/// Close payload for TIP-1034 whose final voucher is signed by a TIP-1166
-/// configurable account (`0x05`) and whose close authorization is signed by
-/// `close_signer`, the payer's primitive key.
+/// Close payload for TIP-1034 whose final voucher and close authorization are
+/// both signed by a TIP-1166 configurable account (`0x05`), the channel's
+/// authorized signer. Signing the close authorization with the payer's key
+/// instead fails when that key is an access key, which is neither the payer
+/// nor the authorized signer.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_close_payload_with_descriptor_configurable(
     voucher_signer: &ConfigurableVoucherSigner,
-    close_signer: &impl Signer<tempo_alloy::primitives::transaction::PrimitiveSignature>,
     channel_id: B256,
     descriptor: ChannelDescriptor,
     cumulative_amount: u128,
@@ -606,14 +608,14 @@ pub async fn create_precompile_close_payload_with_descriptor_configurable(
             chain_id,
         )
         .await?;
-    let close = sign_precompile_close_authorization_primitive_with_escrow(
-        close_signer,
-        channel_id,
-        cumulative_amount,
-        TIP20_CHANNEL_RESERVE_ADDRESS,
-        chain_id,
-    )
-    .await?;
+    let close = voucher_signer
+        .sign_digest(precompile_close_authorization_signing_hash_with_escrow(
+            channel_id,
+            cumulative_amount,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            chain_id,
+        )?)
+        .await?;
 
     Ok(SessionCredentialPayload::Close {
         channel_id: channel_id.to_string(),

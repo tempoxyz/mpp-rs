@@ -3519,7 +3519,6 @@ impl TempoSessionProvider {
                 Some(voucher_signer) => {
                     create_precompile_close_payload_with_descriptor_configurable(
                         voucher_signer,
-                        &self.signer,
                         entry.channel_id,
                         descriptor,
                         cumulative_amount,

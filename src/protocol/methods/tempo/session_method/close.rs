@@ -419,6 +419,12 @@ where
             if !precompile::verify_close_authorization(
                 &close_sig,
                 &[channel.payer, channel.authorized_signer],
+                self.configurable_vouchers().then(|| {
+                    (
+                        channel.authorized_signer,
+                        opening_commitment.unwrap_or_default(),
+                    )
+                }),
                 channel_id_b256,
                 cumulative_amount,
                 escrow,

@@ -11,7 +11,7 @@
 use alloy::primitives::{keccak256, Address, Bytes, B256};
 use alloy::rlp::{Decodable, Encodable, Header};
 use tempo_alloy::primitives::transaction::{PrimitiveSignature, TempoSignature};
-use tempo_alloy::primitives::MAX_WEBAUTHN_SIGNATURE_LENGTH;
+use tempo_alloy::primitives::{MAX_WEBAUTHN_SIGNATURE_LENGTH, SECP256K1_SIGNATURE_LENGTH};
 
 /// The TIP-1107 configurable account precompile.
 pub const CONFIGURABLE_ACCOUNT_ADDRESS: Address =
@@ -37,6 +37,20 @@ pub const MAX_CONFIGURABLE_ACCOUNT_SIGNATURES: usize = 8;
 
 /// Largest encoded owner approval: a type byte and a WebAuthn signature.
 pub const MAX_CONFIGURABLE_ACCOUNT_OWNER_SIGNATURE_BYTES: usize = 1 + MAX_WEBAUTHN_SIGNATURE_LENGTH;
+
+/// Largest canonical `0x05` signature: a full owner list and the most
+/// approvals of the largest kind, with the longest RLP headers each can need.
+pub const MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES: usize = 1 // type byte
+    + 4 // outer list header
+    + 21 // account
+    + 4 // config list header
+    + 33 // salt
+    + 9 // version
+    + 2 // threshold
+    + 4 // owners list header
+    + MAX_CONFIGURABLE_ACCOUNT_OWNERS * (1 + 21 + 2)
+    + 4 // approvals list header
+    + MAX_CONFIGURABLE_ACCOUNT_SIGNATURES * (3 + MAX_CONFIGURABLE_ACCOUNT_OWNER_SIGNATURE_BYTES);
 
 /// One weighted owner of a configurable account.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -358,8 +372,12 @@ impl ConfigurableAccountSignature {
     }
 
     /// Decode canonical `0x05 || rlp(...)` bytes. Returns `None` for any
-    /// other signature type.
+    /// other signature type, including every 65-byte signature: that length
+    /// is always an untyped secp256k1 signature, whatever its first byte.
     pub fn from_bytes(bytes: &[u8]) -> Option<Result<Self, ConfigurableAccountError>> {
+        if bytes.len() == SECP256K1_SIGNATURE_LENGTH {
+            return None;
+        }
         let (&type_byte, rest) = bytes.split_first()?;
         if type_byte != SIGNATURE_TYPE_CONFIGURABLE_ACCOUNT {
             return None;
@@ -538,6 +556,31 @@ pub(crate) mod tests {
             .map(|signer| PrimitiveSignature::Secp256k1(signer.sign_hash_sync(&digest).unwrap()))
             .collect();
         ConfigurableAccountSignature::try_new(account, config.clone(), approvals).unwrap()
+    }
+
+    #[test]
+    fn sixty_five_bytes_are_never_configurable() {
+        // An untyped secp256k1 signature whose `r` starts with the `0x05` type byte.
+        let mut signature = [0u8; SECP256K1_SIGNATURE_LENGTH];
+        signature[0] = SIGNATURE_TYPE_CONFIGURABLE_ACCOUNT;
+        assert!(ConfigurableAccountSignature::from_bytes(&signature).is_none());
+    }
+
+    #[test]
+    fn max_signature_bytes_bounds_the_largest_encoding() {
+        let keys = owners(MAX_CONFIGURABLE_ACCOUNT_OWNERS);
+        let config = config(&keys, MAX_CONFIGURABLE_ACCOUNT_SIGNATURES as u8);
+        let account = config.account_address().unwrap();
+        let approvers: Vec<_> = keys
+            .iter()
+            .take(MAX_CONFIGURABLE_ACCOUNT_SIGNATURES)
+            .collect();
+        let signature = sign(&approvers, account, &config, B256::repeat_byte(0x01)).to_bytes();
+        let webauthn_growth = MAX_CONFIGURABLE_ACCOUNT_SIGNATURES
+            * (MAX_CONFIGURABLE_ACCOUNT_OWNER_SIGNATURE_BYTES - 66);
+        assert!(signature.len() + webauthn_growth <= MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES);
+        // Larger than the 2048-byte primitive cap session servers used before.
+        const { assert!(MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES > 2048) };
     }
 
     #[test]

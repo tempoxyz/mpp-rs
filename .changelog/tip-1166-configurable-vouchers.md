@@ -1,5 +1,5 @@
 ---
-mpp: patch
+mpp: minor
 ---
 
-Added TIP-1166 configurable account vouchers for TIP-1034 sessions: servers opt in with `SessionMethod::with_configurable_vouchers` (advertised as `configurableVouchers`) and track each channel's `opening_commitment`, and clients sign with `TempoSessionProvider::with_configurable_voucher_signer`. Defaults are unchanged.
+Added TIP-1166 configurable account vouchers for TIP-1034 sessions: servers opt in with `SessionMethod::with_configurable_vouchers` (advertised as `configurableVouchers`) and track each channel's `opening_commitment`, and clients sign with `TempoSessionProvider::with_configurable_voucher_signer`. Defaults are unchanged. `ChannelState` gains the public `opening_commitment` field, so code that builds it with a struct literal must set it (`None` when unknown).

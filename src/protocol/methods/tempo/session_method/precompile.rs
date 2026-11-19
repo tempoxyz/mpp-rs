@@ -20,9 +20,10 @@ use tempo_alloy::TempoNetwork;
 
 use super::chain::OnChainChannel;
 use super::{ChannelState, SessionMethod};
+use crate::protocol::methods::tempo::configurable_account::MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id_with_escrow,
-    precompile_close_authorization_signing_hash_with_escrow,
+    precompile_close_authorization_signing_hash_with_escrow, verify_configurable_account_signature,
     verify_precompile_voucher_signature_with, VoucherVerifyOptions,
     PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
@@ -117,8 +118,17 @@ where
     }
 }
 
-/// Largest TIP-1020 signature accepted from a credential (WebAuthn is the largest kind).
-const MAX_SIGNATURE_BYTES: usize = 2048;
+/// Largest voucher signature accepted from a credential: a TIP-1020 primitive
+/// (WebAuthn is the largest kind) or a TIP-1166 configurable account (`0x05`)
+/// signature, which can be larger.
+const MAX_SIGNATURE_BYTES: usize = {
+    let primitive = 2048;
+    if MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES > primitive {
+        MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES
+    } else {
+        primitive
+    }
+};
 
 pub(super) type WireDescriptor = ITIP20ChannelReserve::ChannelDescriptor;
 
@@ -275,10 +285,14 @@ pub(super) fn verify_voucher_for(
     .unwrap_or(false)
 }
 
-/// Verify a cooperative close authorization signed by any of `signers`.
+/// Verify a cooperative close authorization signed by any of `signers` with a
+/// primitive signature or, when `configurable` names the channel's voucher
+/// signer and opening commitment, by that signer's configurable account
+/// (`0x05`), as its vouchers are.
 pub(super) fn verify_close_authorization(
     signature: &[u8],
     signers: &[Address],
+    configurable: Option<(Address, B256)>,
     channel_id: B256,
     cumulative_amount: u128,
     escrow: Address,
@@ -292,6 +306,13 @@ pub(super) fn verify_close_authorization(
     ) else {
         return false;
     };
+    if let Some((signer, opening_commitment)) = configurable {
+        if let Some(valid) =
+            verify_configurable_account_signature(signature, signer, hash, opening_commitment)
+        {
+            return valid;
+        }
+    }
     let Ok(primitive) = PrimitiveSignature::from_bytes(signature) else {
         return false;
     };
@@ -662,6 +683,56 @@ pub(super) fn close_call(
 mod tests {
     use super::*;
 
+    #[test]
+    fn signature_cap_admits_the_largest_configurable_signature() {
+        let at_cap = format!(
+            "0x05{}",
+            "00".repeat(MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES - 1)
+        );
+        assert!(parse_signature_for::<crate::server::TempoProvider>(
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            &at_cap
+        )
+        .is_ok());
+        let over = format!("0x{}", "00".repeat(MAX_SIGNATURE_BYTES + 1));
+        assert!(parse_signature_for::<crate::server::TempoProvider>(
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            &over
+        )
+        .is_err());
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn configurable_signer_close_authorization_verifies() {
+        use crate::client::tempo::session::configurable::ConfigurableVoucherSigner;
+        use crate::protocol::methods::tempo::configurable_account::tests::{config, owners};
+
+        let keys = owners(2);
+        let config = config(&keys, 2);
+        let account = config.account_address().unwrap();
+        let commitment = config.commitment().unwrap();
+        let signer = ConfigurableVoucherSigner::new(account, config, keys).unwrap();
+        let (channel_id, escrow) = (B256::repeat_byte(0xab), TIP20_CHANNEL_RESERVE_ADDRESS);
+        let close = signer
+            .sign_digest(
+                precompile_close_authorization_signing_hash_with_escrow(
+                    channel_id, 9, escrow, 42431,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The payer's access key is neither the payer nor the authorized signer.
+        let signers = [Address::repeat_byte(0x11), account];
+        let verify = |configurable| {
+            verify_close_authorization(&close, &signers, configurable, channel_id, 9, escrow, 42431)
+        };
+        assert!(verify(Some((account, commitment))));
+        assert!(!verify(Some((account, B256::repeat_byte(0x01)))));
+        assert!(!verify(None));
+    }
+
     fn descriptor(payee: Address, token: Address) -> ChannelDescriptor {
         ChannelDescriptor {
             payer: format!("{:#x}", Address::repeat_byte(0x11)),
@@ -782,11 +853,12 @@ mod tests {
             .to_vec();
         let signers = [payer.address()];
         assert!(verify_close_authorization(
-            &close_sig, &signers, channel_id, 9, escrow, 42431
+            &close_sig, &signers, None, channel_id, 9, escrow, 42431
         ));
         assert!(!verify_close_authorization(
             &close_sig,
             &[Address::ZERO],
+            None,
             channel_id,
             9,
             escrow,
