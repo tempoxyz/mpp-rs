@@ -137,12 +137,16 @@ impl Transport for WsTransport {
     }
 
     fn respond_challenge(&self, ctx: ChallengeContext<'_, Self::Input>) -> Self::ChallengeOutput {
-        // Never issue a Challenge no Credential may answer (such as one whose
-        // method is outside the method-id grammar): refuse what the HTTP
-        // transport refuses to format.
-        if let Err(e) = crate::protocol::core::format_www_authenticate(ctx.challenge) {
+        // Never issue a Challenge whose method is outside the method-id grammar:
+        // no Credential could answer it. Only the method is checked, since JSON
+        // frames carry fields (such as multiline descriptions) that an HTTP
+        // header can't.
+        if !ctx.challenge.method.is_valid() {
             return WsResponse::Error {
-                error: format!("Failed to format challenge: {e}"),
+                error: format!(
+                    "Failed to format challenge: Invalid method: \"{}\". Must be lowercase letters a-z per spec.",
+                    ctx.challenge.method
+                ),
             };
         }
         let challenge_json = serde_json::to_value(ctx.challenge)
@@ -288,6 +292,33 @@ mod tests {
                 assert!(error.is_none());
             }
             _ => panic!("expected Challenge response"),
+        }
+    }
+
+    #[test]
+    fn test_ws_respond_challenge_keeps_multiline_description() {
+        let transport = ws();
+        let msg = WsMessage::Data {
+            data: serde_json::json!({}),
+        };
+        let mut challenge = PaymentChallenge::new(
+            "test-id",
+            "test.example.com",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+        );
+        challenge.description = Some("Line one\nLine two".to_owned());
+        let resp = transport.respond_challenge(ChallengeContext {
+            challenge: &challenge,
+            input: &msg,
+            error: None,
+        });
+        match resp {
+            WsResponse::Challenge { challenge, .. } => {
+                assert_eq!(challenge["description"], "Line one\nLine two");
+            }
+            other => panic!("expected a Challenge, got {other:?}"),
         }
     }
 
