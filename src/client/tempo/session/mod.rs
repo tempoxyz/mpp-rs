@@ -35,8 +35,8 @@ use self::channel_ops::{
     ChannelEntry, OpenPayloadOptions, OpenPrecompilePayloadOptions, TopUpPrecompilePayloadOptions,
 };
 use self::recovery::{
-    can_sign_descriptor, hydrate_session_snapshot, read_on_chain_channel_state,
-    recover_stored_channel, validate_settlement_route, RecoveryScope,
+    can_sign_descriptor, hydrate_session_snapshot_with_opening_commitment,
+    read_on_chain_channel_state, recover_stored_channel, validate_settlement_route, RecoveryScope,
 };
 use self::store::{
     ChannelStore, ChannelStoreLease, MemoryChannelStore, OriginBoundChannelStore,
@@ -1799,7 +1799,12 @@ impl TempoSessionProvider {
                 ));
             }
             let state = read_on_chain_channel_state(provider, snapshot_channel_id).await?;
-            let mut recovered = hydrate_session_snapshot(snapshot, scope, state)?;
+            let mut recovered = hydrate_session_snapshot_with_opening_commitment(
+                snapshot,
+                scope,
+                state,
+                self.opening_commitment_for(&snapshot.descriptor),
+            )?;
             let spent = snapshot.spent.parse::<u128>().map_err(|error| {
                 MppError::InvalidConfig(format!("invalid snapshot spent: {error}"))
             })?;
@@ -2202,7 +2207,7 @@ impl TempoSessionProvider {
             .parse()
             .mpp_config("invalid snapshot channelId")?;
         let state = read_on_chain_channel_state(&self.rpc_provider, channel_id).await?;
-        let recovered = hydrate_session_snapshot(
+        let recovered = hydrate_session_snapshot_with_opening_commitment(
             &snapshot,
             RecoveryScope {
                 payer,
@@ -2214,6 +2219,7 @@ impl TempoSessionProvider {
                 chain_id: snapshot.chain_id,
             },
             state,
+            self.opening_commitment_for(&snapshot.descriptor),
         )?;
         // A channel kept in another namespace is not copied into this one.
         if self
@@ -2518,7 +2524,11 @@ impl TempoSessionProvider {
         if entry.descriptor.as_ref() != Some(&snapshot.descriptor)
             || entry.chain_id != snapshot.chain_id
             || snapshot.escrow.parse::<Address>().ok() != Some(entry.escrow_contract)
-            || recovery::validate_snapshot_voucher(&snapshot).is_err()
+            || recovery::validate_snapshot_voucher(
+                &snapshot,
+                self.opening_commitment_for(&snapshot.descriptor),
+            )
+            .is_err()
             || spent > entry.cumulative_amount
             || !self.price_within_caps(price)
             || self.check_policy(challenge).is_err()
@@ -2674,6 +2684,21 @@ impl TempoSessionProvider {
         self.configurable_voucher_signer.as_ref().filter(|signer| {
             descriptor.authorized_signer.parse::<Address>().ok() == Some(signer.account())
         })
+    }
+
+    /// The opening commitment this client's vouchers for a channel with
+    /// `descriptor` settle against: its salt when the configurable voucher
+    /// signer commits to it (the only salt this client opens such a channel
+    /// with), else zero, the only commitment a primitive or derived version-0
+    /// voucher settles under.
+    fn opening_commitment_for(
+        &self,
+        descriptor: &crate::protocol::methods::tempo::session::ChannelDescriptor,
+    ) -> B256 {
+        let salt = descriptor.salt.parse::<B256>().unwrap_or_default();
+        self.configurable_signer_for(descriptor)
+            .filter(|signer| !salt.is_zero() && signer.commitment() == salt)
+            .map_or(B256::ZERO, |_| salt)
     }
 
     /// A TIP-1034 voucher payload, signed by the configurable voucher signer
@@ -4850,7 +4875,7 @@ impl PaymentProvider for TempoSessionProvider {
         ) {
             return None;
         }
-        // Fail closed: an \`expires\` that does not read as a date counts as expired.
+        // Fail closed: an `expires` that does not read as a date counts as expired.
         if state.challenge.is_expired() {
             self.prepaid.lock().unwrap().remove(context.url.as_str());
             return None;

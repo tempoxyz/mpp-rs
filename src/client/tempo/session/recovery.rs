@@ -21,10 +21,7 @@ use super::{
 use crate::{
     error::{MppError, ResultExt},
     protocol::methods::tempo::{
-        precompile_voucher::{
-            precompile_voucher_signing_hash_with_escrow, verify_configurable_account_signature,
-            verify_precompile_voucher_signature,
-        },
+        precompile_voucher::{verify_precompile_voucher_signature_with, VoucherVerifyOptions},
         session::{ChannelDescriptor, SessionSnapshot},
     },
 };
@@ -141,7 +138,13 @@ pub fn recover_stored_channel(
 }
 
 /// Validate the signed spending bound before using any snapshot accounting hints.
-pub(crate) fn validate_snapshot_voucher(snapshot: &SessionSnapshot) -> Result<u128, MppError> {
+///
+/// The voucher is checked as the channel reserve settles it against
+/// `opening_commitment` (see [`hydrate_session_snapshot_with_opening_commitment`]).
+pub(crate) fn validate_snapshot_voucher(
+    snapshot: &SessionSnapshot,
+    opening_commitment: B256,
+) -> Result<u128, MppError> {
     let channel_id = parse_b256("snapshot channelId", &snapshot.channel_id)?;
     let escrow = parse_address("snapshot escrow", &snapshot.escrow)?;
     let signed = snapshot
@@ -175,32 +178,18 @@ pub(crate) fn validate_snapshot_voucher(snapshot: &SessionSnapshot) -> Result<u1
     let signature = alloy::hex::decode(signed.signature.trim_start_matches("0x"))
         .map_err(|e| invalid(format!("invalid snapshot voucher signature: {e}")))?;
     let authority = descriptor_authority(&snapshot.descriptor)?;
-    // A TIP-1166 configurable account (`0x05`) voucher is checked against the
-    // descriptor salt: a signer with a configuration commitment can only open
-    // with it as salt, so it is the channel's opening commitment.
-    let salt = parse_b256("descriptor salt", &snapshot.descriptor.salt)?;
-    let configurable = verify_configurable_account_signature(
+    let valid = verify_precompile_voucher_signature_with(
         &signature,
         authority,
-        precompile_voucher_signing_hash_with_escrow(
-            channel_id,
-            voucher_cumulative,
-            escrow,
-            snapshot.chain_id,
-        )?,
-        salt,
-    );
-    let valid = match configurable {
-        Some(valid) => valid,
-        None => verify_precompile_voucher_signature(
-            &signature,
-            authority,
-            channel_id,
-            voucher_cumulative,
-            escrow,
-            snapshot.chain_id,
-        )?,
-    };
+        channel_id,
+        voucher_cumulative,
+        escrow,
+        snapshot.chain_id,
+        &VoucherVerifyOptions {
+            configurable: true,
+            opening_commitment: Some(opening_commitment),
+        },
+    )?;
     if !valid {
         return Err(invalid("snapshot highest voucher signature is invalid"));
     }
@@ -209,10 +198,33 @@ pub(crate) fn validate_snapshot_voucher(snapshot: &SessionSnapshot) -> Result<u1
 }
 
 /// Hydrate a fresh client store from a server snapshot plus on-chain state.
+///
+/// The snapshot's voucher is checked for a channel with a zero opening
+/// commitment: a primitive voucher, or a TIP-1166 configurable account
+/// (`0x05`) voucher presenting the version-0 configuration its address
+/// derives from. Use [`hydrate_session_snapshot_with_opening_commitment`]
+/// for a channel opened with a configuration commitment as its salt.
 pub fn hydrate_session_snapshot(
     snapshot: &SessionSnapshot,
     scope: RecoveryScope,
     state: OnChainChannelState,
+) -> Result<StoredChannelEntry, MppError> {
+    hydrate_session_snapshot_with_opening_commitment(snapshot, scope, state, B256::ZERO)
+}
+
+/// [`hydrate_session_snapshot`] for a channel whose opening commitment is
+/// `opening_commitment`: the voucher signer's configuration commitment when
+/// the channel opened (then also the descriptor's salt), or zero.
+///
+/// Neither the snapshot nor the channel state establishes the opening
+/// commitment, so the caller supplies the one its own vouchers settle
+/// against; the voucher is checked with the rules the channel reserve
+/// settles it with under that commitment.
+pub fn hydrate_session_snapshot_with_opening_commitment(
+    snapshot: &SessionSnapshot,
+    scope: RecoveryScope,
+    state: OnChainChannelState,
+    opening_commitment: B256,
 ) -> Result<StoredChannelEntry, MppError> {
     let channel_id = parse_b256("snapshot channelId", &snapshot.channel_id)?;
     let escrow = parse_address("snapshot escrow", &snapshot.escrow)?;
@@ -223,7 +235,7 @@ pub fn hydrate_session_snapshot(
     }
     validate_descriptor(&snapshot.descriptor, channel_id, scope)?;
 
-    let accepted = validate_snapshot_voucher(snapshot)?;
+    let accepted = validate_snapshot_voucher(snapshot, opening_commitment)?;
     if state.deposit == 0 || state.close_requested_at != 0 {
         return Err(invalid("snapshot channel is absent or closing on-chain"));
     }
@@ -355,7 +367,10 @@ mod tests {
             signing::{P256Jwk, TempoP256Signer},
         },
         protocol::methods::tempo::{
-            precompile_voucher::sign_precompile_voucher_primitive, session::SnapshotVoucher,
+            precompile_voucher::{
+                precompile_voucher_signing_hash_with_escrow, sign_precompile_voucher_primitive,
+            },
+            session::SnapshotVoucher,
         },
     };
     use alloy::signers::Signer;
@@ -614,15 +629,77 @@ mod tests {
             spent: "200".into(),
             units: None,
         };
+        let commitment = config.commitment().unwrap();
         assert_eq!(
-            validate_snapshot_voucher(&snapshot(descriptor.clone())).unwrap(),
+            validate_snapshot_voucher(&snapshot(descriptor.clone()), commitment).unwrap(),
             200
         );
 
         // A configuration other than the channel's opening commitment is rejected.
-        let mut other_salt = descriptor;
-        other_salt.salt = B256::repeat_byte(0x40).to_string();
-        assert!(validate_snapshot_voucher(&snapshot(other_salt)).is_err());
+        assert!(
+            validate_snapshot_voucher(&snapshot(descriptor.clone()), B256::repeat_byte(0x40))
+                .is_err()
+        );
+
+        // On a channel opened with a random salt (zero opening commitment), the
+        // version-0 configuration the account derives from still verifies.
+        let mut random_salt = descriptor;
+        random_salt.salt = B256::repeat_byte(0x40).to_string();
+        assert_eq!(
+            validate_snapshot_voucher(&snapshot(random_salt), B256::ZERO).unwrap(),
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_voucher_from_retired_authority_is_rejected_under_opening_commitment() {
+        let signer = signer();
+        let descriptor = descriptor(signer.address());
+        let channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+            &descriptor,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            4217,
+        )
+        .unwrap();
+        let signature = sign_precompile_voucher_primitive(&signer, channel_id, 200, 4217)
+            .await
+            .unwrap();
+        let snapshot = SessionSnapshot {
+            accepted_cumulative: "200".into(),
+            chain_id: 4217,
+            channel_id: format!("{channel_id:#x}"),
+            close_requested_at: None,
+            deposit: "1000".into(),
+            descriptor,
+            settlement_route: None,
+            escrow: format!("{TIP20_CHANNEL_RESERVE_ADDRESS:#x}"),
+            highest_voucher: Some(SnapshotVoucher {
+                channel_id: format!("{channel_id:#x}"),
+                cumulative_amount: "200".into(),
+                signature: alloy::hex::encode_prefixed(signature),
+            }),
+            required_cumulative: "250".into(),
+            settled: "0".into(),
+            spent: "200".into(),
+            units: None,
+        };
+        assert_eq!(
+            validate_snapshot_voucher(&snapshot, B256::ZERO).unwrap(),
+            200
+        );
+        // A channel opened with a configuration commitment retired the root key.
+        assert!(validate_snapshot_voucher(&snapshot, B256::repeat_byte(0x40)).is_err());
+        assert!(hydrate_session_snapshot_with_opening_commitment(
+            &snapshot,
+            scope(signer.address()),
+            OnChainChannelState {
+                settled: 0,
+                deposit: 1_000,
+                close_requested_at: 0,
+            },
+            B256::repeat_byte(0x40),
+        )
+        .is_err());
     }
 
     #[tokio::test]
