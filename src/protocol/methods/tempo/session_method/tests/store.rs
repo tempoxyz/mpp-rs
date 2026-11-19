@@ -490,3 +490,30 @@ async fn test_default_wait_for_update_does_not_complete_immediately() {
     // Should timeout. The default must not return immediately
     assert!(result.is_err());
 }
+
+#[test]
+fn test_channel_state_without_opening_commitment_loads() {
+    let mut state = test_channel_state("0xchannel1");
+    state.opening_commitment = Some(alloy::primitives::B256::repeat_byte(7));
+    let mut json = serde_json::to_value(&state).unwrap();
+    assert_eq!(
+        json["opening_commitment"].as_str().map(str::to_owned),
+        Some(alloy::primitives::B256::repeat_byte(7).to_string())
+    );
+    // Records stored before the field existed still load, as zero.
+    let obj = json.as_object_mut().unwrap();
+    obj.remove("opening_commitment");
+    let old: ChannelState = serde_json::from_value(json).unwrap();
+    assert_eq!(old.opening_commitment, None);
+}
+
+#[test]
+fn test_channel_state_with_signer_snapshot_field_loads() {
+    let mut json = serde_json::to_value(test_channel_state("0xchannel1")).unwrap();
+    let obj = json.as_object_mut().unwrap();
+    obj.remove("opening_commitment");
+    let commitment = alloy::primitives::B256::repeat_byte(7);
+    obj.insert("signer_snapshot".into(), commitment.to_string().into());
+    let old: ChannelState = serde_json::from_value(json).unwrap();
+    assert_eq!(old.opening_commitment, Some(commitment));
+}

@@ -69,6 +69,15 @@ pub struct SessionMethod<P> {
     close_signer: Option<Arc<super::DynSigner>>,
     /// When each streaming channel's escrow was last read successfully.
     stream_checks: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+    /// Accept TIP-1166 configurable account vouchers; see
+    /// [`with_configurable_vouchers`](Self::with_configurable_vouchers).
+    configurable_vouchers: bool,
+    /// TIP-1166 opening commitments looked up on chain, by channel ID.
+    opening_commitments: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<alloy::primitives::B256, alloy::primitives::B256>,
+        >,
+    >,
 }
 
 impl<P> SessionMethod<P>
@@ -86,6 +95,36 @@ where
             config,
             close_signer: None,
             stream_checks: Arc::default(),
+            configurable_vouchers: false,
+            opening_commitments: Arc::default(),
+        }
+    }
+
+    /// Accept TIP-1166 configurable account (`0x05`) vouchers and advertise
+    /// `configurableVouchers: true` in session challenges, so clients signing
+    /// with a configurable account can open channels.
+    ///
+    /// Off by default, accepting only primitive vouchers as before. Enable it
+    /// once the chain runs T15, which settles such vouchers on the TIP-1034
+    /// channel reserve precompile.
+    pub fn with_configurable_vouchers(mut self, enabled: bool) -> Self {
+        self.configurable_vouchers = enabled;
+        self
+    }
+
+    /// Whether configurable account vouchers are accepted.
+    pub fn configurable_vouchers(&self) -> bool {
+        self.configurable_vouchers
+    }
+
+    /// Voucher verification options for a channel with `opening_commitment`.
+    pub(super) fn voucher_options(
+        &self,
+        opening_commitment: Option<alloy::primitives::B256>,
+    ) -> crate::protocol::methods::tempo::precompile_voucher::VoucherVerifyOptions {
+        crate::protocol::methods::tempo::precompile_voucher::VoucherVerifyOptions {
+            configurable: self.configurable_vouchers,
+            opening_commitment,
         }
     }
 
@@ -180,7 +219,13 @@ where
             session_protocol: None,
             session_snapshot: None,
         };
-        serde_json::to_value(details).ok()
+        let mut details = serde_json::to_value(details).ok()?;
+        if self.configurable_vouchers {
+            if let Some(obj) = details.as_object_mut() {
+                obj.insert("configurableVouchers".to_string(), serde_json::json!(true));
+            }
+        }
+        Some(details)
     }
 
     fn respond(

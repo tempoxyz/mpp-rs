@@ -100,6 +100,8 @@
 //! ```
 
 pub mod charge;
+#[cfg(feature = "tempo")]
+pub mod configurable_account;
 
 pub(crate) type DynSigner = dyn alloy::signers::Signer + Send + Sync;
 pub mod fee_payer_envelope;

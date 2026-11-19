@@ -5,8 +5,9 @@
 //! storage: every credential carries the descriptor, which must hash to the
 //! claimed channel id, and on-chain state is read with `getChannelState`.
 //! Vouchers are TIP-1020 primitive signatures (secp256k1, P-256 or WebAuthn),
-//! so access keys authorized by Tempo Wallet can pay. Mirrors mppx's
-//! precompile session server.
+//! so access keys authorized by Tempo Wallet can pay, and, with configurable
+//! vouchers enabled, TIP-1166 `0x05` signatures. Mirrors mppx's precompile
+//! session server.
 
 use alloy::consensus::transaction::SignerRecoverable;
 use alloy::consensus::SignableTransaction;
@@ -18,10 +19,12 @@ use tempo_alloy::primitives::transaction::{Call, PrimitiveSignature, TempoSignat
 use tempo_alloy::TempoNetwork;
 
 use super::chain::OnChainChannel;
-use super::SessionMethod;
+use super::{ChannelState, SessionMethod};
+use crate::protocol::methods::tempo::configurable_account::MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id_with_escrow,
-    precompile_close_authorization_signing_hash_with_escrow, verify_precompile_voucher_signature,
+    precompile_close_authorization_signing_hash_with_escrow, verify_configurable_account_signature,
+    verify_precompile_voucher_signature_with, VoucherVerifyOptions,
     PRECOMPILE_MAX_CUMULATIVE_AMOUNT,
 };
 use crate::protocol::methods::tempo::session::ChannelDescriptor;
@@ -32,6 +35,61 @@ impl<P> SessionMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
 {
+    /// The channel's TIP-1166 opening commitment, looked up on chain when it is
+    /// unknown (see [`find_opening_commitment`]) and then recorded on the
+    /// channel and cached by channel ID, so each channel is looked up once.
+    ///
+    /// A missing opening commitment is unknown, never zero: a zero opening commitment accepts
+    /// primitive vouchers, which the escrow does not settle on a channel bound
+    /// to a configurable account. A failed lookup rejects the credential.
+    /// Channels on the legacy escrow have no opening commitment.
+    pub(super) async fn resolve_opening_commitment(
+        &self,
+        channel: &ChannelState,
+    ) -> Result<Option<B256>, VerificationError> {
+        if channel.opening_commitment.is_some() || !is_precompile(channel.escrow_contract) {
+            return Ok(channel.opening_commitment);
+        }
+        let channel_id = Self::parse_channel_id(&channel.channel_id)?;
+        let cached = self
+            .opening_commitments
+            .lock()
+            .map_err(|_| VerificationError::internal("opening commitment cache poisoned"))?
+            .get(&channel_id)
+            .copied();
+        let opening_commitment = match cached {
+            Some(opening_commitment) => opening_commitment,
+            None => {
+                let opening_commitment = find_opening_commitment(
+                    self.provider.as_ref(),
+                    channel.escrow_contract,
+                    channel_id,
+                    channel.authorized_signer,
+                )
+                .await?;
+                self.opening_commitments
+                    .lock()
+                    .map_err(|_| VerificationError::internal("opening commitment cache poisoned"))?
+                    .insert(channel_id, opening_commitment);
+                opening_commitment
+            }
+        };
+        self.store
+            .update_channel(
+                &channel.channel_id,
+                Box::new(move |current| {
+                    Ok(current.map(|mut state| {
+                        if state.opening_commitment.is_none() {
+                            state.opening_commitment = Some(opening_commitment);
+                        }
+                        state
+                    }))
+                }),
+            )
+            .await?;
+        Ok(Some(opening_commitment))
+    }
+
     /// Read on-chain channel state from the legacy escrow or, given the
     /// channel's validated descriptor, from the TIP-1034 precompile.
     pub(super) async fn read_channel(
@@ -60,8 +118,17 @@ where
     }
 }
 
-/// Largest TIP-1020 signature accepted from a credential (WebAuthn is the largest kind).
-const MAX_SIGNATURE_BYTES: usize = 2048;
+/// Largest voucher signature accepted from a credential: a TIP-1020 primitive
+/// (WebAuthn is the largest kind) or a TIP-1166 configurable account (`0x05`)
+/// signature, which can be larger.
+const MAX_SIGNATURE_BYTES: usize = {
+    let primitive = 2048;
+    if MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES > primitive {
+        MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES
+    } else {
+        primitive
+    }
+};
 
 pub(super) type WireDescriptor = ITIP20ChannelReserve::ChannelDescriptor;
 
@@ -163,8 +230,9 @@ pub(super) fn validate_descriptor(
     Ok(d)
 }
 
-/// Decode a signature for `escrow`'s voucher scheme: TIP-1020 primitive bytes
-/// for the precompile, canonical secp256k1 for the legacy escrow.
+/// Decode a signature for `escrow`'s voucher scheme: TIP-1020 primitive or
+/// TIP-1166 bytes for the precompile, canonical secp256k1 for the legacy
+/// escrow.
 pub(super) fn parse_signature_for<P>(
     escrow: Address,
     signature: &str,
@@ -183,7 +251,9 @@ pub(super) fn parse_signature_for<P>(
     Ok(bytes)
 }
 
-/// Verify a voucher with the scheme of `escrow`.
+/// Verify a voucher with the scheme of `escrow`. `options` (configurable
+/// account vouchers and the channel's opening commitment) apply only to the
+/// precompile.
 pub(super) fn verify_voucher_for(
     escrow: Address,
     chain_id: u64,
@@ -191,6 +261,7 @@ pub(super) fn verify_voucher_for(
     cumulative_amount: u128,
     signature: &[u8],
     expected_signer: Address,
+    options: &VoucherVerifyOptions,
 ) -> bool {
     if !is_precompile(escrow) {
         return verify_voucher(
@@ -202,21 +273,26 @@ pub(super) fn verify_voucher_for(
             expected_signer,
         );
     }
-    verify_precompile_voucher_signature(
+    verify_precompile_voucher_signature_with(
         signature,
         expected_signer,
         channel_id,
         cumulative_amount,
         escrow,
         chain_id,
+        options,
     )
     .unwrap_or(false)
 }
 
-/// Verify a cooperative close authorization signed by any of `signers`.
+/// Verify a cooperative close authorization signed by any of `signers` with a
+/// primitive signature or, when `configurable` names the channel's voucher
+/// signer and opening commitment, by that signer's configurable account
+/// (`0x05`), as its vouchers are.
 pub(super) fn verify_close_authorization(
     signature: &[u8],
     signers: &[Address],
+    configurable: Option<(Address, B256)>,
     channel_id: B256,
     cumulative_amount: u128,
     escrow: Address,
@@ -230,6 +306,13 @@ pub(super) fn verify_close_authorization(
     ) else {
         return false;
     };
+    if let Some((signer, opening_commitment)) = configurable {
+        if let Some(valid) =
+            verify_configurable_account_signature(signature, signer, hash, opening_commitment)
+        {
+            return valid;
+        }
+    }
     let Ok(primitive) = PrimitiveSignature::from_bytes(signature) else {
         return false;
     };
@@ -250,7 +333,125 @@ alloy::sol! {
             uint32 closeRequestedAt;
         }
         function getChannelState(bytes32 channelId) external view returns (ChannelState memory);
+
+        /// TIP-1166 (T15): `open` recorded the voucher signer's configurable
+        /// account commitment, which the descriptor's salt holds.
+        event OpeningCommitmentRecorded(bytes32 indexed channelId, address indexed signer, bytes32 commitment);
+        /// TIP-1166 (T15): a nonzero `topUp` after the voucher signer's
+        /// configuration changed.
+        error SignerConfigChanged(address signer);
+        /// TIP-1166 (T15): `open` with a salt other than the signer's commitment.
+        error SaltNotSignerCommitment(address signer, bytes32 commitment);
     }
+}
+
+alloy::sol! {
+    interface IConfigurableAccountCommitment {
+        /// TIP-1107: the account's configuration commitment, zero until it
+        /// registers or upgrades. Once nonzero it never returns to zero.
+        function getConfigCommitment(address account) external view returns (bytes32 commitment);
+    }
+}
+
+/// The TIP-1107 configuration commitment of `account`: zero when it has
+/// none, including on a chain without the configurable account precompile
+/// (an empty call result).
+pub(super) async fn get_config_commitment<P: Provider<TempoNetwork>>(
+    provider: &P,
+    account: Address,
+) -> Result<B256, VerificationError> {
+    use crate::protocol::methods::tempo::configurable_account::CONFIGURABLE_ACCOUNT_ADDRESS;
+
+    let call = IConfigurableAccountCommitment::getConfigCommitmentCall { account };
+    let mut request = tempo_alloy::rpc::TempoTransactionRequest::default();
+    request.inner = request.inner.to(CONFIGURABLE_ACCOUNT_ADDRESS).input(
+        alloy::rpc::types::TransactionInput::new(Bytes::from(call.abi_encode())),
+    );
+    let output = provider.call(request).await.map_err(|e| {
+        VerificationError::network_error(format!(
+            "failed to read configurable account commitment: {e}"
+        ))
+    })?;
+    if output.is_empty() {
+        return Ok(B256::ZERO);
+    }
+    IConfigurableAccountCommitment::getConfigCommitmentCall::abi_decode_returns(&output).map_err(
+        |e| {
+            VerificationError::network_error(format!(
+                "failed to decode configurable account commitment: {e}"
+            ))
+        },
+    )
+}
+
+/// The TIP-1166 opening commitment of an open channel whose open receipt this
+/// server did not see (a reused channel, or state recorded before the field
+/// existed): the commitment of the channel's `OpeningCommitmentRecorded` event, or
+/// zero when the escrow emitted none.
+///
+/// A `signer` without a configuration commitment now had none at open, since
+/// commitments never return to zero, so its opening commitment is zero without a log
+/// search. Any read failure is an error: an unknown opening commitment is never taken
+/// to be zero.
+pub(super) async fn find_opening_commitment<P: Provider<TempoNetwork>>(
+    provider: &P,
+    escrow: Address,
+    channel_id: B256,
+    signer: Address,
+) -> Result<B256, VerificationError> {
+    use alloy::sol_types::SolEvent;
+
+    if get_config_commitment(provider, signer).await?.is_zero() {
+        return Ok(B256::ZERO);
+    }
+    let filter = alloy::rpc::types::Filter::new()
+        .address(escrow)
+        .event_signature(IChannelReserveState::OpeningCommitmentRecorded::SIGNATURE_HASH)
+        .topic1(channel_id)
+        .from_block(alloy::eips::BlockNumberOrTag::Earliest)
+        .to_block(alloy::eips::BlockNumberOrTag::Latest);
+    let logs = provider.get_logs(&filter).await.map_err(|e| {
+        VerificationError::network_error(format!("failed to read opening commitment logs: {e}"))
+    })?;
+    for log in logs
+        .iter()
+        .filter(|log| !log.removed && log.address() == escrow)
+    {
+        let Ok(event) = IChannelReserveState::OpeningCommitmentRecorded::decode_log(&log.inner)
+        else {
+            continue;
+        };
+        if event.channelId != channel_id {
+            continue;
+        }
+        if event.signer != signer || event.commitment.is_zero() {
+            return Err(VerificationError::invalid_signature(
+                "channel opening commitment does not match its authorized signer",
+            ));
+        }
+        return Ok(event.commitment);
+    }
+    Ok(B256::ZERO)
+}
+
+/// The TIP-1166 opening commitment an open transaction's receipt reports for
+/// `channel_id`: the commitment of its `OpeningCommitmentRecorded` event from
+/// `escrow`, or `None` when the signer had no commitment.
+pub(super) fn opening_commitment_from_logs(
+    logs: &[alloy::rpc::types::Log],
+    escrow: Address,
+    channel_id: B256,
+) -> Option<B256> {
+    use alloy::sol_types::SolEvent;
+
+    logs.iter()
+        .filter(|log| log.address() == escrow)
+        .find_map(|log| {
+            let event =
+                IChannelReserveState::OpeningCommitmentRecorded::decode_log(&log.inner).ok()?;
+            (event.channelId == channel_id && !event.commitment.is_zero())
+                .then_some(event.commitment)
+        })
 }
 
 /// Read the precompile's `getChannelState` for `channel_id` as of `block`.
@@ -482,6 +683,56 @@ pub(super) fn close_call(
 mod tests {
     use super::*;
 
+    #[test]
+    fn signature_cap_admits_the_largest_configurable_signature() {
+        let at_cap = format!(
+            "0x05{}",
+            "00".repeat(MAX_CONFIGURABLE_ACCOUNT_SIGNATURE_BYTES - 1)
+        );
+        assert!(parse_signature_for::<crate::server::TempoProvider>(
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            &at_cap
+        )
+        .is_ok());
+        let over = format!("0x{}", "00".repeat(MAX_SIGNATURE_BYTES + 1));
+        assert!(parse_signature_for::<crate::server::TempoProvider>(
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            &over
+        )
+        .is_err());
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn configurable_signer_close_authorization_verifies() {
+        use crate::client::tempo::session::configurable::ConfigurableVoucherSigner;
+        use crate::protocol::methods::tempo::configurable_account::tests::{config, owners};
+
+        let keys = owners(2);
+        let config = config(&keys, 2);
+        let account = config.account_address().unwrap();
+        let commitment = config.commitment().unwrap();
+        let signer = ConfigurableVoucherSigner::new(account, config, keys).unwrap();
+        let (channel_id, escrow) = (B256::repeat_byte(0xab), TIP20_CHANNEL_RESERVE_ADDRESS);
+        let close = signer
+            .sign_digest(
+                precompile_close_authorization_signing_hash_with_escrow(
+                    channel_id, 9, escrow, 42431,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The payer's access key is neither the payer nor the authorized signer.
+        let signers = [Address::repeat_byte(0x11), account];
+        let verify = |configurable| {
+            verify_close_authorization(&close, &signers, configurable, channel_id, 9, escrow, 42431)
+        };
+        assert!(verify(Some((account, commitment))));
+        assert!(!verify(Some((account, B256::repeat_byte(0x01)))));
+        assert!(!verify(None));
+    }
+
     fn descriptor(payee: Address, token: Address) -> ChannelDescriptor {
         ChannelDescriptor {
             payer: format!("{:#x}", Address::repeat_byte(0x11)),
@@ -554,7 +805,8 @@ mod tests {
             channel_id,
             5,
             &sig,
-            signer.address()
+            signer.address(),
+            &VoucherVerifyOptions::default()
         ));
         assert!(!verify_voucher_for(
             escrow,
@@ -562,7 +814,8 @@ mod tests {
             channel_id,
             6,
             &sig,
-            signer.address()
+            signer.address(),
+            &VoucherVerifyOptions::default()
         ));
         assert!(!verify_voucher_for(
             escrow,
@@ -570,7 +823,8 @@ mod tests {
             channel_id,
             5,
             &sig,
-            signer.address()
+            signer.address(),
+            &VoucherVerifyOptions::default()
         ));
         assert!(!verify_voucher_for(
             escrow,
@@ -578,7 +832,8 @@ mod tests {
             channel_id,
             5,
             &sig,
-            Address::ZERO
+            Address::ZERO,
+            &VoucherVerifyOptions::default()
         ));
     }
 
@@ -598,11 +853,12 @@ mod tests {
             .to_vec();
         let signers = [payer.address()];
         assert!(verify_close_authorization(
-            &close_sig, &signers, channel_id, 9, escrow, 42431
+            &close_sig, &signers, None, channel_id, 9, escrow, 42431
         ));
         assert!(!verify_close_authorization(
             &close_sig,
             &[Address::ZERO],
+            None,
             channel_id,
             9,
             escrow,
@@ -615,7 +871,8 @@ mod tests {
             channel_id,
             9,
             &close_sig,
-            payer.address()
+            payer.address(),
+            &VoucherVerifyOptions::default()
         ));
     }
 

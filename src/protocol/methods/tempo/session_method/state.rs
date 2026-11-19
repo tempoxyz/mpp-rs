@@ -22,6 +22,9 @@ pub(super) struct Opening {
     pub(super) settlement_route: Option<SettlementRoute>,
     pub(super) cumulative_amount: u128,
     pub(super) signature: Vec<u8>,
+    /// TIP-1166 opening commitment from the open receipt: zero when it recorded
+    /// none, `None` only for the legacy escrow.
+    pub(super) opening_commitment: Option<alloy::primitives::B256>,
 }
 
 impl ChannelState {
@@ -40,6 +43,7 @@ impl ChannelState {
             settlement_route,
             cumulative_amount,
             signature,
+            opening_commitment,
         } = opening;
 
         if let Some(existing) = existing {
@@ -59,6 +63,7 @@ impl ChannelState {
                     highest_voucher_signature: Some(signature),
                     authorized_signer,
                     close_requested_at: on_chain.close_requested_at,
+                    opening_commitment: opening_commitment.or(existing.opening_commitment),
                     ..existing
                 }
             } else {
@@ -68,6 +73,7 @@ impl ChannelState {
                     spent,
                     authorized_signer,
                     close_requested_at: on_chain.close_requested_at,
+                    opening_commitment: opening_commitment.or(existing.opening_commitment),
                     ..existing
                 }
             }
@@ -95,6 +101,7 @@ impl ChannelState {
                 pending_close: None,
                 close_requested_at: on_chain.close_requested_at,
                 created_at: now_iso8601(),
+                opening_commitment,
             }
         }
     }
