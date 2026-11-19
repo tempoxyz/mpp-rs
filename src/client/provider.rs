@@ -109,7 +109,7 @@ pub struct PaymentContext {
 ///
 /// impl PaymentProvider for MyProvider {
 ///     fn supports(&self, method: &str, intent: &str) -> bool {
-///         method == "my_network" && intent == "charge"
+///         method == "mynetwork" && intent == "charge"
 ///     }
 ///
 ///     async fn pay(&self, challenge: &PaymentChallenge) -> Result<PaymentCredential, MppError> {

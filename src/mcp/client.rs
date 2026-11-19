@@ -1255,6 +1255,80 @@ mod tests {
         }
     }
 
+    /// A caller that inherits the default payment-answer classification.
+    #[derive(Clone)]
+    struct DefaultAnswerCaller(TestCaller);
+
+    impl ToolCaller for DefaultAnswerCaller {
+        type Params = Value;
+        type Output = Value;
+        type Error = TestError;
+
+        async fn call_tool(&self, params: Self::Params) -> Result<Self::Output, Self::Error> {
+            self.0.call_tool(params).await
+        }
+
+        fn payment_challenges_from_error(
+            &self,
+            error: &Self::Error,
+        ) -> Option<Vec<PaymentChallenge>> {
+            self.0.payment_challenges_from_error(error)
+        }
+
+        fn payment_challenges_from_output(
+            &self,
+            output: &Self::Output,
+        ) -> Option<Vec<PaymentChallenge>> {
+            self.0.payment_challenges_from_output(output)
+        }
+
+        fn attach_credential(
+            &self,
+            params: &mut Self::Params,
+            credential: &PaymentCredential,
+        ) -> Result<(), MppError> {
+            self.0.attach_credential(params, credential)
+        }
+
+        fn is_definitive_error(&self, error: &Self::Error) -> bool {
+            self.0.is_definitive_error(error)
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_retry_answered_only_with_invalid_method_offers_is_rolled_back() {
+        for method in ["tempo-v2", "x402"] {
+            let mut offer = serde_json::to_value(challenge()).unwrap();
+            offer["id"] = "other".into();
+            offer["method"] = method.into();
+            let caller = TestCaller::new([
+                Err(payment_error(true)),
+                Ok(payment_required_result(vec![offer])),
+            ]);
+            let provider = TestProvider::new();
+            let client = McpClient::new(DefaultAnswerCaller(caller), provider.clone(), context());
+
+            let result = client.call_tool(params()).await.unwrap();
+
+            assert_eq!(result["isError"], true, "{method}");
+            assert_eq!(
+                provider.lifecycle.pays.load(Ordering::SeqCst),
+                1,
+                "{method}"
+            );
+            assert_eq!(
+                provider.lifecycle.commits.load(Ordering::SeqCst),
+                0,
+                "{method}"
+            );
+            assert_eq!(
+                provider.lifecycle.rollbacks.load(Ordering::SeqCst),
+                1,
+                "{method}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unsupported_challenges_preserve_the_original_error() {
         let caller = TestCaller::new([Err(payment_error(true))]);

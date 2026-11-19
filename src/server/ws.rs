@@ -137,6 +137,14 @@ impl Transport for WsTransport {
     }
 
     fn respond_challenge(&self, ctx: ChallengeContext<'_, Self::Input>) -> Self::ChallengeOutput {
+        // Never issue a Challenge no Credential may answer (such as one whose
+        // method is outside the method-id grammar): refuse what the HTTP
+        // transport refuses to format.
+        if let Err(e) = crate::protocol::core::format_www_authenticate(ctx.challenge) {
+            return WsResponse::Error {
+                error: format!("Failed to format challenge: {e}"),
+            };
+        }
         let challenge_json = serde_json::to_value(ctx.challenge)
             .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
 
@@ -280,6 +288,32 @@ mod tests {
                 assert!(error.is_none());
             }
             _ => panic!("expected Challenge response"),
+        }
+    }
+
+    #[test]
+    fn test_ws_respond_challenge_refuses_invalid_method() {
+        let transport = ws();
+        let msg = WsMessage::Data {
+            data: serde_json::json!({}),
+        };
+        for method in ["edge-pay", "x402", "a:b"] {
+            let challenge = PaymentChallenge::new(
+                "test-id",
+                "test.example.com",
+                method,
+                "charge",
+                Base64UrlJson::from_value(&serde_json::json!({"amount": "1000"})).unwrap(),
+            );
+            let resp = transport.respond_challenge(ChallengeContext {
+                challenge: &challenge,
+                input: &msg,
+                error: None,
+            });
+            assert!(
+                matches!(&resp, WsResponse::Error { error } if error.contains("Invalid method")),
+                "{method}: {resp:?}"
+            );
         }
     }
 

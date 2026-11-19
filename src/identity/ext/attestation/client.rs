@@ -738,12 +738,21 @@ fn sent_tokens(headers: &HeaderMap) -> Vec<(Key, Vec<String>)> {
 const X402_CREDENTIAL_HEADERS: &[&str] = &["payment-signature", "x-payment"];
 
 /// Whether `request` is a paid attempt: it answers a Challenge, or carries an
-/// x402 credential.
+/// x402 credential or a Payment credential, as the identity exchange counts
+/// it, even one whose Challenge does not parse (such as a method outside the
+/// method-id grammar): the exchange never resends such a request.
 fn is_paid(request: &Request, context: &ProveContext) -> bool {
     context.challenge.is_some()
         || X402_CREDENTIAL_HEADERS
             .iter()
             .any(|name| request.headers().contains_key(*name))
+        || request.headers().values().any(|value| {
+            value
+                .to_str()
+                .ok()
+                .and_then(crate::protocol::core::headers::extract_payment_scheme)
+                .is_some()
+        })
 }
 
 impl Prover for AttestationProver {
@@ -865,6 +874,38 @@ mod tests {
         assert!(sent(&unpaid).is_empty());
         let mut paid = request("https://api.example/");
         prover.present(&mut paid, true);
+        assert_eq!(sent(&paid), vec![near]);
+    }
+
+    #[tokio::test]
+    async fn an_unparsed_payment_credential_counts_as_paid() {
+        use base64::Engine as _;
+        let near = token(100, |c| c["iat"] = (now() - 1_000).into());
+        let prover = AttestationProver::new([AUDIENCE], [ISSUER])
+            .unwrap()
+            .with_attestations([&near])
+            .unwrap();
+        // A Credential whose method is outside the grammar: no Challenge parses.
+        let credential = serde_json::json!({
+            "challenge": {
+                "id": "c", "realm": "api.example", "method": "tempo-v2",
+                "intent": "charge", "request": "e30",
+            },
+            "payload": {"type": "hash", "hash": "0xabc"},
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&credential).unwrap());
+        let mut paid = request("https://api.example/");
+        paid.headers_mut().insert(
+            "authorization",
+            format!("Payment {encoded}").parse().unwrap(),
+        );
+        let context = ProveContext {
+            created: 0,
+            nonce: "n".into(),
+            challenge: None,
+        };
+        prover.prove(&mut paid, &context).await.unwrap();
         assert_eq!(sent(&paid), vec![near]);
     }
 
