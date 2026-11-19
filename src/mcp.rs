@@ -449,6 +449,14 @@ fn serialize_wire_challenges<S: Serializer>(
 }
 
 fn wire_challenge(challenge: &PaymentChallenge) -> Result<serde_json::Value, MppError> {
+    // Refuse what extract_challenges would discard, as format_www_authenticate
+    // does for HTTP, so a server never offers a Challenge its clients can't read.
+    if !challenge.method.is_valid() {
+        return Err(MppError::invalid_challenge_reason(format!(
+            "Invalid method: \"{}\". Must be lowercase letters a-z per spec.",
+            challenge.method
+        )));
+    }
     let mut value = serde_json::to_value(challenge)
         .map_err(|error| MppError::InvalidConfig(error.to_string()))?;
     value["request"] = challenge.request.decode_value()?;
@@ -842,6 +850,20 @@ mod tests {
         challenge.request = Base64UrlJson::from_raw("not json");
 
         assert!(serde_json::to_value(payment_required_error(&challenge)).is_err());
+    }
+
+    #[test]
+    fn test_payment_required_error_rejects_invalid_method() {
+        for method in ["x402", "tempo-v2", "a:b"] {
+            let mut challenge = test_challenge();
+            challenge.method = method.into();
+
+            let error = serde_json::to_value(payment_required_error(&challenge)).unwrap_err();
+            assert!(
+                error.to_string().contains("Invalid method"),
+                "{method}: {error}"
+            );
+        }
     }
 
     // ---- attach_receipt ----
