@@ -461,15 +461,19 @@ async fn test_open_stores_channel_after_broadcast() {
     assert_eq!(stored.highest_voucher_amount, 1_000);
 }
 
-/// With configurable vouchers on, a `0x05` opening voucher can verify against
-/// the payer-chosen descriptor salt before broadcast. When the open receipt
-/// then records no opening commitment, that voucher is invalid for the
-/// channel and the open is rejected instead of stored.
-#[tokio::test]
-async fn test_precompile_open_rechecks_salt_voucher_against_receipt() {
+/// A TIP-1034 open credential for `salt` and `authorized_signer`, with a
+/// voucher for 1_000 that `sign` signs from its digest.
+fn precompile_open_credential(
+    salt: B256,
+    authorized_signer: Address,
+    sign: impl FnOnce(B256) -> Vec<u8>,
+) -> (
+    String,
+    crate::protocol::intents::SessionRequest,
+    crate::protocol::core::PaymentCredential,
+) {
     use crate::protocol::core::{Base64UrlJson, PaymentChallenge, PaymentCredential};
     use crate::protocol::intents::SessionRequest;
-    use crate::protocol::methods::tempo::configurable_account::tests::{config, owners, sign};
     use crate::protocol::methods::tempo::precompile_voucher::{
         compute_precompile_channel_id_with_escrow, precompile_voucher_signing_hash_with_escrow,
     };
@@ -477,7 +481,7 @@ async fn test_precompile_open_rechecks_salt_voucher_against_receipt() {
     use alloy::eips::Encodable2718;
     use alloy::primitives::aliases::U96;
     use alloy::signers::SignerSync;
-    use alloy::sol_types::{SolCall, SolValue};
+    use alloy::sol_types::SolCall;
     use tempo_alloy::contracts::precompiles::{
         ITIP20ChannelReserve, TIP20_CHANNEL_RESERVE_ADDRESS as RESERVE,
     };
@@ -485,20 +489,13 @@ async fn test_precompile_open_rechecks_salt_voucher_against_receipt() {
     use tempo_alloy::primitives::TempoTransaction;
 
     let payer = alloy::signers::local::PrivateKeySigner::random();
-    let keys = owners(1);
-    let mut cfg = config(&keys, 1);
-    let account = cfg.account_address().unwrap();
-    // A configuration the account never registered, chosen by the payer.
-    cfg.version = 1;
-    let salt = cfg.commitment().unwrap();
-
     let open = ITIP20ChannelReserve::openCall {
         payee: TEST_PAYEE,
         operator: Address::ZERO,
         token: TEST_TOKEN,
         deposit: U96::from(10_000u64),
         salt,
-        authorizedSigner: account,
+        authorizedSigner: authorized_signer,
     };
     let tx = TempoTransaction {
         chain_id: 42431,
@@ -525,14 +522,14 @@ async fn test_precompile_open_rechecks_salt_voucher_against_receipt() {
         Address::ZERO,
         TEST_TOKEN,
         salt,
-        account,
+        authorized_signer,
         expiring_nonce_hash,
         RESERVE,
         42431,
     );
     let digest =
         precompile_voucher_signing_hash_with_escrow(channel_id, 1_000, RESERVE, 42431).unwrap();
-    let voucher = sign(&[&keys[0]], account, &cfg, digest).to_bytes();
+    let voucher = sign(digest);
 
     let request = SessionRequest {
         amount: "1000".to_string(),
@@ -564,7 +561,7 @@ async fn test_precompile_open_rechecks_salt_voucher_against_receipt() {
                     operator: Address::ZERO.to_string(),
                     token: TEST_TOKEN.to_string(),
                     salt: salt.to_string(),
-                    authorized_signer: account.to_string(),
+                    authorized_signer: authorized_signer.to_string(),
                     expiring_nonce_hash: expiring_nonce_hash.to_string(),
                 },
             ),
@@ -574,10 +571,139 @@ async fn test_precompile_open_rechecks_salt_voucher_against_receipt() {
             signature: alloy::hex::encode_prefixed(&voucher),
         },
     );
+    (channel_id.to_string(), request, credential)
+}
+
+/// A `0x05` opening voucher for a configuration the payer chose as salt but
+/// the account never registered: the open would record a zero opening
+/// commitment, which that voucher does not satisfy, so it is rejected
+/// before broadcast.
+#[tokio::test]
+async fn test_precompile_open_rejects_salt_voucher_signer_never_committed() {
+    use crate::protocol::methods::tempo::configurable_account::tests::{config, owners, sign};
+
+    let keys = owners(1);
+    let mut cfg = config(&keys, 1);
+    let account = cfg.account_address().unwrap();
+    cfg.version = 1;
+    let salt = cfg.commitment().unwrap();
+    let (channel_id, request, credential) = precompile_open_credential(salt, account, |digest| {
+        sign(&[&keys[0]], account, &cfg, digest).to_bytes().to_vec()
+    });
 
     let store = Arc::new(InMemoryChannelStore::new());
     let asserter = alloy::providers::mock::Asserter::new();
-    // Mined, with no `OpeningCommitmentRecorded` log: the opening commitment is zero.
+    asserter.push_success(&B256::ZERO); // getConfigCommitment
+    push_mined_transaction(&asserter);
+    let method =
+        mocked_session_method(store.clone(), asserter.clone()).with_configurable_vouchers(true);
+
+    let err = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        Some(ErrorCode::InvalidSignature),
+        "{}",
+        err.message
+    );
+    assert_eq!(asserter.read_q().len(), 3, "transaction was broadcast");
+    assert!(store.get_channel_sync(&channel_id).is_none());
+}
+
+/// A signer whose configuration commitment is the salt opens a channel with
+/// that opening commitment, which a primitive voucher never settles: it is
+/// rejected before the open is broadcast, not after funding.
+#[tokio::test]
+async fn test_precompile_open_rejects_primitive_voucher_under_signer_commitment() {
+    use alloy::signers::SignerSync;
+
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let commitment = B256::repeat_byte(0x5c);
+    let (channel_id, request, credential) =
+        precompile_open_credential(commitment, signer.address(), |digest| {
+            signer.sign_hash_sync(&digest).unwrap().as_bytes().to_vec()
+        });
+
+    for configurable in [false, true] {
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&commitment); // getConfigCommitment
+        push_mined_transaction(&asserter);
+        let method = mocked_session_method(store.clone(), asserter.clone())
+            .with_configurable_vouchers(configurable);
+
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            Some(ErrorCode::InvalidSignature),
+            "{}",
+            err.message
+        );
+        assert_eq!(asserter.read_q().len(), 3, "transaction was broadcast");
+        assert!(store.get_channel_sync(&channel_id).is_none());
+    }
+}
+
+/// A salt that is neither random for a signer without a commitment nor the
+/// signer's commitment would make the open revert: it is rejected first.
+#[tokio::test]
+async fn test_precompile_open_rejects_salt_other_than_signer_commitment() {
+    use alloy::signers::SignerSync;
+
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let (channel_id, request, credential) =
+        precompile_open_credential(B256::repeat_byte(0xab), signer.address(), |digest| {
+            signer.sign_hash_sync(&digest).unwrap().as_bytes().to_vec()
+        });
+
+    let store = Arc::new(InMemoryChannelStore::new());
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&B256::repeat_byte(0x5c)); // getConfigCommitment
+    push_mined_transaction(&asserter);
+    let method = mocked_session_method(store.clone(), asserter.clone());
+
+    let err = method
+        .verify_session(&credential, &request)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code,
+        Some(ErrorCode::CredentialMismatch),
+        "{}",
+        err.message
+    );
+    assert_eq!(asserter.read_q().len(), 3, "transaction was broadcast");
+    assert!(store.get_channel_sync(&channel_id).is_none());
+}
+
+/// With configurable vouchers on, a `0x05` opening voucher verifies before
+/// broadcast against the signer's commitment, which is the salt. When the
+/// open receipt then records no opening commitment, that voucher is invalid
+/// for the channel and the open is rejected instead of stored.
+#[tokio::test]
+async fn test_precompile_open_rechecks_salt_voucher_against_receipt() {
+    use crate::protocol::methods::tempo::configurable_account::tests::{config, owners, sign};
+    use alloy::primitives::aliases::U96;
+    use alloy::sol_types::SolValue;
+
+    let keys = owners(1);
+    let mut cfg = config(&keys, 1);
+    let account = cfg.account_address().unwrap();
+    cfg.version = 1;
+    let salt = cfg.commitment().unwrap();
+    let (channel_id, request, credential) = precompile_open_credential(salt, account, |digest| {
+        sign(&[&keys[0]], account, &cfg, digest).to_bytes().to_vec()
+    });
+
+    let store = Arc::new(InMemoryChannelStore::new());
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&salt); // getConfigCommitment
+                                  // Mined, with no `OpeningCommitmentRecorded` log: the opening commitment is zero.
     push_mined_transaction(&asserter);
     asserter.push_success(&Bytes::from(
         (U96::ZERO, U96::from(10_000u64), 0u32).abi_encode_params(),
@@ -595,7 +721,7 @@ async fn test_precompile_open_rechecks_salt_voucher_against_receipt() {
         "{}",
         err.message
     );
-    assert!(store.get_channel_sync(&channel_id.to_string()).is_none());
+    assert!(store.get_channel_sync(&channel_id).is_none());
 }
 
 #[tokio::test]

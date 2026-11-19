@@ -233,16 +233,30 @@ where
         };
         // From T15 (TIP-1166) a signer with a configurable account commitment
         // can only open with that commitment as salt, which becomes the
-        // channel's opening commitment. Until the receipt says which, accept a
-        // voucher valid with either; it is checked against the receipt below.
-        let salt_commitment = precompile_descriptor
-            .as_ref()
-            .map(|descriptor| descriptor.salt)
-            .filter(|salt| self.configurable_vouchers() && !salt.is_zero());
-        let valid_without_commitment = verify_open_voucher(voucher_signer, None);
-        if !valid_without_commitment
-            && !salt_commitment.is_some_and(|salt| verify_open_voucher(voucher_signer, Some(salt)))
-        {
+        // channel's opening commitment; any other signer's channel opens with
+        // a zero one. Read the signer's commitment now so the voucher is
+        // checked against the commitment the open records: a commitment never
+        // returns to zero, and one that changes before inclusion reverts the
+        // open. The receipt is checked again below.
+        let expected_commitment = match precompile_descriptor.as_ref() {
+            Some(descriptor) if !descriptor.salt.is_zero() => {
+                let signer_commitment =
+                    precompile::get_config_commitment(self.provider.as_ref(), voucher_signer)
+                        .await?;
+                if signer_commitment.is_zero() {
+                    Some(B256::ZERO)
+                } else if signer_commitment == descriptor.salt {
+                    Some(signer_commitment)
+                } else {
+                    return Err(VerificationError::credential_mismatch(
+                        "descriptor salt is not the voucher signer's configuration commitment",
+                    ));
+                }
+            }
+            Some(_) => Some(B256::ZERO),
+            None => None,
+        };
+        if !verify_open_voucher(voucher_signer, expected_commitment) {
             return Err(VerificationError::invalid_signature(
                 "invalid voucher signature",
             ));
@@ -335,13 +349,10 @@ where
             ));
         }
 
-        // The signature was verified against the transaction's signer above;
-        // only a channel that reports a different signer, a signer opening
-        // commitment, or a voucher that was only valid with the payer-chosen
-        // salt as commitment needs another check.
-        if (authorized_signer != voucher_signer
-            || !valid_without_commitment
-            || opening_commitment.is_some_and(|commitment| !commitment.is_zero()))
+        // The signature was verified against the transaction's signer and the
+        // expected opening commitment above; only a channel that reports a
+        // different signer or opening commitment needs another check.
+        if (authorized_signer != voucher_signer || opening_commitment != expected_commitment)
             && !verify_open_voucher(authorized_signer, opening_commitment)
         {
             return Err(VerificationError::invalid_signature(
