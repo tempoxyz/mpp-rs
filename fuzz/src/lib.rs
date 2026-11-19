@@ -23,14 +23,14 @@ impl<'a> Arbitrary<'a> for Text {
     }
 }
 
-/// A method name matching `[a-z][a-z0-9:_-]*`.
+/// A method name matching `[a-z]+` (`1*LOWERALPHA`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method(pub String);
 
 impl<'a> Arbitrary<'a> for Method {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
-        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789:_-";
-        let mut name = String::from(*u.choose(&ALPHABET[..26])? as char);
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+        let mut name = String::from(*u.choose(ALPHABET)? as char);
         for _ in 0..u.int_in_range(0..=11)? {
             name.push(*u.choose(ALPHABET)? as char);
         }
