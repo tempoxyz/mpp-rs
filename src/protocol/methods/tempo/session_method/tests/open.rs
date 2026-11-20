@@ -816,3 +816,159 @@ async fn test_open_binds_credential_source_before_broadcast() {
         assert!(store.get_channel_sync(&channel_id).is_none());
     }
 }
+
+/// The TIP-1034 branch of handle_open binds a sourced open credential to the
+/// payer its transaction signature authenticates before broadcasting: a
+/// malformed source, a source on another chain or one naming another account
+/// is refused with the transaction unsent, while the payer's own source gets
+/// past the check.
+#[tokio::test]
+async fn test_precompile_open_binds_credential_source_before_broadcast() {
+    use alloy::eips::Encodable2718;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::SignerSync;
+    use alloy::sol_types::SolCall;
+    use tempo_alloy::contracts::precompiles::{
+        ITIP20ChannelReserve, TIP20_CHANNEL_RESERVE_ADDRESS,
+    };
+    use tempo_alloy::primitives::transaction::Call;
+    use tempo_alloy::primitives::TempoTransaction;
+
+    let escrow = TIP20_CHANNEL_RESERVE_ADDRESS;
+    let did = |chain_id: u64, address: Address| {
+        format!("did:pkh:eip155:{chain_id}:{}", address.to_checksum(None))
+    };
+    // A TIP-1034 open of a 10_000 deposit, with a voucher for `cumulative`.
+    let open = |payer: &PrivateKeySigner, cumulative: u128| {
+        let salt = B256::repeat_byte(0xab);
+        let tx = TempoTransaction {
+            chain_id: 42431,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            calls: vec![Call {
+                to: alloy::primitives::TxKind::Call(escrow),
+                value: alloy::primitives::U256::ZERO,
+                input: ITIP20ChannelReserve::openCall::new((
+                    TEST_PAYEE,
+                    Address::ZERO,
+                    TEST_TOKEN,
+                    alloy::primitives::Uint::from(10_000u64),
+                    salt,
+                    Address::ZERO,
+                ))
+                .abi_encode()
+                .into(),
+            }],
+            ..Default::default()
+        };
+        // The precompile's expiringNonceHash: the signing encoding, then the sender.
+        let mut buf = Vec::new();
+        alloy::consensus::SignableTransaction::encode_for_signing(&tx, &mut buf);
+        buf.extend_from_slice(payer.address().as_slice());
+        let nonce_hash = alloy::primitives::keccak256(buf);
+        let channel_id = crate::protocol::methods::tempo::precompile_voucher::compute_precompile_channel_id_with_escrow(
+            payer.address(),
+            TEST_PAYEE,
+            Address::ZERO,
+            TEST_TOKEN,
+            salt,
+            Address::ZERO,
+            nonce_hash,
+            escrow,
+            42431,
+        );
+        let signature = payer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let transaction =
+            alloy::hex::encode_prefixed(tx.into_signed(signature.into()).encoded_2718());
+        let voucher_hash =
+            crate::protocol::methods::tempo::precompile_voucher_signing_hash_with_escrow(
+                channel_id, cumulative, escrow, 42431,
+            )
+            .unwrap();
+        let voucher = payer.sign_hash_sync(&voucher_hash).unwrap();
+        let request = crate::protocol::intents::SessionRequest {
+            amount: "1000".to_string(),
+            currency: TEST_TOKEN.to_string(),
+            recipient: Some(TEST_PAYEE.to_string()),
+            method_details: Some(serde_json::json!({
+                "escrowContract": escrow.to_string(),
+                "chainId": 42431,
+            })),
+            ..Default::default()
+        };
+        let challenge = crate::protocol::core::PaymentChallenge::new(
+            "test-id",
+            "api.example.com",
+            METHOD_NAME,
+            INTENT_SESSION,
+            crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap(),
+        );
+        let descriptor = crate::protocol::methods::tempo::session::ChannelDescriptor {
+            payer: format!("{:#x}", payer.address()),
+            payee: format!("{TEST_PAYEE:#x}"),
+            operator: format!("{:#x}", Address::ZERO),
+            token: format!("{TEST_TOKEN:#x}"),
+            salt: format!("{salt:#x}"),
+            authorized_signer: format!("{:#x}", Address::ZERO),
+            expiring_nonce_hash: format!("{nonce_hash:#x}"),
+        };
+        let credential = crate::protocol::core::PaymentCredential::new(
+            challenge.to_echo(),
+            SessionCredentialPayload::Open {
+                payload_type: "transaction".to_string(),
+                channel_id: channel_id.to_string(),
+                transaction,
+                descriptor: Some(descriptor),
+                settlement_route: None,
+                authorized_signer: None,
+                cumulative_amount: cumulative.to_string(),
+                signature: alloy::hex::encode_prefixed(voucher.as_bytes()),
+            },
+        );
+        (channel_id.to_string(), request, credential)
+    };
+    let payer = PrivateKeySigner::random();
+    let other = PrivateKeySigner::random();
+
+    let run = |source: String, cumulative: u128| {
+        let (channel_id, request, mut credential) = open(&payer, cumulative);
+        credential.source = Some(source);
+        async move {
+            let store = Arc::new(InMemoryChannelStore::new());
+            let asserter = alloy::providers::mock::Asserter::new();
+            push_mined_transaction(&asserter);
+            let queued = asserter.read_q().len();
+            let method = mocked_session_method(store.clone(), asserter.clone());
+            let err = method
+                .verify_session(&credential, &request)
+                .await
+                .unwrap_err();
+            assert_eq!(asserter.read_q().len(), queued, "transaction was broadcast");
+            assert!(store.get_channel_sync(&channel_id).is_none());
+            err
+        }
+    };
+
+    for (source, expected) in [
+        ("not-a-did".to_string(), "credential source is invalid"),
+        (did(4217, payer.address()), "credential source is invalid"),
+        (
+            did(42431, other.address()),
+            "credential source does not match transaction payer",
+        ),
+    ] {
+        let err = run(source.clone(), 1_000).await;
+        assert_eq!(err.message, expected, "{source}");
+    }
+
+    // The payer's own source passes the binding and reaches the voucher check,
+    // which still runs before any broadcast.
+    let err = run(did(42431, payer.address()), 10_001).await;
+    assert_eq!(
+        err.code,
+        Some(ErrorCode::AmountExceedsDeposit),
+        "{}",
+        err.message
+    );
+}
