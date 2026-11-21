@@ -373,17 +373,21 @@ pub fn extract_receipt(meta: &serde_json::Value) -> Option<Receipt> {
 /// `None` when the metadata key is absent or it lists no valid challenge,
 /// except that it returns `Some` with an empty list when every listed
 /// challenge was skipped and at least one of them selected a credential header
-/// other than `Payment-Authorization`. The result still requires payment, so
-/// [`McpClient`](client::McpClient) returns it unpaid, and rolls back a paid
-/// retry answered with it instead of committing it.
+/// other than `Payment-Authorization` or named a method outside the
+/// `1*LOWERALPHA` grammar (such as `tempo-v2` or `x402`). The result still
+/// requires payment, so [`McpClient`](client::McpClient) returns it unpaid, and
+/// rolls back a paid retry answered with it instead of committing it.
 pub fn extract_result_challenges(meta: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
     let entries = meta
         .get(PAYMENT_REQUIRED_META_KEY)?
         .get("challenges")?
         .as_array()?;
     let challenges = parse_wire_challenges(entries);
-    (!challenges.is_empty() || entries.iter().any(has_unsupported_credential_header))
-        .then_some(challenges)
+    (!challenges.is_empty()
+        || entries
+            .iter()
+            .any(|entry| has_unsupported_credential_header(entry) || has_invalid_method(entry)))
+    .then_some(challenges)
 }
 
 fn extract_wire_challenges(value: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
@@ -406,6 +410,15 @@ fn has_unsupported_credential_header(challenge: &serde_json::Value) -> bool {
         let header = header.as_str().unwrap_or_default();
         crate::protocol::core::parse_advertised_credential_header(Some(header)).is_err()
     })
+}
+
+/// Returns whether a wire challenge names a method outside the method-id
+/// grammar (`1*LOWERALPHA`): an offer this client can never answer.
+fn has_invalid_method(challenge: &serde_json::Value) -> bool {
+    challenge
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|method| !crate::protocol::core::MethodName::new(method).is_valid())
 }
 
 fn parse_wire_challenge(mut challenge: serde_json::Value) -> Option<PaymentChallenge> {
@@ -436,6 +449,14 @@ fn serialize_wire_challenges<S: Serializer>(
 }
 
 fn wire_challenge(challenge: &PaymentChallenge) -> Result<serde_json::Value, MppError> {
+    // Refuse what extract_challenges would discard, as format_www_authenticate
+    // does for HTTP, so a server never offers a Challenge its clients can't read.
+    if !challenge.method.is_valid() {
+        return Err(MppError::invalid_challenge_reason(format!(
+            "Invalid method: \"{}\". Must be lowercase letters a-z per spec.",
+            challenge.method
+        )));
+    }
     let mut value = serde_json::to_value(challenge)
         .map_err(|error| MppError::InvalidConfig(error.to_string()))?;
     value["request"] = challenge.request.decode_value()?;
@@ -714,6 +735,19 @@ mod tests {
         let meta = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: data });
         assert_eq!(extract_result_challenges(&meta).unwrap().len(), 1);
 
+        // Offers only in methods outside the grammar still require payment.
+        for method in ["tempo-v2", "x402"] {
+            let mut offer = serde_json::to_value(test_challenge()).unwrap();
+            offer["method"] = method.into();
+            let meta =
+                serde_json::json!({ PAYMENT_REQUIRED_META_KEY: {"challenges": [offer, {}]} });
+            assert_eq!(
+                extract_result_challenges(&meta).map(|c| c.len()),
+                Some(0),
+                "{method}"
+            );
+        }
+
         let malformed = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: {"challenges": [{}]} });
         assert!(extract_result_challenges(&malformed).is_none());
         assert!(extract_result_challenges(&serde_json::json!({})).is_none());
@@ -816,6 +850,20 @@ mod tests {
         challenge.request = Base64UrlJson::from_raw("not json");
 
         assert!(serde_json::to_value(payment_required_error(&challenge)).is_err());
+    }
+
+    #[test]
+    fn test_payment_required_error_rejects_invalid_method() {
+        for method in ["x402", "tempo-v2", "a:b"] {
+            let mut challenge = test_challenge();
+            challenge.method = method.into();
+
+            let error = serde_json::to_value(payment_required_error(&challenge)).unwrap_err();
+            assert!(
+                error.to_string().contains("Invalid method"),
+                "{method}: {error}"
+            );
+        }
     }
 
     // ---- attach_receipt ----

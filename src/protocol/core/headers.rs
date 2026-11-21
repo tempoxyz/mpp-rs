@@ -189,15 +189,9 @@ fn is_valid_intent_name(value: &str) -> bool {
     !value.is_empty() && !value.contains('|')
 }
 
-/// Validate the method identifier grammar used by mppx.
+/// Validate the method identifier grammar: `payment-method-id = 1*LOWERALPHA`.
 fn is_valid_method_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
-        && chars.all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || matches!(character, ':' | '_' | '-')
-        })
+    super::types::is_valid_method_id(value)
 }
 
 /// Validate that a `request` parameter is a base64url-encoded JSON object.
@@ -302,7 +296,7 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
     let method_raw = require_param!(params, "method").clone();
     if !is_valid_method_name(&method_raw) {
         return Err(MppError::invalid_challenge_reason(format!(
-            "Invalid method: \"{}\". Must match method-name ABNF.",
+            "Invalid method: \"{}\". Must be lowercase letters a-z per spec.",
             method_raw
         )));
     }
@@ -467,7 +461,7 @@ fn decode_latin1(value: &[u8]) -> Cow<'_, str> {
 pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
     if !is_valid_method_name(challenge.method.as_str()) {
         return Err(MppError::invalid_challenge_reason(format!(
-            "Invalid method: \"{}\". Must match method-name ABNF.",
+            "Invalid method: \"{}\". Must be lowercase letters a-z per spec.",
             challenge.method
         )));
     }
@@ -1269,7 +1263,7 @@ mod tests {
 
     #[test]
     fn test_parse_www_authenticate_accepts_canonical_method_names() {
-        for method in ["tempo", "x402", "tempo-v2", "a:b", "a_b", "a1:b_2-c"] {
+        for method in ["tempo", "stripe", "evm", "a"] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#
             );
@@ -1289,7 +1283,8 @@ mod tests {
     #[test]
     fn test_parse_www_authenticate_rejects_invalid_method_names() {
         for method in [
-            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "Tempo",
+            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "Tempo", "x402", "tempo2",
+            "tempo-v2", "a:b", "a_b", "a1:b_2-c",
         ] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#
