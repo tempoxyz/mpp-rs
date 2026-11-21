@@ -597,6 +597,110 @@ pub(super) fn verify_open(
     Ok((d, signer, deposit))
 }
 
+/// Bind an opening credential's source to the payer its signed transaction
+/// authenticates.
+///
+/// A credential without a source is accepted. Otherwise the source must name
+/// the transaction's payer on this chain, proven by the transaction's
+/// signature: a direct signature by the payer, an access key the transaction
+/// itself authorizes (signed by the payer, for this chain and unexpired), or
+/// an access key the payer authorized earlier that is neither revoked nor
+/// expired on chain. Mirrors mppx's `assertCredentialSourceIsPayer`.
+///
+/// When the transaction carries a key authorization that does not prove the
+/// signing key this way (it authorizes another key, or someone other than the
+/// payer signed it), the signing key is looked up on chain as if the
+/// authorization were absent, so an already-active key still authenticates the
+/// payer. A failed lookup is a retryable network error, not a rejection.
+pub(super) async fn verify_open_source<P: Provider<TempoNetwork>>(
+    provider: &P,
+    source: Option<&str>,
+    chain_id: u64,
+    payer: Address,
+    tx_bytes: &[u8],
+) -> Result<(), VerificationError> {
+    let Some(source) = source else {
+        return Ok(());
+    };
+    let parsed = crate::protocol::methods::tempo::proof::parse_proof_source(source)
+        .map_err(|_| VerificationError::new("credential source is invalid"))?;
+    if parsed.chain_id != chain_id {
+        return Err(VerificationError::new("credential source is invalid"));
+    }
+    if parsed.address != payer {
+        return Err(VerificationError::new(
+            "credential source does not match transaction payer",
+        ));
+    }
+    // Unavailable authorization state cannot authenticate a claimed identity.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX);
+    if !signature_authenticates_payer(provider, chain_id, payer, tx_bytes, now).await? {
+        return Err(VerificationError::new(
+            "credential source is not authenticated by transaction signature",
+        ));
+    }
+    Ok(())
+}
+
+async fn signature_authenticates_payer<P: Provider<TempoNetwork>>(
+    provider: &P,
+    chain_id: u64,
+    payer: Address,
+    tx_bytes: &[u8],
+    now: u64,
+) -> Result<bool, VerificationError> {
+    use tempo_alloy::provider::ext::TempoProviderExt;
+
+    let tx_data = match tx_bytes.first() {
+        Some(&tempo_alloy::primitives::transaction::TEMPO_TX_TYPE_ID) => &tx_bytes[1..],
+        _ => tx_bytes,
+    };
+    // Undecodable transactions and signatures cannot authenticate anyone.
+    let Ok(signed) = tempo_alloy::primitives::AASigned::rlp_decode(&mut &tx_data[..]) else {
+        return Ok(false);
+    };
+    let sig_hash = signed.signature_hash();
+    let keychain = match signed.signature() {
+        TempoSignature::Primitive(signature) => {
+            return Ok(signature
+                .recover_signer(&sig_hash)
+                .is_ok_and(|signer| signer == payer));
+        }
+        TempoSignature::Keychain(keychain) => keychain,
+    };
+    if keychain.user_address != payer {
+        return Ok(false);
+    }
+    let Ok(access_key) = keychain.key_id(&sig_hash) else {
+        return Ok(false);
+    };
+    if let Some(authorization) = &signed.tx().key_authorization {
+        // The transaction authorizes its own access key: the payer must sign
+        // that authorization, for this chain, and it must not have expired.
+        if authorization.key_id == access_key
+            && authorization
+                .recover_signer()
+                .is_ok_and(|signer| signer == payer)
+            && (authorization.chain_id == 0 || authorization.chain_id == chain_id)
+            && authorization.expiry.is_none_or(|expiry| expiry.get() > now)
+        {
+            return Ok(true);
+        }
+        // Otherwise the authorization proves nothing about the signing key:
+        // require that key to be active on chain already.
+    }
+    let key = provider
+        .get_keychain_key(payer, access_key)
+        .await
+        .map_err(|e| {
+            VerificationError::network_error(format!("failed to look up payer access key: {e}"))
+        })?;
+    Ok(!key.isRevoked && key.expiry > now)
+}
+
 /// Check a client-signed precompile topUp for `descriptor` and `additional_deposit`.
 pub(super) fn verify_top_up(
     tx_bytes: &[u8],

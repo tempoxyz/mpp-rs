@@ -230,8 +230,9 @@ fn test_open_channel_id_binding_rejects_mismatch() {
         chain_id,
     );
 
-    // Should pass with correct channel ID.
-    assert!(
+    // Should pass with correct channel ID, naming the sender as the payer
+    // that a credential source must match.
+    let (_, _, payer) =
         SessionMethod::<alloy::providers::RootProvider<TempoNetwork>>::verify_open_channel_id_binding(
             &tx_bytes,
             correct_id,
@@ -240,8 +241,8 @@ fn test_open_channel_id_binding_rejects_mismatch() {
             payee,
             token,
         )
-        .is_ok()
-    );
+        .unwrap();
+    assert_eq!(payer, signer.address());
 
     // Should fail with a different channel ID.
     let fake_id = B256::from([0x01u8; 32]);
@@ -766,4 +767,472 @@ async fn unsupported_store_rejects_open_before_transaction_processing() {
         .unwrap_err();
     assert!(error.to_string().contains("atomic operation"), "{error}");
     std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// An opening credential's source must be the payer its transaction's
+/// signature authenticates (mppx "open source transaction authentication").
+mod open_source {
+    use super::*;
+    use alloy::eips::Encodable2718;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::SignerSync;
+    use alloy::sol_types::SolValue;
+    use tempo_alloy::primitives::transaction::{
+        KeyAuthorization, KeychainSignature, PrimitiveSignature, SignatureType, TempoSignature,
+    };
+    use tempo_alloy::primitives::TempoTransaction;
+
+    const CHAIN_ID: u64 = 42431;
+
+    fn tx() -> TempoTransaction {
+        TempoTransaction {
+            chain_id: CHAIN_ID,
+            gas_limit: 500_000,
+            calls: vec![tempo_alloy::primitives::transaction::Call {
+                to: alloy::primitives::TxKind::Call(TEST_ESCROW),
+                value: alloy::primitives::U256::ZERO,
+                input: Bytes::new(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn encode(tx: TempoTransaction, signature: TempoSignature) -> Vec<u8> {
+        tx.into_signed(signature).encoded_2718()
+    }
+
+    fn direct(signer: &PrivateKeySigner) -> Vec<u8> {
+        let tx = tx();
+        let signature = signer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        encode(tx, signature.into())
+    }
+
+    fn keychain(tx: TempoTransaction, account: Address, key: &PrivateKeySigner) -> Vec<u8> {
+        let hash = KeychainSignature::signing_hash(tx.signature_hash(), account);
+        let inner = PrimitiveSignature::Secp256k1(key.sign_hash_sync(&hash).unwrap());
+        encode(
+            tx,
+            TempoSignature::Keychain(KeychainSignature::new(account, inner)),
+        )
+    }
+
+    fn inline(
+        payer: &PrivateKeySigner,
+        key: &PrivateKeySigner,
+        chain_id: u64,
+        expiry: Option<u64>,
+    ) -> Vec<u8> {
+        inline_signed_by(payer, payer.address(), key, key, chain_id, expiry)
+    }
+
+    /// A transaction signed by \`signer\` for \`account\`, carrying an inline
+    /// authorization of \`authorized\` signed by \`authorizer\`.
+    fn inline_signed_by(
+        authorizer: &PrivateKeySigner,
+        account: Address,
+        authorized: &PrivateKeySigner,
+        signer: &PrivateKeySigner,
+        chain_id: u64,
+        expiry: Option<u64>,
+    ) -> Vec<u8> {
+        let mut authorization = KeyAuthorization::unrestricted(
+            chain_id,
+            SignatureType::Secp256k1,
+            authorized.address(),
+        );
+        if let Some(expiry) = expiry {
+            authorization = authorization.with_expiry(expiry);
+        }
+        let signature = authorizer
+            .sign_hash_sync(&authorization.signature_hash())
+            .unwrap();
+        let mut tx = tx();
+        tx.key_authorization =
+            Some(authorization.into_signed(PrimitiveSignature::Secp256k1(signature)));
+        keychain(tx, account, signer)
+    }
+
+    fn source(address: Address) -> String {
+        format!("did:pkh:eip155:{CHAIN_ID}:{}", address.to_checksum(None))
+    }
+
+    fn push_key(
+        asserter: &alloy::providers::mock::Asserter,
+        key: Address,
+        expiry: u64,
+        revoked: bool,
+    ) {
+        asserter.push_success(&Bytes::from(
+            (alloy::primitives::U256::ZERO, key, expiry, false, revoked).abi_encode_params(),
+        ));
+    }
+
+    async fn check(
+        asserter: alloy::providers::mock::Asserter,
+        source: Option<&str>,
+        payer: Address,
+        tx: &[u8],
+    ) -> Result<(), VerificationError> {
+        let provider = alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter);
+        precompile::verify_open_source(&provider, source, CHAIN_ID, payer, tx).await
+    }
+
+    const NOT_AUTHENTICATED: &str =
+        "credential source is not authenticated by transaction signature";
+
+    #[tokio::test]
+    async fn accepts_authenticated_payers() {
+        let payer = PrivateKeySigner::random();
+        let key = PrivateKeySigner::random();
+        let src = source(payer.address());
+        let none = alloy::providers::mock::Asserter::new;
+
+        check(none(), Some(&src), payer.address(), &direct(&payer))
+            .await
+            .unwrap();
+        check(
+            none(),
+            Some(&src),
+            payer.address(),
+            &inline(&payer, &key, CHAIN_ID, None),
+        )
+        .await
+        .unwrap();
+        let active = none();
+        push_key(&active, key.address(), u64::MAX, false);
+        check(
+            active,
+            Some(&src),
+            payer.address(),
+            &keychain(tx(), payer.address(), &key),
+        )
+        .await
+        .unwrap();
+        // Without a source there is nothing to bind.
+        check(none(), None, payer.address(), &[]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_unauthenticated_sources() {
+        let payer = PrivateKeySigner::random();
+        let key = PrivateKeySigner::random();
+        let src = source(payer.address());
+        let none = alloy::providers::mock::Asserter::new;
+        let keyed = keychain(tx(), payer.address(), &key);
+
+        let revoked = none();
+        push_key(&revoked, key.address(), u64::MAX, true);
+        let expired = none();
+        push_key(&expired, key.address(), 1, false);
+        // The keychain reports a key it does not hold as all zeroes.
+        let missing = || {
+            let asserter = none();
+            push_key(&asserter, Address::ZERO, 0, false);
+            asserter
+        };
+        let other = PrivateKeySigner::random();
+
+        // An inline authorization that does not prove the signing key falls
+        // back to the keychain, where these keys are not active.
+        let cases: Vec<(&str, alloy::providers::mock::Asserter, Vec<u8>)> = vec![
+            ("key signs directly", none(), direct(&key)),
+            ("revoked key", revoked, keyed.clone()),
+            ("expired key", expired, keyed.clone()),
+            ("unknown key", missing(), keyed),
+            ("wrong chain", missing(), inline(&payer, &key, 999, None)),
+            (
+                "expired authorization",
+                missing(),
+                inline(&payer, &key, CHAIN_ID, Some(1)),
+            ),
+            (
+                "authorization signed by someone other than the payer",
+                missing(),
+                inline_signed_by(&other, payer.address(), &key, &key, CHAIN_ID, None),
+            ),
+            (
+                "authorized by the signing key itself",
+                missing(),
+                inline_signed_by(&key, payer.address(), &key, &key, CHAIN_ID, None),
+            ),
+            (
+                "authorization for another key",
+                missing(),
+                inline_signed_by(&payer, payer.address(), &other, &key, CHAIN_ID, None),
+            ),
+            ("not a transaction", none(), vec![0x76, 0x01]),
+        ];
+        for (name, asserter, tx) in cases {
+            let err = check(asserter, Some(&src), payer.address(), &tx)
+                .await
+                .unwrap_err();
+            assert_eq!(err.message, NOT_AUTHENTICATED, "{name}");
+        }
+    }
+
+    /// A key already active for the payer authenticates it even when the
+    /// transaction's inline authorization does not prove that key (one an
+    /// admin key signed, or one for another key).
+    #[tokio::test]
+    async fn inline_authorization_falls_back_to_the_keychain() {
+        let payer = PrivateKeySigner::random();
+        let key = PrivateKeySigner::random();
+        let admin = PrivateKeySigner::random();
+        let src = source(payer.address());
+        for tx in [
+            inline_signed_by(&admin, payer.address(), &key, &key, CHAIN_ID, None),
+            inline_signed_by(&payer, payer.address(), &admin, &key, CHAIN_ID, None),
+        ] {
+            let active = alloy::providers::mock::Asserter::new();
+            push_key(&active, key.address(), u64::MAX, false);
+            check(active.clone(), Some(&src), payer.address(), &tx)
+                .await
+                .unwrap();
+            assert!(active.read_q().is_empty(), "keychain was not consulted");
+        }
+    }
+
+    /// A keychain lookup that fails says nothing about the key: the client
+    /// may retry rather than being told it is unauthorized.
+    #[tokio::test]
+    async fn keychain_lookup_failure_is_retryable() {
+        let payer = PrivateKeySigner::random();
+        let key = PrivateKeySigner::random();
+        let src = source(payer.address());
+        for tx in [
+            keychain(tx(), payer.address(), &key),
+            inline_signed_by(&key, payer.address(), &key, &key, CHAIN_ID, None),
+        ] {
+            let unavailable = alloy::providers::mock::Asserter::new();
+            unavailable.push_failure_msg("unavailable");
+            let err = check(unavailable, Some(&src), payer.address(), &tx)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, Some(ErrorCode::NetworkError), "{}", err.message);
+            assert!(err.retryable);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_a_source_that_is_not_the_payer() {
+        let payer = PrivateKeySigner::random();
+        let other = PrivateKeySigner::random();
+        let err = check(
+            alloy::providers::mock::Asserter::new(),
+            Some(&source(other.address())),
+            payer.address(),
+            &direct(&payer),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err.message,
+            "credential source does not match transaction payer"
+        );
+    }
+}
+
+/// handle_open binds a sourced open credential to the payer its transaction
+/// signature authenticates, before broadcasting anything.
+#[tokio::test]
+async fn test_open_binds_credential_source_before_broadcast() {
+    let payer = alloy::signers::local::PrivateKeySigner::random();
+    let other = alloy::signers::local::PrivateKeySigner::random();
+    let did = |chain_id: u64, address: Address| {
+        format!("did:pkh:eip155:{chain_id}:{}", address.to_checksum(None))
+    };
+
+    // The payer's own source opens the channel.
+    let (channel_id, request, mut credential) =
+        open_credential(&payer, Address::ZERO, 10_000, &payer, 1_000).await;
+    credential.source = Some(did(42431, payer.address()));
+    let store = Arc::new(InMemoryChannelStore::new());
+    let asserter = alloy::providers::mock::Asserter::new();
+    push_mined_transaction(&asserter);
+    push_on_chain_channel(&asserter, payer.address(), Address::ZERO, 10_000);
+    let method = mocked_session_method(store.clone(), asserter);
+    method.verify_session(&credential, &request).await.unwrap();
+    assert!(store.get_channel_sync(&channel_id).is_some());
+
+    for (source, expected) in [
+        ("not-a-did".to_string(), "credential source is invalid"),
+        (did(4217, payer.address()), "credential source is invalid"),
+        (
+            did(42431, other.address()),
+            "credential source does not match transaction payer",
+        ),
+    ] {
+        let (channel_id, request, mut credential) =
+            open_credential(&payer, Address::ZERO, 10_000, &payer, 1_000).await;
+        credential.source = Some(source.clone());
+        let store = Arc::new(InMemoryChannelStore::new());
+        let asserter = alloy::providers::mock::Asserter::new();
+        push_mined_transaction(&asserter);
+        let queued = asserter.read_q().len();
+        let method = mocked_session_method(store.clone(), asserter.clone());
+        let err = method
+            .verify_session(&credential, &request)
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, expected, "{source}");
+        assert_eq!(asserter.read_q().len(), queued, "transaction was broadcast");
+        assert!(store.get_channel_sync(&channel_id).is_none());
+    }
+}
+
+/// The TIP-1034 branch of handle_open binds a sourced open credential to the
+/// payer its transaction signature authenticates before broadcasting: a
+/// malformed source, a source on another chain or one naming another account
+/// is refused with the transaction unsent, while the payer's own source gets
+/// past the check.
+#[tokio::test]
+async fn test_precompile_open_binds_credential_source_before_broadcast() {
+    use alloy::eips::Encodable2718;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::signers::SignerSync;
+    use alloy::sol_types::SolCall;
+    use tempo_alloy::contracts::precompiles::{
+        ITIP20ChannelReserve, TIP20_CHANNEL_RESERVE_ADDRESS,
+    };
+    use tempo_alloy::primitives::transaction::Call;
+    use tempo_alloy::primitives::TempoTransaction;
+
+    let escrow = TIP20_CHANNEL_RESERVE_ADDRESS;
+    let did = |chain_id: u64, address: Address| {
+        format!("did:pkh:eip155:{chain_id}:{}", address.to_checksum(None))
+    };
+    // A TIP-1034 open of a 10_000 deposit, with a voucher for `cumulative`.
+    let open = |payer: &PrivateKeySigner, cumulative: u128| {
+        let salt = B256::repeat_byte(0xab);
+        let tx = TempoTransaction {
+            chain_id: 42431,
+            gas_limit: 500_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            calls: vec![Call {
+                to: alloy::primitives::TxKind::Call(escrow),
+                value: alloy::primitives::U256::ZERO,
+                input: ITIP20ChannelReserve::openCall::new((
+                    TEST_PAYEE,
+                    Address::ZERO,
+                    TEST_TOKEN,
+                    alloy::primitives::Uint::from(10_000u64),
+                    salt,
+                    Address::ZERO,
+                ))
+                .abi_encode()
+                .into(),
+            }],
+            ..Default::default()
+        };
+        // The precompile's expiringNonceHash: the signing encoding, then the sender.
+        let mut buf = Vec::new();
+        alloy::consensus::SignableTransaction::encode_for_signing(&tx, &mut buf);
+        buf.extend_from_slice(payer.address().as_slice());
+        let nonce_hash = alloy::primitives::keccak256(buf);
+        let channel_id = crate::protocol::methods::tempo::precompile_voucher::compute_precompile_channel_id_with_escrow(
+            payer.address(),
+            TEST_PAYEE,
+            Address::ZERO,
+            TEST_TOKEN,
+            salt,
+            Address::ZERO,
+            nonce_hash,
+            escrow,
+            42431,
+        );
+        let signature = payer.sign_hash_sync(&tx.signature_hash()).unwrap();
+        let transaction =
+            alloy::hex::encode_prefixed(tx.into_signed(signature.into()).encoded_2718());
+        let voucher_hash =
+            crate::protocol::methods::tempo::precompile_voucher_signing_hash_with_escrow(
+                channel_id, cumulative, escrow, 42431,
+            )
+            .unwrap();
+        let voucher = payer.sign_hash_sync(&voucher_hash).unwrap();
+        let request = crate::protocol::intents::SessionRequest {
+            amount: "1000".to_string(),
+            currency: TEST_TOKEN.to_string(),
+            recipient: Some(TEST_PAYEE.to_string()),
+            method_details: Some(serde_json::json!({
+                "escrowContract": escrow.to_string(),
+                "chainId": 42431,
+            })),
+            ..Default::default()
+        };
+        let challenge = crate::protocol::core::PaymentChallenge::new(
+            "test-id",
+            "api.example.com",
+            METHOD_NAME,
+            INTENT_SESSION,
+            crate::protocol::core::Base64UrlJson::from_typed(&request).unwrap(),
+        );
+        let descriptor = crate::protocol::methods::tempo::session::ChannelDescriptor {
+            payer: format!("{:#x}", payer.address()),
+            payee: format!("{TEST_PAYEE:#x}"),
+            operator: format!("{:#x}", Address::ZERO),
+            token: format!("{TEST_TOKEN:#x}"),
+            salt: format!("{salt:#x}"),
+            authorized_signer: format!("{:#x}", Address::ZERO),
+            expiring_nonce_hash: format!("{nonce_hash:#x}"),
+        };
+        let credential = crate::protocol::core::PaymentCredential::new(
+            challenge.to_echo(),
+            SessionCredentialPayload::Open {
+                payload_type: "transaction".to_string(),
+                channel_id: channel_id.to_string(),
+                transaction,
+                descriptor: Some(descriptor),
+                settlement_route: None,
+                authorized_signer: None,
+                cumulative_amount: cumulative.to_string(),
+                signature: alloy::hex::encode_prefixed(voucher.as_bytes()),
+            },
+        );
+        (channel_id.to_string(), request, credential)
+    };
+    let payer = PrivateKeySigner::random();
+    let other = PrivateKeySigner::random();
+
+    let run = |source: String, cumulative: u128| {
+        let (channel_id, request, mut credential) = open(&payer, cumulative);
+        credential.source = Some(source);
+        async move {
+            let store = Arc::new(InMemoryChannelStore::new());
+            let asserter = alloy::providers::mock::Asserter::new();
+            push_mined_transaction(&asserter);
+            let queued = asserter.read_q().len();
+            let method = mocked_session_method(store.clone(), asserter.clone());
+            let err = method
+                .verify_session(&credential, &request)
+                .await
+                .unwrap_err();
+            assert_eq!(asserter.read_q().len(), queued, "transaction was broadcast");
+            assert!(store.get_channel_sync(&channel_id).is_none());
+            err
+        }
+    };
+
+    for (source, expected) in [
+        ("not-a-did".to_string(), "credential source is invalid"),
+        (did(4217, payer.address()), "credential source is invalid"),
+        (
+            did(42431, other.address()),
+            "credential source does not match transaction payer",
+        ),
+    ] {
+        let err = run(source.clone(), 1_000).await;
+        assert_eq!(err.message, expected, "{source}");
+    }
+
+    // The payer's own source passes the binding and reaches the voucher check,
+    // which still runs before any broadcast.
+    let err = run(did(42431, payer.address()), 10_001).await;
+    assert_eq!(
+        err.code,
+        Some(ErrorCode::AmountExceedsDeposit),
+        "{}",
+        err.message
+    );
 }
