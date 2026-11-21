@@ -230,6 +230,42 @@ async fn receipt_commits_payment_state() {
 }
 
 #[tokio::test]
+async fn unreadable_receipt_keeps_payment_and_connection() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            // A method the method-id grammar rejects makes the Receipt unreadable.
+            let mut receipt = json_to_value(Receipt::success("tempo", "0xfirst")).unwrap();
+            receipt["method"] = json!("invoice-v2");
+            send_text(&mut ws, json!({ "type": "receipt", "receipt": receipt })).await;
+            send_text(&mut ws, receipt_frame()).await;
+            sleep(Duration::from_millis(100)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect = MppWsConnect::new(url, provider.clone());
+    let mut events = connect.mpp_handle().events;
+    let _connection = connect.connect().await.unwrap();
+
+    let error = next_error(&mut events).await;
+    assert!(error.contains("unreadable Receipt"), "{error}");
+    // The connection stays open: the next readable Receipt still arrives.
+    loop {
+        let event = timeout(TIMEOUT, events.recv()).await.unwrap().unwrap();
+        if matches!(event, MppEvent::Receipt(_)) {
+            break;
+        }
+    }
+
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn server_error_rolls_back_payment_state() {
     let url = spawn_server(|mut ws| {
         Box::pin(async move {

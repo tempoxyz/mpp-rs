@@ -991,17 +991,8 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             Ok(())
         }
         WsServerMessage::Receipt { receipt } => {
-            let parsed: Receipt = match json_from_value(receipt) {
-                Ok(r) => r,
-                Err(err) => {
-                    error!(%err, "failed to deserialize Receipt");
-                    let _ = events_tx.send(MppEvent::Error(format!(
-                        "malformed Receipt: {err}; not reconnecting"
-                    )));
-                    return Err(TerminationReason::Fatal);
-                }
-            };
-            debug!(?parsed, "MPP receipt received");
+            // A Receipt frame means the server accepted the Credential, so the
+            // payment is committed before the Receipt body is read.
             if let Some(payment) = payment_awaiting_receipt.take() {
                 if let Err(err) = payment.commit().await {
                     error!(%err, "failed to commit accepted MPP payment");
@@ -1011,9 +1002,24 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                     return Err(TerminationReason::Fatal);
                 }
             }
+            *credential_awaiting_receipt = false;
+            // A Receipt this SDK can't read (for example a method outside the
+            // method-id grammar) is reported and skipped, as the HTTP client
+            // ignores an unreadable Payment-Receipt header: the payment
+            // already went through, so the connection stays open.
+            let parsed: Receipt = match json_from_value(receipt) {
+                Ok(r) => r,
+                Err(err) => {
+                    error!(%err, "failed to deserialize Receipt");
+                    let _ = events_tx.send(MppEvent::Error(format!(
+                        "unreadable Receipt: {err}; payment kept"
+                    )));
+                    return Ok(());
+                }
+            };
+            debug!(?parsed, "MPP receipt received");
             let _ = receipt_tx.send(Some(parsed.clone()));
             let _ = events_tx.send(MppEvent::Receipt(parsed));
-            *credential_awaiting_receipt = false;
             Ok(())
         }
         WsServerMessage::Error { error } => {
