@@ -9,7 +9,7 @@
 //!
 //! The parser is implemented without regex for minimal dependencies.
 
-use super::auth_params::{escape_quoted_value, Tokenizer};
+use super::auth_params::{escape_quoted_description, escape_quoted_value, Tokenizer};
 use super::challenge::PaymentChallenge;
 use super::credential::PaymentCredential;
 use super::receipt::Receipt;
@@ -505,7 +505,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
     if let Some(ref description) = challenge.description {
         parts.push(format!(
             "description=\"{}\"",
-            escape_quoted_value(description)?
+            escape_quoted_description(description)?
         ));
     }
 
@@ -1300,19 +1300,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_www_authenticate_decodes_unicode_escapes() {
+    fn test_parse_www_authenticate_reads_quoted_pairs() {
+        // A quoted-pair (RFC 9110 §5.6.4) is the character after the
+        // backslash: \uXXXX is the text uXXXX, not an escape.
         for (escaped, expected) in [
             (
                 r"em dash \u2014 and coffee \u2615",
-                "em dash \u{2014} and coffee \u{2615}",
+                "em dash u2014 and coffee u2615",
             ),
-            (r"grinning \ud83d\ude00 face", "grinning \u{1f600} face"),
+            (r"grinning \ud83d\ude00 face", "grinning ud83dude00 face"),
             ("café naïve", "café naïve"),
-            (r"lone \ud83d here", "lone \u{fffd} here"),
-            (r"lone \ude00 here", "lone \u{fffd} here"),
             (r"not an escape \\u2014", r"not an escape \u2014"),
             (r"short \u12 tail", "short u12 tail"),
-            (r"ascii api\u0061", "ascii apia"),
+            (r"ascii api\u0061", "ascii apiu0061"),
+            (r"\a\b \é", "ab é"),
         ] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description="{escaped}""#
@@ -1327,7 +1328,24 @@ mod tests {
     }
 
     #[test]
-    fn test_format_www_authenticate_escapes_unicode_as_utf16() {
+    fn test_parse_www_authenticate_reads_quoted_pairs_in_every_param() {
+        let header = r#"Payment id="ch\_1", realm="merchant\u2014api.example.com", method="te\mpo", intent="char\ge", request="e\30", expires="2030-01-01T00:00:00\Z", digest="sha-256=:\a:", opaque="e\30""#;
+        let challenge = parse_www_authenticate(header).unwrap();
+        assert_eq!(challenge.id, "ch_1");
+        assert_eq!(challenge.realm, "merchantu2014api.example.com");
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "charge");
+        assert_eq!(challenge.request.raw(), "e30");
+        assert_eq!(challenge.expires.as_deref(), Some("2030-01-01T00:00:00Z"));
+        assert_eq!(challenge.digest.as_deref(), Some("sha-256=:a:"));
+        assert_eq!(
+            challenge.opaque.as_ref().map(Base64UrlJson::raw),
+            Some("e30")
+        );
+    }
+
+    #[test]
+    fn test_format_www_authenticate_escapes_description_as_utf16() {
         let mut challenge = test_challenge();
         challenge.description = Some("Payment \u{2014} coffee \u{2615} \u{1f600}".to_string());
 
@@ -1335,7 +1353,10 @@ mod tests {
 
         assert!(header.contains(r#"description="Payment \u2014 coffee \u2615 \ud83d\ude00""#));
         let parsed = parse_www_authenticate(&header).unwrap();
-        assert_eq!(parsed.description, challenge.description);
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Payment u2014 coffee u2615 ud83dude00")
+        );
         assert_eq!(parsed.realm, challenge.realm);
         assert_eq!(parsed.method, challenge.method);
         assert_eq!(parsed.intent, challenge.intent);
@@ -1351,7 +1372,6 @@ mod tests {
             "1 \u{d7} Classmatic \u{2014} General Admission \u{1f39f}\u{fe0f}",
         ] {
             let mut challenge = test_challenge();
-            challenge.realm = text.to_string();
             challenge.description = Some(text.to_string());
 
             let header = format_www_authenticate(&challenge).unwrap();
@@ -1362,10 +1382,33 @@ mod tests {
                 "{header:?}"
             );
             let value = axum::http::HeaderValue::from_str(&header).unwrap();
-            let parsed = parse_www_authenticate(value.to_str().unwrap()).unwrap();
-            assert_eq!(parsed.realm, text);
-            assert_eq!(parsed.description.as_deref(), Some(text));
+            parse_www_authenticate(value.to_str().unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn test_format_www_authenticate_rejects_text_quoted_pairs_cannot_carry() {
+        // Bound values must parse back unchanged, and a quoted-pair carries
+        // only printable ASCII and HTAB.
+        for text in [
+            "caf\u{e9}",
+            "bell\u{7}",
+            "nul\u{0}",
+            "del\u{7f}",
+            "a\u{2014}b",
+        ] {
+            let mut challenge = test_challenge();
+            challenge.realm = text.to_string();
+            assert!(format_www_authenticate(&challenge).is_err(), "{text:?}");
+        }
+
+        let mut challenge = test_challenge();
+        challenge.realm = "tab\there \"q\" \\ ~".to_string();
+        let header = format_www_authenticate(&challenge).unwrap();
+        assert_eq!(
+            parse_www_authenticate(&header).unwrap().realm,
+            challenge.realm
+        );
     }
 
     #[test]
