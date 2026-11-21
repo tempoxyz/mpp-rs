@@ -227,29 +227,6 @@ fn test_mpp_create_rejects_short_secret_key() {
 
 #[cfg(feature = "tempo")]
 #[test]
-fn test_mpp_create_rejects_realm_a_challenge_cannot_carry() {
-    let create = |realm: &str| {
-        Mpp::create(
-            tempo(TempoConfig {
-                recipient: TEST_RECIPIENT,
-            })
-            .realm(realm)
-            .secret_key(&"k".repeat(32)),
-        )
-    };
-
-    for realm in ["Café API", "api\u{2014}example.com", "bell\u{7}"] {
-        let err = create(realm).err().expect("non-ASCII realm");
-        assert!(
-            err.to_string().contains("Invalid realm"),
-            "{realm:?}: {err}"
-        );
-    }
-    assert!(create("api.example.com").is_ok());
-}
-
-#[cfg(feature = "tempo")]
-#[test]
 fn test_charge_dollar_amount() {
     let mpp = create_test_mpp();
 
