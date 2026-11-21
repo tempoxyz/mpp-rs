@@ -3,8 +3,10 @@
 //! - Neither parser panics.
 //! - The single parser, the list parser and `PaymentProtocol::detect` agree
 //!   on the first challenge of a header.
-//! - Parsing normalizes once: an accepted header formats, and the formatted
-//!   header parses back to the same challenge.
+//! - Parsing normalizes once: an accepted header formats unless a value
+//!   holds a line break or a bound value holds text outside printable ASCII,
+//!   and the formatted header parses back to the same challenge, but for
+//!   `description` characters written as `\uXXXX`.
 
 #![no_main]
 
@@ -13,7 +15,7 @@ use mpp::{
     format_www_authenticate, parse_www_authenticate, parse_www_authenticate_all, PaymentChallenge,
     PaymentProtocol,
 };
-use mpp_fuzz::{assert_same, quoted_values};
+use mpp_fuzz::{assert_same, has_quoted_text_values, quoted_values, read_back};
 
 fuzz_target!(|header: &str| {
     let single = parse_www_authenticate(header);
@@ -27,7 +29,10 @@ fuzz_target!(|header: &str| {
             _ => panic!("the parsers disagree on {header:?}"),
         }
     } else {
-        assert!(single.is_err(), "parsed a challenge the detector does not see");
+        assert!(
+            single.is_err(),
+            "parsed a challenge the detector does not see"
+        );
     }
 
     let Ok(challenge) = single else { return };
@@ -36,12 +41,24 @@ fuzz_target!(|header: &str| {
     match format_www_authenticate(&challenge) {
         Ok(formatted) => {
             let reparsed = parse_www_authenticate(&formatted).expect("formatted header parses");
-            assert_same(&reparsed, &challenge);
-            assert_eq!(format_www_authenticate(&reparsed).unwrap(), formatted);
+            let expected = read_back(&challenge);
+            assert_same(&reparsed, &expected);
+            let again = format_www_authenticate(&reparsed).unwrap();
+            if expected.description == challenge.description {
+                assert_eq!(again, formatted);
+            } else {
+                // `description` lost its `\uXXXX` escapes once; it reads
+                // back the same from now on.
+                assert_same(&parse_www_authenticate(&again).unwrap(), &reparsed);
+            }
         }
-        // The parser decodes `\u000a` and friends; the formatter refuses to
-        // emit them.
-        Err(_) => assert!(has_line_break(&challenge), "cannot format {challenge:?}"),
+        // A quoted string may hold raw line breaks, and raw text outside
+        // printable ASCII; the formatter refuses both outside `description`
+        // and line breaks in it.
+        Err(_) => assert!(
+            has_line_break(&challenge) || !has_quoted_text_values(&challenge),
+            "cannot format {challenge:?}"
+        ),
     }
 });
 

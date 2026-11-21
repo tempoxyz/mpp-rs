@@ -77,6 +77,8 @@ mod receipt;
 pub mod types;
 
 // Re-export all public types
+#[cfg(all(feature = "server", any(feature = "tempo", feature = "stripe")))]
+pub(crate) use auth_params::validate_realm;
 #[cfg(feature = "server")]
 pub(crate) use binding::constant_time_eq;
 #[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]

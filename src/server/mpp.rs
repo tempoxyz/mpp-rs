@@ -190,8 +190,8 @@ where
     ///
     /// For a simpler API, use [`Mpp::create()`] with [`tempo()`](super::tempo).
     ///
-    /// `secret_key` should be at least 32 bytes. This constructor cannot fail
-    /// and does not check the length; [`Mpp::create()`] does.
+    /// `secret_key` should be at least 32 bytes and `realm` printable ASCII.
+    /// This constructor cannot fail and checks neither; [`Mpp::create()`] does.
     pub fn new(method: M, realm: impl Into<String>, secret_key: impl Into<String>) -> Mpp<M, ()> {
         Self::from_config(method, Config::new(realm.into(), secret_key.into()))
     }
@@ -513,6 +513,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 ))
             })?;
         crate::protocol::core::validate_secret_key(&secret_key)?;
+        crate::protocol::core::validate_realm(&builder.realm)?;
 
         let provider = super::tempo_provider(&builder.rpc_url)?;
         let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider)
@@ -592,6 +593,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
                 ))
             })?;
         crate::protocol::core::validate_secret_key(&secret_key)?;
+        crate::protocol::core::validate_realm(&builder.realm)?;
 
         let mut method = crate::protocol::methods::stripe::method::ChargeMethod::new(
             &builder.secret_key,

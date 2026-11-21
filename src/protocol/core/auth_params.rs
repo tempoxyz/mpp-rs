@@ -231,6 +231,20 @@ pub(super) fn escape_quoted_value(s: &str) -> Result<String> {
     Ok(escape_quoted_text(s))
 }
 
+/// Check that a server realm can be written into a Challenge header.
+///
+/// The realm is bound into the Challenge ID, so [`escape_quoted_value`]
+/// refuses it on every request when it holds a character outside printable
+/// ASCII; checking it once when the server is configured reports that early.
+#[cfg(all(feature = "server", any(feature = "tempo", feature = "stripe")))]
+pub(crate) fn validate_realm(realm: &str) -> Result<()> {
+    escape_quoted_value(realm).map(|_| ()).map_err(|_| {
+        MppError::InvalidConfig(format!(
+            "Invalid realm {realm:?}: a realm must be printable ASCII, since a Challenge header can't carry other characters."
+        ))
+    })
+}
+
 /// Escape free text, such as a description, for a quoted-string header value.
 ///
 /// Like [`escape_quoted_value`], but writes any other character as `\uXXXX`
