@@ -17,10 +17,7 @@ use super::super::{proof, TempoChargeExt};
 use super::calls::{validate_fee_payer_calls, PaymentCalls};
 use super::fee_payer::FeePayerPolicy;
 use super::matching::{match_transfers, TransferSource};
-use super::memo::{
-    assert_challenge_bound_memo, assert_challenge_bound_memos, challenge_bound_memo_error,
-    is_challenge_bound_memo,
-};
+use super::memo::{assert_pull_attribution, assert_pull_attribution_logs};
 use super::receipt_logs::{match_receipt_transfer_logs_with_settlement, ReceiptSenderPolicy};
 use super::{ensure_challenge_not_expired, ChargeMethod};
 
@@ -210,11 +207,10 @@ where
             .flatten();
 
         if let Some(route) = machine_token_route {
-            if let Some((challenge_id, realm)) = challenge_binding {
-                let memo = route.transfer.memo.ok_or_else(challenge_bound_memo_error)?;
-                if !is_challenge_bound_memo(&memo, challenge_id, realm) {
-                    return Err(challenge_bound_memo_error());
-                }
+            if let (Some((challenge_id, realm)), Some(memo)) =
+                (challenge_binding, route.transfer.memo.as_ref())
+            {
+                assert_pull_attribution([memo], expected, challenge_id, realm)?;
             }
             return Ok(Some(route.settlement_sender));
         }
@@ -243,8 +239,9 @@ where
         )?;
 
         if let Some((challenge_id, realm)) = challenge_binding {
-            assert_challenge_bound_memos(
+            assert_pull_attribution(
                 matched.iter().filter_map(|transfer| transfer.memo.as_ref()),
+                expected,
                 challenge_id,
                 realm,
             )?;
@@ -327,6 +324,32 @@ where
             .await
             .ok()??;
         (receipt.transaction_hash() == tx_hash).then_some(receipt)
+    }
+
+    /// Reject a transaction that is already on chain before this server
+    /// broadcasts it for this credential: another server, or an earlier
+    /// settlement whose replay record expired or lives elsewhere, may
+    /// already have accepted it. Only a transaction still pending here may
+    /// later be recovered from a failed broadcast. Fails closed when the
+    /// receipt cannot be looked up.
+    async fn ensure_not_yet_included(&self, tx_hash: B256) -> Result<(), VerificationError> {
+        let receipt = self
+            .provider
+            .get_transaction_receipt(tx_hash)
+            .await
+            .map_err(|_| {
+                VerificationError::network_error(
+                    "Failed to look up the transaction before broadcasting it",
+                )
+            })?;
+        if receipt.is_some() {
+            // Answered as a replay (invalid-challenge), which clients treat as
+            // final: paying a fresh Challenge for it could pay twice.
+            return Err(VerificationError::credential_replayed(format!(
+                "Transaction {tx_hash:#x} is already included on chain."
+            )));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -448,8 +471,9 @@ where
         // The sponsor pays the gas here, so simulate the exact co-signed
         // transaction with its concrete fee payer and fee token, and bail if
         // it would revert. Fails closed: no simulation, no broadcast.
-        // A reconciled transaction may already be on chain, where simulating
-        // it again would fail: broadcast it and recover its receipt instead.
+        // A reconciled transaction is not simulated again: one already on
+        // chain is rejected before the broadcast below, and a pending one is
+        // broadcast and its receipt recovered.
         // The node bills the fee payer it recovers from `feePayerSignature`,
         // so the simulation carries it: a hosted fee payer's as signed, and a
         // local fee payer's over a simulation-only copy with gas headroom
@@ -493,6 +517,19 @@ where
             None => None,
         };
 
+        // Set once this server is about to broadcast these exact bytes, and
+        // kept until they settle, so a retry after a failed broadcast can
+        // still recover a transaction that landed later.
+        let mut broadcast_record: Option<String> = None;
+        // The records this attempt wrote itself, and whether it reached the
+        // send: an attempt that fails before sending removes them again, so a
+        // retry neither skips simulation nor the inclusion check for a
+        // transaction that was never broadcast.
+        let mut created_broadcast_record = false;
+        let mut wrote_hosted_record = false;
+        let mut sent = false;
+        // A refused attempt's broadcast record whose removal failed.
+        let mut uncleared_refused_record: Option<String> = None;
         let result: Result<B256, VerificationError> = async {
             // Simulation and the dedup claim took round trips since co-signing:
             // right before broadcasting, make sure the sponsored transaction
@@ -515,34 +552,136 @@ where
             // while settlement completes.
             ensure_challenge_not_expired(expires)?;
 
+            // A transaction mined before this broadcast was settled by
+            // someone else, so its receipt proves nothing for this
+            // credential. Checked right before sending, so the recovery
+            // below only ever accepts a transaction that was still pending.
+            // A transaction this server already broadcast for an earlier
+            // attempt of this credential may have landed after that attempt
+            // failed: its broadcast record lets the retry recover it below.
+            let broadcast_key = format!(
+                "{}{:#x}",
+                crate::store::TEMPO_BROADCAST_PENDING_PREFIX,
+                keccak256(&final_tx_bytes)
+            );
+            // The record names the challenge it was broadcast for: only a
+            // retry for that challenge may settle from it, never a
+            // credential for another challenge presenting the same bytes.
+            let broadcast_before = match (&self.store, &submission_key) {
+                (Some(store), Some(_)) => store
+                    .get(&broadcast_key)
+                    .await
+                    .map_err(|e| {
+                        VerificationError::internal(format!("Failed to read broadcast record: {e}"))
+                    })?
+                    .is_some_and(|recorded| {
+                        recorded.as_str().is_some_and(|recorded| {
+                            crate::protocol::core::constant_time_eq(recorded, challenge_id)
+                        })
+                    }),
+                _ => false,
+            };
+            if !broadcast_before {
+                self.ensure_not_yet_included(keccak256(&final_tx_bytes))
+                    .await?;
+            }
+
+            // Recorded right before the send, and only for as long as a
+            // retry could still settle: past the challenge's expiry it can no
+            // longer be retried.
+            if let (Some(store), Some(_)) = (&self.store, &submission_key) {
+                if !broadcast_before {
+                    // A record another challenge holds stays: this attempt
+                    // then has no record of its own. A failed write fails
+                    // before the send: without the record, a send whose
+                    // outcome is lost and that lands later could not be
+                    // settled by a retry, leaving the payer charged with no
+                    // receipt. MemoryStore's expiring capacity does not count
+                    // these records, so proof reservations cannot fill it.
+                    let created = store
+                        .put_if_absent_with_ttl(
+                            &broadcast_key,
+                            serde_json::Value::String(challenge_id.to_owned()),
+                            broadcast_record_ttl(expires, &final_tx_bytes)?,
+                        )
+                        .await
+                        .map_err(|e| {
+                            VerificationError::internal(format!("Failed to record broadcast: {e}"))
+                        })?;
+                    if created {
+                        broadcast_record = Some(broadcast_key);
+                        created_broadcast_record = true;
+                    }
+                } else {
+                    broadcast_record = Some(broadcast_key);
+                }
+            }
+
+            // After the broadcast record, so that a failed write of either
+            // leaves no hosted record for a transaction that was never sent.
             if let (Some(store), Some(key), Some(fill)) =
                 (&self.store, &hosted_record, hosted_fill.take())
             {
                 store.put(key, fill).await.map_err(|e| {
                     VerificationError::internal(format!("Failed to record sponsorship: {e}"))
                 })?;
+                wrote_hosted_record = true;
             }
+
+            // The lookups and writes above took round trips: a challenge
+            // that expired meanwhile is not broadcast.
+            ensure_challenge_not_expired(expires)?;
 
             // Use eth_sendRawTransactionSync (EIP-7966) for single-call broadcast +
             // receipt. The Tempo node holds the connection open until the transaction
             // is mined/pre-confirmed and returns the full receipt, avoiding the
             // client-side polling loop of send_raw_transaction + get_receipt.
             let raw_hex = alloy::hex::encode_prefixed(&final_tx_bytes);
+            sent = true;
             let broadcast: Result<<TempoNetwork as alloy::network::Network>::ReceiptResponse, _> =
                 self.provider
                     .raw_request("eth_sendRawTransactionSync".into(), [raw_hex])
                     .await;
+            // Set when the receipt was recovered after the node definitely
+            // refused this attempt's own broadcast, such as a duplicate of a
+            // transaction someone else submitted, with no earlier broadcast
+            // record here.
+            let mut recovered_after_refusal = false;
             let receipt = match broadcast {
                 Ok(receipt) => receipt,
                 Err(broadcast_error) => {
+                    // A node that answered with a definite rejection never
+                    // admitted this attempt, so it leaves no broadcast record:
+                    // otherwise a retry would skip the inclusion check and
+                    // could accept a transaction another server settled.
+                    // Only an earlier attempt's record, kept because its
+                    // outcome was unknown, survives a rejected retry.
+                    let refused = broadcast_refused(&broadcast_error);
+                    if !broadcast_before && refused {
+                        if let (Some(store), Some(key)) = (&self.store, broadcast_record.take()) {
+                            // A record that survives would let a retry skip
+                            // the inclusion check and the bound-memo
+                            // requirement for a transaction this server
+                            // never broadcast: fail instead of settling, and
+                            // try once more to remove it below.
+                            if store.delete(&key).await.is_err() {
+                                uncleared_refused_record = Some(key);
+                                return Err(VerificationError::internal(
+                                    "Failed to clear broadcast record after the node refused the transaction",
+                                ));
+                            }
+                        }
+                    }
                     // The node may have included the transaction before its
-                    // reply failed. Recover only when the store reserved this
-                    // submission above: without a store, a receipt for these
-                    // bytes may belong to an earlier, already accepted
-                    // submission of the same credential. An unrecovered
-                    // broadcast releases the reservation below, so a retry of
-                    // the same bytes can reach recovery once the transaction
-                    // lands; the replay claim still prevents double acceptance.
+                    // reply failed, or already knew it as pending. It was not
+                    // on chain when checked above, so a receipt now comes from
+                    // this broadcast or one that raced it. Recover only when
+                    // the store reserved this submission above: without a
+                    // store, a concurrent submission of the same credential
+                    // could recover the same receipt. An unrecovered broadcast
+                    // releases the reservation below but keeps its broadcast
+                    // record, so a retry after the transaction lands recovers
+                    // it here instead of being rejected as already included.
                     let recovered = match &submission_key {
                         Some(_) => {
                             self.recover_broadcast_receipt(keccak256(&final_tx_bytes))
@@ -550,6 +689,7 @@ where
                         }
                         None => None,
                     };
+                    recovered_after_refusal = recovered.is_some() && !broadcast_before && refused;
                     recovered.ok_or_else(|| {
                         VerificationError::network_error(format!(
                             "Failed to broadcast: {broadcast_error}"
@@ -579,7 +719,26 @@ where
                     settlement_senders: &settlement_senders,
                 },
             )?;
-            assert_challenge_bound_memo(&matched_logs, challenge_id, realm)?;
+            assert_pull_attribution_logs(&matched_logs, &expected, challenge_id, realm)?;
+            // A first broadcast the node refused, such as a duplicate, may
+            // have been refused because someone else (another server, or
+            // anyone who saw the transaction pending) submitted it first.
+            // Its receipt then proves nothing for this credential unless a
+            // transfer carries this challenge's attribution memo, and the
+            // refusal removed this attempt's broadcast record, so a retry is
+            // answered as a replay. A broadcast whose outcome is unknown,
+            // such as a timeout, keeps its record: it is this server's own,
+            // and its receipt settles this request as a retry's would.
+            if recovered_after_refusal
+                && !matched_logs.iter().any(|log| {
+                    matches!(log, super::receipt_logs::MatchedTransferLog::Memo(memo)
+                        if super::memo::is_challenge_bound_memo(memo, challenge_id, realm))
+                })
+            {
+                return Err(VerificationError::credential_replayed(
+                    "Transaction was already submitted elsewhere",
+                ));
+            }
 
             // Record the on-chain tx hash for hash-based replay protection. Use the
             // atomic claim so a concurrent hash credential for the same tx cannot
@@ -609,15 +768,111 @@ where
         // transaction can be mined at most once, and a mined one is still
         // caught by its transaction hash claim.
         if result.is_err() {
-            if let (Some(store), Some(key)) = (&self.store, &submission_key) {
+            if let Some(store) = &self.store {
+                let unsent = |written: bool, key: &Option<String>| {
+                    (!sent && written).then(|| key.clone()).flatten()
+                };
+                let keys = [
+                    submission_key.clone(),
+                    unsent(wrote_hosted_record, &hosted_record),
+                    unsent(created_broadcast_record, &broadcast_record),
+                    uncleared_refused_record,
+                ];
+                for key in keys.into_iter().flatten() {
+                    let _ = store.delete(&key).await;
+                }
+            }
+        } else if let Some(store) = &self.store {
+            // Settled: the transaction hash claim now guards it.
+            for key in [&hosted_record, &broadcast_record].into_iter().flatten() {
                 let _ = store.delete(key).await;
             }
-        } else if let (Some(store), Some(key)) = (&self.store, &hosted_record) {
-            // Settled: the transaction hash claim now guards it.
-            let _ = store.delete(key).await;
         }
         result
     }
+}
+
+/// Whether a failed `eth_sendRawTransactionSync` is the node's definite
+/// refusal of the transaction, so it never admitted this submission, rather
+/// than a failure after which it may still land.
+///
+/// Only a JSON-RPC error that names a validation failure counts: malformed
+/// requests, insufficient funds or balance, a bad signature, too little gas,
+/// a fee below what the node takes, an expired or out-of-range
+/// `valid_before`, or "already known" (the node already held the
+/// transaction from another submission). Nonce errors, timeouts (EIP-7966
+/// code 4), internal errors (-32603), transport failures and any error the
+/// node does not explain leave the outcome open, so the broadcast record is
+/// kept for a retry to settle from.
+pub(super) fn broadcast_refused(error: &alloy::transports::TransportError) -> bool {
+    /// Message fragments of node validation errors that reject a
+    /// transaction before it enters the pool.
+    const REFUSALS: &[&str] = &[
+        "already known",
+        "insufficient funds",
+        "insufficient balance",
+        "invalid signature",
+        "signature is invalid",
+        "intrinsic gas",
+        "gas limit too low",
+        "exceeds block gas limit",
+        "fee too low",
+        "underpriced",
+        "max fee per gas less than",
+        "fee cap",
+        "valid_before",
+        "validbefore",
+        "valid_after",
+        "validafter",
+        "transaction expired",
+        "transaction type not supported",
+        "invalid chain id",
+        "chain id mismatch",
+    ];
+    error.as_error_resp().is_some_and(|response| {
+        let message = response.message.to_ascii_lowercase();
+        // A nonce that is already used may have been used by this very
+        // submission; timeouts say nothing about admission.
+        if response.code == 4
+            || response.code == -32603
+            || message.contains("nonce")
+            || message.contains("timeout")
+            || message.contains("timed out")
+        {
+            return false;
+        }
+        // Parse error, invalid request and invalid params: the request was
+        // rejected before the transaction was looked at.
+        matches!(response.code, -32700 | -32600 | -32602)
+            || REFUSALS.iter().any(|refusal| message.contains(refusal))
+    })
+}
+
+/// How long a broadcast record is kept: until the challenge's expiry plus a
+/// minute, since a retry after it is refused. Without an expiry, until the
+/// transaction's `valid_before` plus a minute, at most an hour (plus the
+/// minute) from now.
+pub(super) fn broadcast_record_ttl(
+    expires: Option<&str>,
+    tx_bytes: &[u8],
+) -> Result<std::time::Duration, VerificationError> {
+    const MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+    const MAX_WITHOUT_EXPIRY: u64 = 3600;
+    let now = super::fee_payer::unix_now()?.as_secs();
+    let challenge_deadline = expires
+        .and_then(|expires| {
+            time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .map(|at| u64::try_from(at.unix_timestamp()).unwrap_or(0));
+    let deadline = challenge_deadline.unwrap_or_else(|| {
+        let cap = now.saturating_add(MAX_WITHOUT_EXPIRY);
+        tempo_alloy::primitives::AASigned::decode_2718(&mut &tx_bytes[..])
+            .ok()
+            .and_then(|signed| signed.tx().valid_before.map(|vb| vb.get()))
+            .map_or(cap, |valid_before| valid_before.min(cap))
+    });
+    Ok(std::time::Duration::from_secs(deadline.saturating_sub(now)) + MARGIN)
 }
 
 /// The hosted sponsorship a retry reconciles: the exact co-signed transaction

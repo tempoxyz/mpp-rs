@@ -942,6 +942,8 @@ async fn assert_sponsored_ousd_charge_succeeds(
         push_balance(&asserter, balance);
     }
     asserter.push_success(&serde_json::json!("0x"));
+    // Not yet on chain when checked right before the broadcast.
+    asserter.push_success(&serde_json::Value::Null);
     let tx_hash = B256::repeat_byte(0x11);
     let block_hash = B256::repeat_byte(0x22);
     let mut log =

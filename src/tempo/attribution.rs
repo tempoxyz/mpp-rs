@@ -5,13 +5,19 @@
 //!
 //! ## Byte Layout (32 bytes)
 //!
-//! | Offset | Size | Field                                     |
-//! |--------|------|-------------------------------------------|
-//! | 0..3   | 4    | TAG = keccak256("mpp")\[0..3\]            |
-//! | 4      | 1    | version (0x01)                            |
-//! | 5..14  | 10   | serverId = keccak256(serverId)\[0..9\]    |
-//! | 15..24 | 10   | clientId = keccak256(clientId)\[0..9\] or 0s |
-//! | 25..31 | 7    | nonce = keccak256(challengeId)\[0..6\]   |
+//! The layout the Tempo charge spec defines (ranges are half-open):
+//!
+//! | Bytes  | Size | Field                                              |
+//! |--------|------|----------------------------------------------------|
+//! | 0..4   | 4    | TAG = keccak256("mpp")\[0..4\]                       |
+//! | 4      | 1    | version (0x01)                                     |
+//! | 5..15  | 10   | keccak256(realm)\[0..10\]                            |
+//! | 15..25 | 10   | keccak256(clientId)\[0..10\], or 10 zero bytes       |
+//! | 25..32 | 7    | keccak256(challengeId)\[0..7\]                       |
+//!
+//! The memo is optional: clients put it on the primary transfer when the
+//! challenge names no memo, and servers accept a transfer without one. A memo
+//! is in attribution format when its first five bytes are TAG and version.
 //!
 //! The TAG prefix makes MPP transactions trivially distinguishable
 //! from arbitrary memos via `TransferWithMemo` event topic filtering.
@@ -36,7 +42,7 @@ pub const ANONYMOUS: [u8; 10] = [0u8; 10];
 pub struct DecodedMemo {
     /// Memo version (currently always 1).
     pub version: u8,
-    /// 10-byte server fingerprint (keccak256(serverId)[0..9]).
+    /// 10-byte server fingerprint (keccak256(serverId)[0..10]).
     pub server_fingerprint: [u8; 10],
     /// 10-byte client fingerprint, or `None` if anonymous.
     pub client_fingerprint: Option<[u8; 10]>,
@@ -52,7 +58,7 @@ fn fingerprint(value: &str) -> [u8; 10] {
     fp
 }
 
-/// Computes the 7-byte challenge-bound nonce: keccak256(challenge_id)[0..6].
+/// Computes the 7-byte challenge-bound nonce: keccak256(challenge_id)[0..7].
 pub fn challenge_nonce(challenge_id: &str) -> [u8; 7] {
     let hash = keccak256(challenge_id.as_bytes());
     let mut nonce = [0u8; 7];
@@ -88,7 +94,7 @@ pub fn is_mpp_memo(memo: &[u8; 32]) -> bool {
 
 /// Verifies that a memo's server fingerprint matches the given `server_id`.
 ///
-/// Checks TAG, version byte, and that bytes 5–14 equal keccak256(serverId)\[0..9\].
+/// Checks TAG, version byte, and that bytes 5–14 equal keccak256(serverId)\[0..10\].
 pub fn verify_server(memo: &[u8; 32], server_id: &str) -> bool {
     if !is_mpp_memo(memo) {
         return false;
@@ -144,6 +150,19 @@ mod tests {
     fn test_tag_matches_keccak() {
         let hash = keccak256(b"mpp");
         assert_eq!(*TAG, hash[..4]);
+    }
+
+    #[test]
+    fn test_encode_matches_spec_layout() {
+        let memo = encode("challenge-123", "api.example.com", Some("my-app"));
+        assert_eq!(memo[..4], keccak256(b"mpp")[..4]);
+        assert_eq!(memo[4], 0x01);
+        assert_eq!(memo[5..15], keccak256(b"api.example.com")[..10]);
+        assert_eq!(memo[15..25], keccak256(b"my-app")[..10]);
+        assert_eq!(memo[25..32], keccak256(b"challenge-123")[..7]);
+
+        let anonymous = encode("challenge-123", "api.example.com", None);
+        assert_eq!(anonymous[15..25], [0u8; 10]);
     }
 
     #[test]

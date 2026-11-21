@@ -529,3 +529,33 @@ async fn legacy_method_without_binding_override_keeps_accepting_additional_field
         }
     }
 }
+
+/// Tempo charge challenges carry amounts without leading zeros, so an
+/// expected request with a padded amount still matches the issued one,
+/// while a different amount does not.
+#[tokio::test]
+async fn expected_amount_compares_numerically() {
+    for entry in EntryPoint::ALL {
+        let (payment, _) = payment(Binding::Accept, true);
+        let request = ChargeRequest {
+            amount: "1000".into(),
+            ..request()
+        };
+        let credential = credential(&request, entry.uses_body().then_some(b"body"));
+        for (amount, matches) in [("0001000", true), ("1000", true), ("00100", false)] {
+            let expected = ChargeRequest {
+                amount: amount.into(),
+                ..request.clone()
+            };
+            let result = entry.run(&payment, &credential, &expected, b"body").await;
+            assert_eq!(result.is_ok(), matches, "{entry:?}, {amount}: {result:?}");
+        }
+        assert!(payment.issued_challenge_for(
+            &credential,
+            &ChargeRequest {
+                amount: "01000".into(),
+                ..request.clone()
+            }
+        ));
+    }
+}

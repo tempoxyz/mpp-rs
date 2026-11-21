@@ -16,6 +16,25 @@ use super::ChargeMethod;
 
 const AUTHENTICATED_PROOF_DOMAIN: &str = "mpp:charge:proof-domain:authenticated-expiry";
 
+/// Whether an AccountKeychain `getKey` answer names an active access key
+/// for `signer` at `now_secs`, as Tempo's precompile defines it: the key ID
+/// is non-zero and equals the signer, the key is not revoked, and it has not
+/// expired. `getKey` answers a missing or revoked key with a blank entry
+/// (key ID and expiry zero), so an expiry of 0 means the key does not exist;
+/// a key that never expires is stored with `u64::MAX`. A key expires once
+/// the time reaches its expiry.
+pub(super) fn is_active_access_key(
+    key_info: &IAccountKeychain::KeyInfo,
+    signer: Address,
+    now_secs: u64,
+) -> bool {
+    !key_info.keyId.is_zero()
+        && key_info.keyId == signer
+        && !key_info.isRevoked
+        && key_info.expiry != 0
+        && now_secs < key_info.expiry
+}
+
 impl<P> ChargeMethod<P>
 where
     P: Provider<TempoNetwork> + Clone + Send + Sync + 'static,
@@ -66,7 +85,7 @@ where
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            if key_info.expiry == 0 || key_info.isRevoked || key_info.expiry <= now_secs {
+            if !is_active_access_key(&key_info, recovered, now_secs) {
                 return Err(VerificationError::new(
                     "Proof signature does not match source.",
                 ));
