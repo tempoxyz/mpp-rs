@@ -238,7 +238,7 @@ fn test_mpp_create_rejects_realm_a_challenge_cannot_carry() {
         )
     };
 
-    for realm in ["Caf\u{e9} API", "api\u{2014}example.com", "bell\u{7}"] {
+    for realm in ["Café API", "api\u{2014}example.com", "bell\u{7}"] {
         let err = create(realm).err().expect("non-ASCII realm");
         assert!(
             err.to_string().contains("Invalid realm"),

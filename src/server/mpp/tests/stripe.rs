@@ -77,7 +77,7 @@ fn test_create_stripe_rejects_non_ascii_realm() {
             currency: "usd",
             decimals: 2,
         })
-        .realm("Caf\u{e9} API")
+        .realm("Café API")
         .secret_key(&"k".repeat(32)),
     )
     .err()
