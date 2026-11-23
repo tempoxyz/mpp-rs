@@ -54,9 +54,12 @@ fuzz_target!(|header: &str| {
         }
         // A quoted string may hold raw line breaks, and raw text outside
         // printable ASCII; the formatter refuses both outside `description`
-        // and line breaks in it.
+        // and line breaks in it. It also refuses a Challenge flagged as
+        // carrying the legacy `\uXXXX` escape.
         Err(_) => assert!(
-            has_line_break(&challenge) || !has_quoted_text_values(&challenge),
+            challenge.legacy_unicode_escape
+                || has_line_break(&challenge)
+                || !has_quoted_text_values(&challenge),
             "cannot format {challenge:?}"
         ),
     }
