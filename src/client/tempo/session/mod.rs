@@ -4395,6 +4395,15 @@ impl TempoSessionProvider {
                                 || state.close_requested_at != 0
                         };
                         if !funded {
+                            // Clones share pending opens: one signed for another
+                            // wallet is not replayed under this one.
+                            if channel_ops::descriptor_payer(&payload)
+                                .is_some_and(|descriptor_payer| descriptor_payer != payer)
+                            {
+                                return Err(MppError::InvalidConfig(
+                                    "pending channel open belongs to another wallet".into(),
+                                ));
+                            }
                             return Ok(build_credential(challenge, payload, chain_id, payer));
                         }
                         if let Some(open) = self
@@ -9659,6 +9668,47 @@ mod tests {
             if cumulative_amount.parse::<u128>().unwrap() > channel.cumulative_amount)
         );
         provider.abandon_payment(&challenge, &next);
+    }
+
+    #[tokio::test]
+    async fn clone_for_another_wallet_does_not_replay_a_pending_native_open() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+        let escrow = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_default_deposit(10_000);
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        asserter.push_success(&"0x5208"); // eth_estimateGas
+        for _ in 0..3 {
+            asserter.push_success(&channel_state_response(0));
+        }
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = make_scoped_challenge(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            escrow,
+        );
+
+        let credential = provider.pay(&challenge).await.unwrap();
+        provider.abandon_payment(&challenge, &credential);
+
+        let mut other = provider.clone();
+        other.signer = make_test_provider().signer;
+        let error = other.pay(&challenge).await.unwrap_err();
+        assert!(
+            error.to_string().contains("belongs to another wallet"),
+            "{error}"
+        );
+        assert_eq!(provider.pending_opens.lock().unwrap().len(), 1);
+
+        // The wallet that signed it still replays its own open.
+        let retry = provider.pay(&challenge).await.unwrap();
+        assert_eq!(retry.payload, credential.payload);
+        assert_eq!(retry.source, credential.source);
+        provider.abandon_payment(&challenge, &retry);
     }
 
     #[cfg(feature = "sqlite")]
