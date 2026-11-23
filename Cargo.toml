@@ -72,7 +72,7 @@ identity-attestation = ["identity", "dep:reqwest", "dep:ed25519-dalek"]
 # Email OTP identity attestations (requires identity-attestation)
 identity-email-otp = ["identity-attestation"]
 # ERC-8004 agent identity provider (requires identity)
-identity-erc8004 = ["identity", "evm", "dep:reqwest"]
+identity-erc8004 = ["identity", "evm", "dep:reqwest", "dep:tower-service"]
 
 # Utilities
 utils = ["hex"]
@@ -154,6 +154,7 @@ futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
 alloy = { version = "2.1.0", default-features = false, features = [
   "contract",
+  "json-rpc",
   "provider-http",
   "reqwest",
   "rlp",

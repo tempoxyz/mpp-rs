@@ -623,3 +623,220 @@ fn signs_the_configured_origin_not_the_host() {
     let bare = IdentityRequest::new(Method::GET, Uri::from_static("/"), HeaderMap::new());
     assert_eq!(server::target(ORIGIN, &bare), "https://api.example/");
 }
+
+#[cfg(feature = "client")]
+mod bounded {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn a_spent_signature_is_rejected_before_allow() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let asserter = registry();
+        let agents = setup(&asserter, move |config| {
+            config.allow(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        });
+        wallet(&asserter, agent_key().address());
+        wallet(&asserter, agent_key().address());
+        let first = signed(agent_key(), 1).await;
+        assert!(agents.verifier.verify(&first).await.is_valid());
+        let replay = request(&[
+            ("agent-id", first.header("agent-id").unwrap().to_owned()),
+            (
+                "agent-signature",
+                first.header("agent-signature").unwrap().to_owned(),
+            ),
+        ]);
+        let rejection = rejected(agents.verifier.verify(&replay).await);
+        assert_eq!(rejection.status, RejectionStatus::Invalid);
+        assert!(rejection.reason.contains("already used"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_prover_signs_only_in_scope() {
+        use crate::identity::client::{ProveContext, Prover, Scope};
+
+        let prover = client::prover(client::ProverConfig::new(
+            agent_key(),
+            U256::from(1),
+            Scope::origins([ORIGIN]),
+        ));
+        let context = ProveContext {
+            created: now(),
+            nonce: "nonce".to_owned(),
+            challenge: None,
+        };
+        let mut outbound = reqwest::Request::new(
+            reqwest::Method::GET,
+            "https://other.example/haiku".parse().unwrap(),
+        );
+        assert!(prover.prove(&mut outbound, &context).await.is_err());
+        assert!(outbound.headers().get("agent-id").is_none());
+        assert!(outbound.headers().get("agent-signature").is_none());
+    }
+
+    /// A transport that records each request and answers with the next result.
+    #[derive(Clone)]
+    struct Recorder {
+        sent: Arc<Mutex<Vec<serde_json::Value>>>,
+        results: Arc<Mutex<Vec<Bytes>>>,
+    }
+
+    impl tower::Service<alloy_json_rpc::RequestPacket> for Recorder {
+        type Response = alloy_json_rpc::ResponsePacket;
+        type Error = alloy::transports::TransportError;
+        type Future = alloy::transports::TransportFut<'static>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, packet: alloy_json_rpc::RequestPacket) -> Self::Future {
+            let request = serde_json::to_value(&packet).unwrap();
+            let result = self.results.lock().unwrap().remove(0);
+            let response = json!({"jsonrpc": "2.0", "id": request["id"], "result": result});
+            self.sent.lock().unwrap().push(request);
+            Box::pin(std::future::ready(Ok(
+                serde_json::from_value(response).unwrap()
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_erc1271_call_is_capped_and_reads_the_latest_block() {
+        let recorder = Recorder {
+            sent: Arc::default(),
+            results: Arc::new(Mutex::new(vec![
+                Bytes::from(IIdentityRegistry::getAgentWalletCall::abi_encode_returns(
+                    &CONTRACT_WALLET,
+                )),
+                Bytes::from(IERC1271::isValidSignatureCall::abi_encode_returns(
+                    &FixedBytes([0x16, 0x26, 0xba, 0x7e]),
+                )),
+            ])),
+        };
+        let provider = ProviderBuilder::new()
+            .connect_client(alloy::rpc::client::RpcClient::new(recorder.clone(), true))
+            .erased();
+        let agents = create(Config::new(ORIGIN).provider(provider)).unwrap();
+        assert!(agents
+            .verifier
+            .verify(&signed(agent_key(), 3).await)
+            .await
+            .is_valid());
+        let sent = recorder.sent.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        for call in sent.iter() {
+            assert_eq!(call["method"], "eth_call");
+            assert_eq!(call["params"][1], "latest", "{call}");
+        }
+        assert_eq!(sent[1]["params"][0]["gas"], "0xf4240");
+        assert!(sent[0]["params"][0].get("gas").is_none());
+    }
+
+    /// Serves one HTTP response per connection and counts the connections.
+    async fn serve(
+        response: impl Fn(serde_json::Value) -> String + Send + Sync + 'static,
+    ) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body = loop {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break serde_json::Value::Null;
+                    }
+                    buffer.extend_from_slice(&chunk[..read]);
+                    let text = String::from_utf8_lossy(&buffer).into_owned();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break serde_json::from_str(body).unwrap_or_default();
+                        }
+                    }
+                };
+                let _ = socket.write_all(response(body).as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (url, hits)
+    }
+
+    fn ok(body: String) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn wallet_reply(request: &serde_json::Value, padding: usize) -> String {
+        let result = Bytes::from(IIdentityRegistry::getAgentWalletCall::abi_encode_returns(
+            &agent_key().address(),
+        ));
+        json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": result,
+            "padding": "0".repeat(padding),
+        })
+        .to_string()
+    }
+
+    async fn verify_at(url: &str) -> Verification<Agent> {
+        let agents = create(Config::new(ORIGIN).rpc_url(url)).unwrap();
+        agents.verifier.verify(&signed(agent_key(), 1).await).await
+    }
+
+    #[tokio::test]
+    async fn the_default_provider_reads_the_configured_endpoint() {
+        let (url, _) = serve(|request| ok(wallet_reply(&request, 0))).await;
+        assert!(verify_at(&url).await.is_valid());
+    }
+
+    #[tokio::test]
+    async fn the_default_provider_follows_no_redirect() {
+        let (target, hits) = serve(|request| ok(wallet_reply(&request, 0))).await;
+        let (url, _) = serve(move |_| {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        })
+        .await;
+        let rejection = rejected(verify_at(&url).await);
+        assert_eq!(rejection.status, RejectionStatus::Unavailable);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_default_provider_refuses_an_oversized_reply() {
+        let (url, _) = serve(|request| ok(wallet_reply(&request, 70 * 1024))).await;
+        let rejection = rejected(verify_at(&url).await);
+        assert_eq!(rejection.status, RejectionStatus::Unavailable);
+    }
+}

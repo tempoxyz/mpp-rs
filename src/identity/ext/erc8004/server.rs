@@ -4,11 +4,15 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
+use alloy::eips::BlockId;
 use alloy::network::TransactionBuilder;
 use alloy::primitives::{eip191_hash_message, Address, Bytes, Signature};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::client::RpcClient;
+use alloy::rpc::json_rpc::{RequestPacket, ResponsePacket};
 use alloy::rpc::types::TransactionRequest;
 use alloy::sol_types::SolCall;
+use alloy::transports::{TransportError, TransportErrorKind, TransportFut, TransportResult};
 use reqwest::Url;
 use serde_json::Value;
 
@@ -39,6 +43,14 @@ const ERC1271_MAGIC: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
 
 /// How long a registry or ERC-1271 call may take before the chain counts as unavailable.
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Gas an ERC-1271 check may use: room for a passkey (P-256) verification in
+/// Solidity, far below a node's default `eth_call` cap.
+const ERC1271_GAS: u64 = 1_000_000;
+
+/// Bytes of an RPC reply the default provider reads at most. The calls here
+/// return one or a few 32-byte words.
+const MAX_RPC_RESPONSE: usize = 64 * 1024;
 
 /// The longest `Agent-Signature` header read. A smart-account signature is
 /// a few kilobytes of hex at most.
@@ -119,7 +131,9 @@ impl Config {
         self
     }
 
-    /// A provider for the registry's chain. Default: an HTTP provider for [`rpc_url`](Self::rpc_url).
+    /// A provider for the registry's chain. Default: an HTTP provider for
+    /// [`rpc_url`](Self::rpc_url) that follows no redirects and reads replies
+    /// of up to 64 KiB.
     pub fn provider(mut self, provider: DynProvider) -> Self {
         self.provider = Some(provider);
         self
@@ -199,6 +213,12 @@ pub struct Erc8004 {
 ///   proves the agent. For anything else (no Credential, transaction hashes,
 ///   sessions, Zones, other methods) it requires the signature.
 ///
+/// Calls reach the chain before any Credential is checked, so each is bounded:
+/// five seconds, 1,000,000 gas for ERC-1271, at the latest block. Alloy's RPC
+/// client logs each request at TRACE, including the ERC-1271 call's signature:
+/// keep `alloy_rpc_client` below TRACE where logs are kept, or use a store so
+/// a logged signature is already spent.
+///
 /// Fails when the origin is not a URL, or when a chain other than Tempo
 /// mainnet has no provider or RPC URL.
 pub fn create(config: Config) -> Result<Erc8004, ConfigError> {
@@ -218,7 +238,9 @@ pub fn create(config: Config) -> Result<Erc8004, ConfigError> {
             let url = config.rpc_url.as_deref().unwrap_or(RPC_URL);
             let url =
                 Url::parse(url).map_err(|_| ConfigError("The RPC URL is not a URL.".to_owned()))?;
-            ProviderBuilder::new().connect_http(url).erased()
+            let local = alloy::transports::utils::guess_local_url(url.as_str());
+            let client = RpcClient::new(RpcTransport::new(url)?, local);
+            ProviderBuilder::new().connect_client(client).erased()
         }
     };
     let core = Arc::new(Core {
@@ -381,21 +403,33 @@ impl Core {
     }
 
     /// The agent that signed the request, if `allow` lets it in: then its
-    /// nonce is claimed, so a denied agent holds no claim.
+    /// nonce is claimed, so a denied agent holds no claim. A spent signature
+    /// is rejected before `allow` runs.
     async fn admit(&self, request: &IdentityRequest) -> Verification<Agent> {
         let (agent, claim) = match self.authenticated(request).await {
             Verification::Valid(signed) => signed,
             Verification::Rejected(rejection) => return rejection.into(),
         };
+        let key = format!(
+            "mppx:erc8004:nonce:{}",
+            eip191_hash_message(format!("{}:{}", agent.id, claim.nonce))
+        );
+        // Read-only, so a denied agent still holds no claim; the claim below
+        // stays atomic for concurrent requests.
+        if let (Some(store), Some(_)) = (&self.config.store, &self.config.allow) {
+            match store.get(&key).await {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    return Rejection::invalid("The agent signature was already used.").into()
+                }
+                Err(_) => return Rejection::unavailable("The replay store is unavailable.").into(),
+            }
+        }
         let agent = match self.allowed(Verification::Valid(agent)).await {
             Verification::Valid(agent) => agent,
             rejected => return rejected,
         };
         if let Some(store) = &self.config.store {
-            let key = format!(
-                "mppx:erc8004:nonce:{}",
-                eip191_hash_message(format!("{}:{}", agent.id, claim.nonce))
-            );
             // Held past expiry: the signature still verifies through the whole
             // second `now == expires`, and on verifiers whose clocks run behind
             // the store's.
@@ -545,8 +579,11 @@ impl Core {
         .abi_encode();
         let call = TransactionRequest::default()
             .with_to(wallet)
-            .with_input(data);
-        match tokio::time::timeout(RPC_TIMEOUT, self.provider.call(call)).await {
+            .with_input(data)
+            .with_gas_limit(ERC1271_GAS);
+        // The latest block, as the registry read: never pending state.
+        let call = self.provider.call(call).block(BlockId::latest());
+        match tokio::time::timeout(RPC_TIMEOUT, call).await {
             Ok(Ok(output)) if is_magic(&output) => Signed::Yes,
             Ok(Err(error)) if error.as_error_resp().is_none() => Signed::Unavailable,
             Ok(_) => Signed::No,
@@ -571,6 +608,77 @@ pub(super) fn target(origin: &str, request: &IdentityRequest) -> String {
     match uri.query().filter(|query| !query.is_empty()) {
         Some(query) => format!("{origin}{path}?{query}"),
         None => format!("{origin}{path}"),
+    }
+}
+
+/// The default provider's HTTP transport: it follows no redirects, so only the
+/// configured endpoint answers, and reads at most [`MAX_RPC_RESPONSE`] bytes of
+/// a reply.
+#[derive(Clone)]
+struct RpcTransport {
+    client: reqwest::Client,
+    url: Url,
+}
+
+impl RpcTransport {
+    fn new(url: Url) -> Result<Self, ConfigError> {
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(RPC_TIMEOUT)
+            .build()
+            .map_err(|_| ConfigError("The RPC client could not be built.".to_owned()))?;
+        Ok(Self { client, url })
+    }
+
+    async fn send(self, request: RequestPacket) -> TransportResult<ResponsePacket> {
+        let mut response = self
+            .client
+            .post(self.url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(TransportErrorKind::custom)?;
+        let too_large = || TransportErrorKind::custom_str("The RPC reply is too large.");
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RPC_RESPONSE as u64)
+        {
+            return Err(too_large());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(TransportErrorKind::custom)? {
+            if body.len() + chunk.len() > MAX_RPC_RESPONSE {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let status = response.status();
+        if !status.is_success() {
+            // A redirect lands here too: it is never followed.
+            return Err(TransportErrorKind::http_error(
+                status.as_u16(),
+                String::from_utf8_lossy(&body).into_owned(),
+            ));
+        }
+        serde_json::from_slice(&body)
+            .map_err(|error| TransportError::deser_err(error, String::from_utf8_lossy(&body)))
+    }
+}
+
+impl tower_service::Service<RequestPacket> for RpcTransport {
+    type Response = ResponsePacket;
+    type Error = TransportError;
+    type Future = TransportFut<'static>;
+
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, request: RequestPacket) -> Self::Future {
+        Box::pin(self.clone().send(request))
     }
 }
 

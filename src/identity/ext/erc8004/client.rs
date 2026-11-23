@@ -100,6 +100,13 @@ impl Prover for Erc8004Prover {
         context: &'a ProveContext,
     ) -> BoxFuture<'a, Result<(), ProverError>> {
         Box::pin(async move {
+            // `IdentityClient` proves only in-scope requests; a direct call is held
+            // to the same scope, so the agent's ID and signature reach no other origin.
+            if !self.config.scope.contains(request.url()) {
+                return Err(ProverError::new(
+                    "the request is outside the prover's scope",
+                ));
+            }
             let message = message(
                 &self.id,
                 request.method().as_str(),

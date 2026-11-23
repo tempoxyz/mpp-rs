@@ -42,6 +42,7 @@ dependencies = [
  "alloy-eips",
  "alloy-ens",
  "alloy-genesis",
+ "alloy-json-rpc",
  "alloy-network",
  "alloy-provider",
  "alloy-rpc-client",
@@ -3599,7 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "mpp"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "alloy",
  "alloy-json-rpc",
