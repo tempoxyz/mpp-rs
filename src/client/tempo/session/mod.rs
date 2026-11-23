@@ -2020,7 +2020,7 @@ impl TempoSessionProvider {
                 .await
             {
                 if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-                    let refreshed = crate::protocol::core::parse_www_authenticate_all_bytes(
+                    let refreshed = crate::protocol::core::parse_payable_challenges(
                         response
                             .headers()
                             .get_all(WWW_AUTHENTICATE)
@@ -2078,7 +2078,7 @@ impl TempoSessionProvider {
             .mpp_http("session bootstrap challenge request failed")?;
 
         let response = if challenge_response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-            let challenge = crate::protocol::core::parse_www_authenticate_all_bytes(
+            let challenge = crate::protocol::core::parse_payable_challenges(
                 challenge_response
                     .headers()
                     .get_all(WWW_AUTHENTICATE)
@@ -3162,7 +3162,7 @@ impl TempoSessionProvider {
             )
             .await?;
         if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-            let fresh_challenge = crate::protocol::core::parse_www_authenticate_all_bytes(
+            let fresh_challenge = crate::protocol::core::parse_payable_challenges(
                 response
                     .headers()
                     .get_all(WWW_AUTHENTICATE)
@@ -3655,7 +3655,7 @@ impl TempoSessionProvider {
         if response.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
             return None;
         }
-        crate::protocol::core::parse_www_authenticate_all_bytes(
+        crate::protocol::core::parse_payable_challenges(
             response
                 .headers()
                 .get_all(reqwest::header::WWW_AUTHENTICATE)
