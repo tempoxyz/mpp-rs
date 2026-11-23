@@ -236,7 +236,15 @@ pub(super) fn is_token(value: &str) -> bool {
     !value.is_empty()
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || is_tchar_symbol(byte))
+}
+
+/// Whether `byte` is one of the non-alphanumeric tchar.
+fn is_tchar_symbol(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'..=b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+    )
 }
 
 /// Whether a field value starts with the `Payment` auth-scheme.
