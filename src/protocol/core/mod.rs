@@ -89,10 +89,10 @@ pub use challenge::{ChallengeEcho, PaymentChallenge};
 pub use credential::{PaymentCredential, PaymentPayload};
 pub use headers::{
     extract_payment_scheme, format_authorization, format_receipt, format_www_authenticate,
-    format_www_authenticate_many, parse_authorization, parse_receipt, parse_www_authenticate,
-    parse_www_authenticate_all, parse_www_authenticate_all_bytes, with_private_cache_control,
-    AUTHORIZATION_HEADER, PAYMENT_AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME,
-    WWW_AUTHENTICATE_HEADER,
+    format_www_authenticate_many, parse_authorization, parse_payable_challenges, parse_receipt,
+    parse_www_authenticate, parse_www_authenticate_all, parse_www_authenticate_all_bytes,
+    with_private_cache_control, AUTHORIZATION_HEADER, PAYMENT_AUTHORIZATION_HEADER,
+    PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME, WWW_AUTHENTICATE_HEADER,
 };
 pub use receipt::{extract_tx_hash, Receipt};
 

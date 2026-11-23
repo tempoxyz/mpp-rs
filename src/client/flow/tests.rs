@@ -531,6 +531,74 @@ async fn only_unsupported_credential_header_offer_is_never_paid() {
     }
 }
 
+/// A challenge whose `realm` an older server escaped as `\uXXXX`.
+fn www_authenticate_legacy_escape(id: &str, escape: &str) -> String {
+    www_authenticate(id, "tempo", "charge").replace(
+        r#"realm="127.0.0.1""#,
+        &format!(r#"realm="caf{escape}.127.0.0.1""#),
+    )
+}
+
+#[tokio::test]
+async fn legacy_unicode_escaped_challenge_is_never_paid() {
+    for escape in [r"\u00e9", r"\u2014"] {
+        let url = spawn_challenging_server(www_authenticate_legacy_escape("legacy", escape)).await;
+        for via in BOTH {
+            let provider = TestProvider::default();
+            let request = reqwest::Client::new().get(format!("{url}/paid"));
+            let result = via.send(request, &provider, ClientEvents::default()).await;
+            assert!(
+                matches!(&result, Err(HttpError::InvalidChallenge(message)) if message.contains("Legacy unicode-escaped challenge")),
+                "{escape} {via:?}: {result:?}"
+            );
+            assert!(provider.paid().is_empty(), "{escape} {via:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_unicode_escaped_offer_is_skipped_for_valid_challenge() {
+    let url = spawn_challenging_server(format!(
+        "{}, {}",
+        www_authenticate_legacy_escape("legacy", r"\u00e9"),
+        www_authenticate("valid", "tempo", "charge"),
+    ))
+    .await;
+    for via in BOTH {
+        let provider = TestProvider::default();
+        let request = reqwest::Client::new().get(format!("{url}/paid"));
+        let response = via
+            .send(request, &provider, ClientEvents::default())
+            .await
+            .unwrap_or_else(|err| panic!("{via:?}: {err}"));
+        assert_eq!(response.status(), StatusCode::OK, "{via:?}");
+        assert_eq!(provider.paid(), ["valid"], "{via:?}");
+    }
+}
+
+#[tokio::test]
+async fn quoted_pairs_without_unicode_escapes_are_paid() {
+    for (realm, description) in [
+        (r#"a\"b"#, "plain"),
+        (r"a\\b", "plain"),
+        ("127.0.0.1", r"em dash \u2014"),
+    ] {
+        let header = www_authenticate("quoted", "tempo", "charge")
+            .replace(r#"realm="127.0.0.1""#, &format!(r#"realm="{realm}""#));
+        let header = format!(r#"{header}, description="{description}""#);
+        let url = spawn_challenging_server(header).await;
+        for via in BOTH {
+            let provider = TestProvider::default();
+            let request = reqwest::Client::new().get(format!("{url}/paid"));
+            let result = via.send(request, &provider, ClientEvents::default()).await;
+            assert!(
+                provider.paid() == ["quoted"],
+                "{realm} {description} {via:?}: {result:?}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn unchallenged_402_after_payment_is_returned() {
     let app = Router::new().route(

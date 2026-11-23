@@ -388,7 +388,7 @@ impl TempoAccountsProvider {
                 .await
                 .mpp_http("preconnect probe failed")?,
         };
-        Ok(crate::protocol::core::parse_www_authenticate_all_bytes(
+        Ok(crate::protocol::core::parse_payable_challenges(
             response
                 .headers()
                 .get_all(reqwest::header::WWW_AUTHENTICATE)

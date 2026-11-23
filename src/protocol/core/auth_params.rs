@@ -48,6 +48,11 @@ pub(super) struct Tokenizer<'a> {
     /// The first non-whitespace byte at or after `name_end`, cached for the
     /// same reason.
     name_equals: Option<(usize, usize)>,
+    /// Whether the value read last was quoted and held a quoted-pair `\u`
+    /// followed by four hex digits: the `\uXXXX` escape that older servers
+    /// wrote for characters above U+00FF, which a quoted-pair reads as
+    /// `uXXXX`.
+    unicode_escape: bool,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -58,7 +63,14 @@ impl<'a> Tokenizer<'a> {
             start: 0,
             name_end: None,
             name_equals: None,
+            unicode_escape: false,
         }
+    }
+
+    /// Whether the auth-param value returned last was quoted and held a
+    /// legacy `\uXXXX` escape.
+    pub(super) fn read_unicode_escape(&self) -> bool {
+        self.unicode_escape
     }
 
     /// The next token if it is an auth-param. Any other token is left for
@@ -99,6 +111,7 @@ impl<'a> Tokenizer<'a> {
     /// Reads the value of an auth-param: a quoted-string, or the text up to a
     /// comma or whitespace.
     fn value(&mut self) -> Result<Cow<'a, str>> {
+        self.unicode_escape = false;
         let bytes = self.input.as_bytes();
         let start = self.seek(self.pos, |byte| !byte.is_ascii_whitespace());
         if bytes.get(start) != Some(&b'"') {
@@ -118,6 +131,13 @@ impl<'a> Tokenizer<'a> {
                     // A quoted-pair (RFC 9110 §5.6.4) stands for the character
                     // after the backslash, so \u2014 is the text "u2014".
                     i += 1;
+                    if bytes.get(i) == Some(&b'u')
+                        && bytes
+                            .get(i + 1..i + 5)
+                            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+                    {
+                        self.unicode_escape = true;
+                    }
                     if let Some(escaped) = self.input[i..].chars().next() {
                         unescaped.push(escaped);
                         i += escaped.len_utf8();

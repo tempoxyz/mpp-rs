@@ -22,7 +22,7 @@ use super::provider::{PaymentContext, PaymentProvider, PendingPayment};
 use crate::error::MppError;
 use crate::protocol::core::accept_payment::ACCEPT_PAYMENT_HEADER;
 use crate::protocol::core::{
-    format_authorization, parse_receipt, parse_www_authenticate_all_bytes, PaymentChallenge,
+    format_authorization, parse_payable_challenges, parse_receipt, PaymentChallenge,
     PaymentCredential, Receipt,
 };
 
@@ -329,9 +329,19 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                 return Err(self.fail(None, HttpError::MissingChallenge).await);
             }
 
-            let challenges: Vec<_> = parse_www_authenticate_all_bytes(www_auth_values)
+            // A challenge escaped by an older server is skipped like an
+            // unusable offer, before anything is signed.
+            let mut legacy_escape = None;
+            let challenges: Vec<_> = parse_payable_challenges(www_auth_values)
                 .into_iter()
-                .filter_map(|r| r.ok())
+                .filter_map(|result| match result {
+                    Ok(challenge) => Some(challenge),
+                    Err(error) if error.is_legacy_unicode_escape() => {
+                        legacy_escape.get_or_insert(error);
+                        None
+                    }
+                    Err(_) => None,
+                })
                 .collect();
 
             let safe_supported = challenges.iter().any(|challenge| {
@@ -383,6 +393,11 @@ impl<P: PaymentProvider> PaymentFlow<'_, P> {
                     reject(previous.take()).await?;
                     if !paid_challenge_ids.is_empty() {
                         return Ok(resp);
+                    }
+                    if let Some(error) = legacy_escape {
+                        return Err(self
+                            .fail(None, HttpError::InvalidChallenge(error.to_string()))
+                            .await);
                     }
                     let message = with_available_methods(
                         message,

@@ -278,10 +278,19 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
 
 /// Reads the auth-params that follow a `Payment` scheme into a challenge.
 fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
+    read_challenge_flagged(tokens).map(|(challenge, _)| challenge)
+}
+
+/// Like [`read_challenge`], and also whether a quoted value of an auth-param
+/// other than `description` held a legacy `\uXXXX` escape.
+fn read_challenge_flagged(tokens: &mut Tokenizer<'_>) -> Result<(PaymentChallenge, bool)> {
     let mut params = HashMap::new();
+    let mut unicode_escape = false;
     while let Some((name, value)) = tokens.param()? {
         // Auth-param names are case-insensitive (RFC 9110 §11.2).
         let key = name.to_ascii_lowercase();
+        // Every auth-param but `description` is bound by the challenge id.
+        unicode_escape |= key != "description" && tokens.read_unicode_escape();
         if key == "request" && value.len() > MAX_TOKEN_LEN {
             return Err(MppError::invalid_challenge_reason(format!(
                 "Request parameter exceeds maximum length of {} bytes",
@@ -322,7 +331,7 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
         opaque.as_ref().map(Base64UrlJson::raw),
     )?;
 
-    Ok(PaymentChallenge {
+    let challenge = PaymentChallenge {
         id,
         realm,
         method,
@@ -335,7 +344,8 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
         header: super::parse_advertised_credential_header(
             params.get("header").map(String::as_str),
         )?,
-    })
+    };
+    Ok((challenge, unicode_escape))
 }
 
 /// Parse all Payment challenges from one or more WWW-Authenticate header values.
@@ -413,13 +423,64 @@ pub fn parse_www_authenticate_all_bytes<'a>(
         .collect()
 }
 
+/// Parse the Payment challenges of raw `WWW-Authenticate` field values for
+/// paying one of them.
+///
+/// Like [`parse_www_authenticate_all_bytes`], except that a challenge with a
+/// legacy `\uXXXX` escape in any auth-param but `description` is an error
+/// (see [`MppError::is_legacy_unicode_escape`]). Servers that escaped
+/// characters above U+00FF that way (mppx 0.8.18 to 0.21.1, pympp 0.15 to
+/// 0.26, mpp-go 0.4 to 0.9.1) bound the decoded character in the challenge id,
+/// while a quoted-pair reads `\u00e9` as `u00e9`. A Credential for such a
+/// challenge would echo values the server rejects, after a pushed payment has
+/// already moved funds, so clients skip it before paying.
+///
+/// # Examples
+///
+/// ```
+/// use mpp::protocol::core::parse_payable_challenges;
+///
+/// let header: &[u8] =
+///     br#"Payment id="abc", realm="caf\u00e9", method="tempo", intent="charge", request="e30""#;
+/// let challenges = parse_payable_challenges([header]);
+/// assert!(challenges[0].as_ref().unwrap_err().is_legacy_unicode_escape());
+/// ```
+pub fn parse_payable_challenges<'a>(
+    headers: impl IntoIterator<Item = &'a [u8]>,
+) -> Vec<Result<PaymentChallenge>> {
+    headers
+        .into_iter()
+        .flat_map(|value| parse_challenges_flagged(&decode_latin1(value)))
+        .map(|result| match result? {
+            (challenge, true) => Err(MppError::invalid_challenge(
+                challenge.id,
+                LEGACY_UNICODE_ESCAPE_REASON,
+            )),
+            (challenge, false) => Ok(challenge),
+        })
+        .collect()
+}
+
+/// Reason of the error [`parse_payable_challenges`] returns for a challenge
+/// with a legacy `\uXXXX` escape in a bound auth-param.
+pub(crate) const LEGACY_UNICODE_ESCAPE_REASON: &str = "Legacy unicode-escaped challenge: the server escaped a bound parameter as \\uXXXX; upgrade the server";
+
 /// Parses every `Payment` challenge of one field value.
 fn parse_challenges(header: &str) -> Vec<Result<PaymentChallenge>> {
+    parse_challenges_flagged(header)
+        .into_iter()
+        .map(|result| result.map(|(challenge, _)| challenge))
+        .collect()
+}
+
+/// Parses every `Payment` challenge of one field value, each with whether it
+/// held a legacy `\uXXXX` escape in a bound auth-param.
+fn parse_challenges_flagged(header: &str) -> Vec<Result<(PaymentChallenge, bool)>> {
     let mut tokens = Tokenizer::new(header);
     let mut challenges = Vec::new();
     while let Some(Ok(token)) = tokens.next() {
         if token.is_payment_scheme() {
-            challenges.push(read_challenge(&mut tokens));
+            challenges.push(read_challenge_flagged(&mut tokens));
         }
     }
     challenges
@@ -1342,6 +1403,86 @@ mod tests {
             challenge.opaque.as_ref().map(Base64UrlJson::raw),
             Some("e30")
         );
+    }
+
+    #[test]
+    fn test_parse_payable_challenges_refuses_legacy_unicode_escapes() {
+        // Older servers wrote characters above U+00FF in bound auth-params as
+        // \uXXXX. A quoted-pair still reads them as uXXXX, but a Credential
+        // would echo values the challenge id does not bind.
+        for (param, value) in [
+            ("realm", r"caf\u00e9.example.com"),
+            ("realm", r"merchant\u2014api.example.com"),
+            ("realm", r"lower hex \u00E9 and \uabcd"),
+            ("id", r"ch\u00e9"),
+            ("ext", r"x\u00e9"),
+        ] {
+            let header = test_header_with(param, value);
+            let parsed = parse_www_authenticate(&header).unwrap();
+            assert!(!format!("{parsed:?}").contains('\\'), "{param}={value}");
+            let results = parse_payable_challenges([header.as_bytes()]);
+            assert_eq!(results.len(), 1, "{param}={value}");
+            let error = results[0].as_ref().unwrap_err();
+            assert!(error.is_legacy_unicode_escape(), "{param}={value}: {error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Legacy unicode-escaped challenge"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_payable_challenges_reads_other_quoted_pairs() {
+        for (param, value, expected) in [
+            ("realm", r#"quote " here"#, r#"quote " here"#),
+            ("realm", r"slash \\ here", r"slash \ here"),
+            ("realm", r"escaped slash \\u00e9", r"escaped slash \u00e9"),
+            ("realm", r"short \u12 tail", "short u12 tail"),
+            ("realm", r"not hex \u12g4", "not hex u12g4"),
+            ("description", r"em dash \u2014", "api"),
+        ] {
+            let header = test_header_with(param, value);
+            let results = parse_payable_challenges([header.as_bytes()]);
+            let challenge = results[0]
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{param}={value}: {error}"));
+            assert_eq!(challenge.realm, expected, "{param}={value}");
+        }
+    }
+
+    #[test]
+    fn test_parse_payable_challenges_skips_only_the_escaped_offer() {
+        let legacy = test_header_with("realm", r"caf\u00e9");
+        let plain = test_header_with("realm", "api").replace(r#"id="abc""#, r#"id="plain""#);
+        let results = parse_payable_challenges([format!("{legacy}, {plain}").as_bytes()]);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].as_ref().unwrap_err().is_legacy_unicode_escape());
+        assert_eq!(results[1].as_ref().unwrap().id, "plain");
+        // Errors that are not about the escape keep their own reason.
+        let broken = parse_payable_challenges([b"Payment id=\"x\"".as_slice()]);
+        assert!(!broken[0].as_ref().unwrap_err().is_legacy_unicode_escape());
+    }
+
+    /// A challenge header whose `param` auth-param is the quoted `raw` text.
+    fn test_header_with(param: &str, raw: &str) -> String {
+        let mut params = vec![
+            ("id", "abc"),
+            ("realm", "api"),
+            ("method", "tempo"),
+            ("intent", "charge"),
+            ("request", "e30"),
+        ];
+        match params.iter_mut().find(|(name, _)| *name == param) {
+            Some(entry) => entry.1 = raw,
+            None => params.push((param, raw)),
+        }
+        let params: Vec<_> = params
+            .iter()
+            .map(|(name, value)| format!(r#"{name}="{value}""#))
+            .collect();
+        format!("Payment {}", params.join(", "))
     }
 
     #[test]
