@@ -155,10 +155,9 @@ struct PendingWithdrawal {
     /// The sent withdrawal, or why it failed. A sender tag that could not be
     /// read is derived again by every payment, never by withdrawing again.
     request: OnceCell<Result<SentWithdrawal, WithdrawalFailure>>,
-    /// The sender tags derived from the outbox's state for a withdrawal whose
-    /// receipt had no event, kept after the first read: they describe fixed
-    /// past blocks, so a resumed wait needs only Tempo.
-    sender_tags: Mutex<Option<Vec<B256>>>,
+    /// For a withdrawal whose receipt had no event: the Zone block last seen
+    /// to include it, and the sender tags derived from that block's state.
+    derived: Mutex<DerivedSenderTags>,
     /// The sender tag of a withdrawal whose Credential was returned after its
     /// challenge expired, as mppx's `redeemedLate`. Only a retry of that
     /// challenge may get the Credential again; until its redemption window
@@ -176,12 +175,25 @@ struct PendingWithdrawal {
     settlement_cursor: Mutex<Option<u64>>,
 }
 
+/// What the Zone showed of a withdrawal whose receipt had no
+/// `WithdrawalRequested` event.
+#[derive(Debug, Default)]
+struct DerivedSenderTags {
+    /// The Zone block a receipt of the transaction last named: `None` until
+    /// the first derivation, which uses the send's receipt.
+    block_hash: Option<B256>,
+    /// The candidates derived from a block's state, with that block's hash.
+    /// They hold only while the transaction's receipt still names that block.
+    sender_tags: Option<(B256, Vec<B256>)>,
+}
+
 /// A sent Zone withdrawal: its sender tag when the receipt carried it, and
 /// what derives it otherwise, as mppx's `ZoneWithdrawal`.
 #[derive(Clone, Debug)]
 struct SentWithdrawal {
-    /// The Zone block that included the withdrawal transaction.
-    block_number: u64,
+    /// The hash of the Zone block that included the withdrawal transaction,
+    /// when its receipt named one.
+    block_hash: Option<B256>,
     /// The paying account.
     sender: Address,
     /// The withdrawal transaction's hash.
@@ -647,7 +659,7 @@ impl TempoZone {
                                 origin: origin.map(str::to_owned),
                                 terms: self.terms_key(challenge, signer, signing_mode),
                                 request: OnceCell::new(),
-                                sender_tags: Mutex::default(),
+                                derived: Mutex::default(),
                                 redeemed_late: Mutex::default(),
                                 waiters: Default::default(),
                                 sending: Default::default(),
@@ -810,59 +822,30 @@ impl TempoZone {
                 return Err(own_error.unwrap_or_else(|| failure.to_error()));
             }
         };
-        // Derived until a read succeeds, then kept, so a failed read on the
-        // Zone is retried with the challenge without withdrawing again: the
-        // withdrawal stays pending, and the payment fails with the resumable
-        // settlement-pending error that HTTP and MCP flows retry. A block
-        // whose state shows no withdrawal of this payer's, or too many, never
-        // changes, so that outcome is unknown rather than retryable.
-        let cached = sent.sender_tags.clone().or_else(|| {
-            withdrawal
-                .sender_tags
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone()
-        });
-        let sender_tags = match cached {
-            Some(sender_tags) => sender_tags,
-            None => {
-                // The send check reserved no time for this read, so it ends at
-                // the challenge's expiry: a read still running then fails as
-                // pending, and a retry resumes it, rather than the Credential
-                // going out late.
-                let read = within(
-                    remaining_bound(paid, self.rpc_timeout),
-                    derive_sender_tag_candidates(
-                        &self.rpc_provider,
-                        sent.block_number,
-                        sent.sender,
-                        sent.transaction_hash,
-                    ),
-                )
-                .await;
-                match read {
-                    Some(Ok(derived)) => {
-                        *withdrawal
-                            .sender_tags
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                            Some(derived.clone());
-                        derived
-                    }
-                    Some(Err(CandidateError::Refused(_))) => {
-                        return Err(MppError::PaymentOutcomeUnknown {
-                            transaction_hash: format!("{:#x}", sent.transaction_hash),
-                        });
-                    }
-                    Some(Err(CandidateError::Read(_))) | None => {
-                        // Pin where the settlement search starts now, so a
-                        // retry that reads the tags much later still covers a
-                        // settlement made in between.
-                        self.pin_settlement_search(tempo, &withdrawal).await;
-                        return Err(pending_error(Vec::new()));
-                    }
+        // Derived until a read succeeds, then kept while the transaction stays
+        // in the same block, so a failed read on the Zone is retried with the
+        // challenge without withdrawing again: the withdrawal stays pending,
+        // and the payment fails with the resumable settlement-pending error
+        // that HTTP and MCP flows retry. A block whose state shows no
+        // withdrawal of this payer's, or too many, never changes, so that
+        // outcome is unknown rather than retryable.
+        let sender_tags = match &sent.sender_tags {
+            Some(sender_tags) => sender_tags.clone(),
+            None => match self.derived_sender_tags(paid, &sent, &withdrawal).await {
+                Ok(derived) => derived,
+                Err(CandidateError::Refused(_)) => {
+                    return Err(MppError::PaymentOutcomeUnknown {
+                        transaction_hash: format!("{:#x}", sent.transaction_hash),
+                    });
                 }
-            }
+                Err(CandidateError::Read(_)) => {
+                    // Pin where the settlement search starts now, so a
+                    // retry that reads the tags much later still covers a
+                    // settlement made in between.
+                    self.pin_settlement_search(tempo, &withdrawal).await;
+                    return Err(pending_error(Vec::new()));
+                }
+            },
         };
         let tag_strings = || {
             sender_tags
@@ -1151,18 +1134,13 @@ impl TempoZone {
             }
             None => None,
         };
-        let block_number = receipt
-            .get("blockNumber")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|number| u64::from_str_radix(number.strip_prefix("0x")?, 16).ok());
+        let block_hash = receipt_block_hash(&receipt);
         // Without the event, only the block derives the tag.
-        let block_number = match (block_number, &sender_tags) {
-            (Some(block_number), _) => block_number,
-            (None, Some(_)) => 0,
-            (None, None) => return Err(unknown()),
-        };
+        if block_hash.is_none() && sender_tags.is_none() {
+            return Err(unknown());
+        }
         Ok(SentWithdrawal {
-            block_number,
+            block_hash,
             sender: from,
             transaction_hash: hash,
             sender_tags,
@@ -1268,6 +1246,91 @@ impl TempoZone {
         }
     }
 
+    /// The sender tags a withdrawal whose receipt had no event may carry,
+    /// derived from the state of the Zone block that includes it.
+    ///
+    /// A retry looks the transaction's receipt up again first: if the Zone
+    /// moved it to another block, as after a reorg, the tags come from that
+    /// block, and tags derived from the earlier one are dropped. A lookup
+    /// that proves nothing keeps the last known block. Both reads of the
+    /// outbox are pinned to that block's hash and its parent's, so they
+    /// describe one chain, and fail when the block is no longer canonical.
+    async fn derived_sender_tags(
+        &self,
+        paid: &PaymentChallenge,
+        sent: &SentWithdrawal,
+        withdrawal: &PendingWithdrawal,
+    ) -> Result<Vec<B256>, CandidateError> {
+        let lock = || {
+            withdrawal
+                .derived
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        let known = lock().block_hash;
+        let block_hash = match known {
+            // The first derivation uses the receipt the send returned.
+            None => sent.block_hash,
+            Some(known) => {
+                let lookup = within(
+                    remaining_bound(paid, self.rpc_timeout),
+                    self.rpc_provider
+                        .raw_request::<_, Option<serde_json::Value>>(
+                            "eth_getTransactionReceipt".into(),
+                            [sent.transaction_hash],
+                        ),
+                )
+                .await;
+                let moved = match lookup {
+                    Some(Ok(Some(receipt))) => included_block(&receipt, sent.transaction_hash),
+                    _ => None,
+                };
+                Some(moved.unwrap_or(known))
+            }
+        };
+        let Some(block_hash) = block_hash else {
+            return Err(CandidateError::Refused(MppError::Http(format!(
+                "Zone withdrawal transaction {:#x} has no block.",
+                sent.transaction_hash
+            ))));
+        };
+        {
+            let mut derived = lock();
+            derived.block_hash = Some(block_hash);
+            match &derived.sender_tags {
+                Some((from, sender_tags)) if *from == block_hash => {
+                    return Ok(sender_tags.clone());
+                }
+                Some(_) => derived.sender_tags = None,
+                None => {}
+            }
+        }
+        // The send check reserved no time for this read, so it ends at the
+        // challenge's expiry: a read still running then fails as pending,
+        // and a retry resumes it, rather than the Credential going out late.
+        let read = within(
+            remaining_bound(paid, self.rpc_timeout),
+            derive_sender_tag_candidates(
+                &self.rpc_provider,
+                BlockRef::Hash(block_hash),
+                sent.sender,
+                sent.transaction_hash,
+            ),
+        )
+        .await
+        .unwrap_or_else(|| {
+            Err(CandidateError::Read(MppError::Http(
+                "timed out reading the Zone outbox's lastFallbackNonce".into(),
+            )))
+        })?;
+        let mut derived = lock();
+        // Kept only while no concurrent retry saw the transaction move.
+        if derived.block_hash == Some(block_hash) {
+            derived.sender_tags = Some((block_hash, read.clone()));
+        }
+        Ok(read)
+    }
+
     /// Looks for the receipt of a withdrawal whose send response failed.
     ///
     /// The recovery timeout bounds the whole search, including a lookup that
@@ -1308,6 +1371,28 @@ fn withdrawal_requested(receipt: &serde_json::Value) -> Option<IZoneOutbox::With
         .find_map(|log| IZoneOutbox::WithdrawalRequested::decode_log_data(log.data()).ok())
 }
 
+/// The hash of the block a receipt names.
+fn receipt_block_hash(receipt: &serde_json::Value) -> Option<B256> {
+    receipt
+        .get("blockHash")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|hash| hash.parse().ok())
+}
+
+/// The block that includes `transaction_hash` by its successful receipt,
+/// or `None` when the receipt is for another transaction or shows no
+/// success, so it proves nothing about where the withdrawal is.
+fn included_block(receipt: &serde_json::Value, transaction_hash: B256) -> Option<B256> {
+    let hash = receipt
+        .get("transactionHash")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|hash| hash.parse::<B256>().ok());
+    let succeeded = receipt.get("status").and_then(serde_json::Value::as_str) == Some("0x1");
+    (hash == Some(transaction_hash) && succeeded)
+        .then(|| receipt_block_hash(receipt))
+        .flatten()
+}
+
 /// The error for a Zone withdrawal paying `challenge` that has not settled,
 /// carrying `sender_tags`: its sender tag alone when known, else every
 /// candidate. `sender_tag` is set only when exactly one remains, so it never
@@ -1337,36 +1422,98 @@ fn settlement_pending(
 /// The outbox numbers each withdrawal with the next `lastFallbackNonce`, so
 /// the transaction's withdrawal took one of the nonces its block added. Every
 /// candidate hashes the payer's address and transaction, so only the payer's
-/// withdrawal can match one.
+/// withdrawal can match one. Both reads are pinned to the hashes of the
+/// block at `block_number` and its parent (EIP-1898), so they describe one
+/// chain even when the Zone RPC's view of that height changes.
 ///
 /// # Errors
 ///
-/// Fails when a read fails, when the block added no withdrawal, and when it
-/// added more than 64: the nonces come from the Zone RPC, so a range no block
-/// could hold is refused rather than hashed.
+/// Fails when a read fails, when the block is no longer canonical, when the
+/// block added no withdrawal, and when it added more than 64: the nonces come
+/// from the Zone RPC, so a range no block could hold is refused rather than
+/// hashed.
 pub async fn sender_tag_candidates(
     zone: &impl Provider<TempoNetwork>,
     block_number: u64,
     sender: Address,
     transaction_hash: B256,
 ) -> Result<Vec<B256>, MppError> {
-    derive_sender_tag_candidates(zone, block_number, sender, transaction_hash)
-        .await
-        .map_err(|(CandidateError::Read(error) | CandidateError::Refused(error))| error)
+    derive_sender_tag_candidates(
+        zone,
+        BlockRef::Number(block_number),
+        sender,
+        transaction_hash,
+    )
+    .await
+    .map_err(|(CandidateError::Read(error) | CandidateError::Refused(error))| error)
 }
 
 /// Why the sender tag candidates could not be derived.
 enum CandidateError {
-    /// A read of the Zone failed: a retry may succeed.
+    /// A read of the Zone failed, or its block is no longer canonical: a
+    /// retry may succeed.
     Read(MppError),
     /// The Zone's state at the withdrawal's block refuses every candidate:
     /// past state doesn't change, so a retry fails the same way.
     Refused(MppError),
 }
 
+/// A Zone block, by number or by hash.
+#[derive(Clone, Copy)]
+enum BlockRef {
+    Number(u64),
+    Hash(B256),
+}
+
+/// A Zone block's hash, number and parent hash.
+struct ZoneBlock {
+    hash: B256,
+    number: u64,
+    parent_hash: B256,
+}
+
+/// Reads the header of the Zone block `block`.
+async fn zone_block(
+    zone: &impl Provider<TempoNetwork>,
+    block: BlockRef,
+) -> Result<ZoneBlock, MppError> {
+    let (method, id) = match block {
+        BlockRef::Number(number) => ("eth_getBlockByNumber", format!("{number:#x}")),
+        BlockRef::Hash(hash) => ("eth_getBlockByHash", format!("{hash:#x}")),
+    };
+    let failed = |reason: String| {
+        MppError::Http(format!(
+            "failed to read Zone block {id} for the outbox's lastFallbackNonce: {reason}"
+        ))
+    };
+    let header: Option<serde_json::Value> = zone
+        .raw_request(method.into(), (id.clone(), false))
+        .await
+        .map_err(|e| failed(describe_rpc_error(&e)))?;
+    let header = header.ok_or_else(|| failed("the Zone RPC does not know it".into()))?;
+    let field = |name: &str| header.get(name).and_then(serde_json::Value::as_str);
+    let hash = field("hash").and_then(|hash| hash.parse::<B256>().ok());
+    let parent_hash = field("parentHash").and_then(|hash| hash.parse::<B256>().ok());
+    let number =
+        field("number").and_then(|number| u64::from_str_radix(number.strip_prefix("0x")?, 16).ok());
+    match (hash, number, parent_hash) {
+        (Some(hash), Some(number), Some(parent_hash))
+            if matches!(block, BlockRef::Hash(expected) if expected == hash)
+                || matches!(block, BlockRef::Number(expected) if expected == number) =>
+        {
+            Ok(ZoneBlock {
+                hash,
+                number,
+                parent_hash,
+            })
+        }
+        _ => Err(failed("invalid block header".into())),
+    }
+}
+
 async fn derive_sender_tag_candidates(
     zone: &impl Provider<TempoNetwork>,
-    block_number: u64,
+    block: BlockRef,
     sender: Address,
     transaction_hash: B256,
 ) -> Result<Vec<B256>, CandidateError> {
@@ -1375,15 +1522,20 @@ async fn derive_sender_tag_candidates(
             "Zone withdrawal transaction {transaction_hash:#x} did not request a withdrawal from the outbox."
         )))
     };
-    let previous = block_number.checked_sub(1).ok_or_else(did_not_request)?;
-    let last_fallback_nonce = |block_number: u64| async move {
+    let block = zone_block(zone, block)
+        .await
+        .map_err(CandidateError::Read)?;
+    if block.number == 0 {
+        return Err(did_not_request());
+    }
+    let last_fallback_nonce = |block_hash: B256| async move {
         let data = alloy::hex::encode_prefixed(IZoneOutbox::lastFallbackNonceCall {}.abi_encode());
         let result: Bytes = zone
             .raw_request(
                 "eth_call".into(),
                 (
                     serde_json::json!({ "to": zone::ZONE_OUTBOX, "data": data }),
-                    format!("{block_number:#x}"),
+                    serde_json::json!({ "blockHash": block_hash, "requireCanonical": true }),
                 ),
             )
             .await
@@ -1397,8 +1549,8 @@ async fn derive_sender_tag_candidates(
             .map_err(|e| MppError::Http(format!("invalid Zone outbox lastFallbackNonce: {e}")))
     };
     let (before, after) = tokio::try_join!(
-        last_fallback_nonce(previous),
-        last_fallback_nonce(block_number)
+        last_fallback_nonce(block.parent_hash),
+        last_fallback_nonce(block.hash)
     )
     .map_err(CandidateError::Read)?;
     if after <= before {

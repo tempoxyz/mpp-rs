@@ -1,6 +1,7 @@
 //! Zone payments from the Tempo charge client, as mppx's
 //! `client/Charge.zone.test.ts`.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use alloy::primitives::{address, Address, B256};
@@ -653,6 +654,34 @@ fn test_zone_settlement_pending_message() {
     );
 }
 
+/// The Zone chain a redacting Zone RPC serves: each block's number, parent
+/// hash and outbox `lastFallbackNonce`, which blocks are canonical, and the
+/// block the withdrawal's receipt names.
+struct ZoneChain {
+    blocks: HashMap<B256, (u64, B256, u64)>,
+    canonical: Vec<B256>,
+    receipt_block: B256,
+}
+
+/// The block the receipts of `zone_receipt` name, and its parent.
+const RECEIPT_BLOCK: B256 = B256::repeat_byte(0x11);
+const RECEIPT_PARENT: B256 = B256::repeat_byte(0x10);
+
+impl ZoneChain {
+    /// A chain whose outbox reports `before` at block 0 and `after` at the
+    /// withdrawal's block 1.
+    fn new(before: u64, after: u64) -> Self {
+        Self {
+            blocks: HashMap::from([
+                (RECEIPT_PARENT, (0, B256::ZERO, before)),
+                (RECEIPT_BLOCK, (1, RECEIPT_PARENT, after)),
+            ]),
+            canonical: vec![RECEIPT_PARENT, RECEIPT_BLOCK],
+            receipt_block: RECEIPT_BLOCK,
+        }
+    }
+}
+
 /// A Zone RPC that leaves the outbox's events out of receipts, as a
 /// production Zone RPC does with other contracts' logs, and whose outbox
 /// reports `before` as its `lastFallbackNonce` at block 0 and `after` at the
@@ -661,6 +690,21 @@ fn redacting_zone_handler(
     sent: Arc<Mutex<Vec<String>>>,
     before: u64,
     after: u64,
+    fail_reads: Arc<std::sync::atomic::AtomicBool>,
+) -> Handler {
+    redacting_zone_handler_on(
+        sent,
+        Arc::new(Mutex::new(ZoneChain::new(before, after))),
+        fail_reads,
+    )
+}
+
+/// A redacting Zone RPC serving `chain`: it answers outbox reads only by
+/// block hash, refusing a block that is no longer canonical, as EIP-1898's
+/// `requireCanonical` does.
+fn redacting_zone_handler_on(
+    sent: Arc<Mutex<Vec<String>>>,
+    chain: Arc<Mutex<ZoneChain>>,
     fail_reads: Arc<std::sync::atomic::AtomicBool>,
 ) -> Handler {
     let inner = zone_handler(|raw| Ok(zone_receipt(raw, "0x1", json!([]))));
@@ -674,18 +718,48 @@ fn redacting_zone_handler(
                 .unwrap()
                 .push(params[0].as_str().unwrap_or_default().to_string());
         }
-        if method == "eth_call" && params[0]["data"].as_str() == Some(selector.as_str()) {
-            if fail_reads.load(Ordering::SeqCst) {
-                return Err((-32000, "read failed".into()));
+        let chain = chain.lock().unwrap();
+        match method {
+            "eth_call" if params[0]["data"].as_str() == Some(selector.as_str()) => {
+                if fail_reads.load(Ordering::SeqCst) {
+                    return Err((-32000, "read failed".into()));
+                }
+                assert_eq!(params[1]["requireCanonical"], json!(true));
+                let hash: B256 = params[1]["blockHash"]
+                    .as_str()
+                    .expect("outbox read not pinned to a block hash")
+                    .parse()
+                    .unwrap();
+                if !chain.canonical.contains(&hash) {
+                    return Err((-32000, "block is not canonical".into()));
+                }
+                let (_, _, nonce) = chain.blocks[&hash];
+                Ok(json!(format!("{:#066x}", nonce)))
             }
-            let nonce = if params[1] == json!("0x0") {
-                before
-            } else {
-                after
-            };
-            return Ok(json!(format!("{:#066x}", nonce)));
+            "eth_getBlockByHash" => {
+                let hash: B256 = params[0].as_str().unwrap().parse().unwrap();
+                Ok(match chain.blocks.get(&hash) {
+                    Some((number, parent, _)) => json!({
+                        "hash": format!("{hash:#x}"),
+                        "number": format!("{number:#x}"),
+                        "parentHash": format!("{parent:#x}"),
+                    }),
+                    None => Value::Null,
+                })
+            }
+            "eth_getTransactionReceipt" => {
+                let Some(raw) = sent.lock().unwrap().last().cloned() else {
+                    return Ok(Value::Null);
+                };
+                let mut receipt = zone_receipt(&raw, "0x1", json!([]));
+                receipt["blockHash"] = json!(format!("{:#x}", chain.receipt_block));
+                Ok(receipt)
+            }
+            _ => {
+                drop(chain);
+                inner(method, params)
+            }
         }
-        inner(method, params)
     })
 }
 
@@ -920,7 +994,7 @@ async fn test_withdrawal_whose_block_added_too_many_withdrawals_is_outcome_unkno
 }
 
 #[tokio::test]
-async fn test_resumed_wait_reuses_derived_sender_tags_without_reading_the_zone() {
+async fn test_resumed_wait_reuses_derived_sender_tags_without_reading_the_outbox() {
     let sent = Arc::new(Mutex::new(Vec::new()));
     let fail_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (zone_url, _) = spawn_rpc(redacting_zone_handler(
@@ -1008,19 +1082,210 @@ async fn test_settlement_pending_error_carries_every_candidate_sender_tag() {
     );
 }
 
-/// A Zone RPC whose outbox reports `before` as its `lastFallbackNonce` at
-/// block 9 and `after` at block 10.
-async fn outbox_rpc(before: u64, after: u64) -> alloy::providers::RootProvider<TempoNetwork> {
-    let (url, _) = spawn_rpc(Arc::new(move |method, params| {
-        if method != "eth_call" {
-            return Err((-32000, format!("unexpected {method}")));
+/// A Tempo RPC that settles the last withdrawal sent to the Zone under
+/// fallback nonce 7, and whose settlement wait gives up at once.
+async fn provider_settling_nonce_7(
+    zone_url: String,
+    sent: Arc<Mutex<Vec<String>>>,
+) -> TempoProvider {
+    let settlement = Arc::new(Mutex::new((true, B256::repeat_byte(0x33))));
+    let (tempo_url, _) = settling_tempo_rpc(sent, settlement).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap()
+}
+
+/// Moves the withdrawal to block 0x22 (number 2), whose outbox added nonce 7,
+/// and drops block `RECEIPT_BLOCK` from the canonical chain.
+fn reinclude_at_nonce_7(chain: &Mutex<ZoneChain>) {
+    let mut chain = chain.lock().unwrap();
+    let parent = B256::repeat_byte(0x21);
+    let block = B256::repeat_byte(0x22);
+    chain.blocks.insert(parent, (1, RECEIPT_PARENT, 6));
+    chain.blocks.insert(block, (2, parent, 7));
+    chain.canonical = vec![RECEIPT_PARENT, parent, block];
+    chain.receipt_block = block;
+}
+
+#[tokio::test]
+async fn test_rederives_sender_tags_when_the_withdrawal_moves_to_another_block() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    // The send's receipt names a block whose outbox added nonce 4, so the
+    // derived tag is not the one that settles.
+    let chain = Arc::new(Mutex::new(ZoneChain::new(3, 4)));
+    let (zone_url, _) = spawn_rpc(redacting_zone_handler_on(
+        sent.clone(),
+        chain.clone(),
+        Arc::default(),
+    ))
+    .await;
+    let provider = provider_settling_nonce_7(zone_url, sent.clone()).await;
+    let challenge = challenge_with(json!({}), None);
+
+    let hash = || tx_hash(sent.lock().unwrap().last().unwrap());
+    match provider.pay(&challenge).await.unwrap_err() {
+        MppError::ZoneSettlementPending { sender_tags, .. } => assert_eq!(
+            sender_tags,
+            [format!(
+                "{:#x}",
+                zone::sender_tag(payer().address(), hash(), 4)
+            )]
+        ),
+        error => panic!("expected ZoneSettlementPending, got {error}"),
+    }
+    // A reorg includes the transaction in another block: the retry follows
+    // its receipt there rather than reusing the tags of the first block.
+    reinclude_at_nonce_7(&chain);
+    let credential = provider.pay(&challenge).await.unwrap();
+    assert_eq!(
+        credential.charge_payload().unwrap().zone_sender_tag(),
+        Some(format!("{:#x}", sent_sender_tag(&sent)).as_str())
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_sender_tag_read_of_a_block_no_longer_canonical_is_retried_from_its_new_block() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let chain = Arc::new(Mutex::new(ZoneChain::new(6, 7)));
+    // The send's block left the canonical chain before its state was read,
+    // and the receipt lookup does not show the new block yet.
+    chain.lock().unwrap().canonical = vec![RECEIPT_PARENT];
+    let (zone_url, _) = spawn_rpc(redacting_zone_handler_on(
+        sent.clone(),
+        chain.clone(),
+        Arc::default(),
+    ))
+    .await;
+    let provider = provider_settling_nonce_7(zone_url, sent.clone()).await;
+    let challenge = challenge_with(json!({}), None);
+
+    for _ in 0..2 {
+        match provider.pay(&challenge).await.unwrap_err() {
+            MppError::ZoneSettlementPending { sender_tags, .. } => {
+                assert!(sender_tags.is_empty());
+            }
+            error => panic!("expected ZoneSettlementPending, got {error}"),
         }
-        let nonce = if params[1] == json!("0x9") {
-            before
-        } else {
-            after
-        };
-        Ok(json!(format!("{:#066x}", nonce)))
+    }
+    reinclude_at_nonce_7(&chain);
+    let credential = provider.pay(&challenge).await.unwrap();
+    assert_eq!(
+        credential.charge_payload().unwrap().zone_sender_tag(),
+        Some(format!("{:#x}", sent_sender_tag(&sent)).as_str())
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_receipt_lookup_that_proves_nothing_keeps_the_derived_sender_tags() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let chain = Arc::new(Mutex::new(ZoneChain::new(6, 7)));
+    let fail_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handler = redacting_zone_handler_on(sent.clone(), chain.clone(), fail_reads.clone());
+    // Once the tags are read, the Zone no longer answers receipt lookups.
+    let (zone_url, zone_calls) = {
+        let fail_reads = fail_reads.clone();
+        spawn_rpc(Arc::new(move |method, params| {
+            if method == "eth_getTransactionReceipt" && fail_reads.load(Ordering::SeqCst) {
+                return Ok(Value::Null);
+            }
+            handler(method, params)
+        }))
+        .await
+    };
+    let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tempo_url, _) = {
+        let sent = sent.clone();
+        let settled = settled.clone();
+        spawn_rpc(Arc::new(move |method, _| match method {
+            "eth_chainId" => Ok(json!("0xa5bf")),
+            "eth_blockNumber" => Ok(json!("0x10")),
+            "eth_getLogs" if settled.load(Ordering::SeqCst) => Ok(json!([settlement_log(
+                sent_sender_tag(&sent),
+                true,
+                B256::repeat_byte(0x33)
+            )])),
+            "eth_getLogs" => Ok(json!([])),
+            _ => Err((-32000, format!("l1: {method}"))),
+        }))
+        .await
+    };
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap();
+    let challenge = challenge_with(json!({}), None);
+
+    assert!(matches!(
+        provider.pay(&challenge).await.unwrap_err(),
+        MppError::ZoneSettlementPending { .. }
+    ));
+    fail_reads.store(true, Ordering::SeqCst);
+    settled.store(true, Ordering::SeqCst);
+    provider.pay(&challenge).await.unwrap();
+    let calls = zone_calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| *call == "eth_getTransactionReceipt")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_sender_tag_candidates_refuses_a_block_header_for_another_block() {
+    let (url, _) = spawn_rpc(Arc::new(|method, _| match method {
+        "eth_getBlockByNumber" => Ok(json!({
+            "hash": format!("{:#x}", B256::repeat_byte(0xaa)),
+            "number": "0xb",
+            "parentHash": format!("{:#x}", B256::repeat_byte(0x99)),
+        })),
+        _ => Err((-32000, format!("unexpected {method}"))),
+    }))
+    .await;
+    let zone = super::super::rpc_provider(url.parse().unwrap(), None);
+    let error = sender_tag_candidates(&zone, 10, Address::ZERO, B256::repeat_byte(0xab))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("invalid block header"),
+        "{error}"
+    );
+}
+
+/// A Zone RPC whose outbox reports `before` as its `lastFallbackNonce` at
+/// block 9 and `after` at block 10, answering outbox reads only by the
+/// blocks' hashes.
+async fn outbox_rpc(before: u64, after: u64) -> alloy::providers::RootProvider<TempoNetwork> {
+    let parent = format!("{:#x}", B256::repeat_byte(0x99));
+    let block = format!("{:#x}", B256::repeat_byte(0xaa));
+    let (url, _) = spawn_rpc(Arc::new(move |method, params| match method {
+        "eth_getBlockByNumber" if params[0] == json!("0xa") => Ok(json!({
+            "hash": block,
+            "number": "0xa",
+            "parentHash": parent,
+        })),
+        "eth_call" => {
+            // A read by height could come from another history.
+            let pinned = params[1]["blockHash"].as_str();
+            if pinned == Some(parent.as_str()) {
+                Ok(json!(format!("{:#066x}", before)))
+            } else if pinned == Some(block.as_str()) {
+                Ok(json!(format!("{:#066x}", after)))
+            } else {
+                Err((-32000, format!("unpinned read at {}", params[1])))
+            }
+        }
+        _ => Err((-32000, format!("unexpected {method}"))),
     }))
     .await;
     super::super::rpc_provider(url.parse().unwrap(), None)
@@ -1879,7 +2144,7 @@ async fn test_withdrawal_past_its_redemption_window_is_never_paid_again() {
             origin: Some("https://api.example.com".into()),
             terms: zone.terms_key(&expired, &signer, &signing_mode),
             request: OnceCell::new(),
-            sender_tags: Mutex::default(),
+            derived: Mutex::default(),
             redeemed_late: Mutex::default(),
             waiters: Default::default(),
             sending: Default::default(),
@@ -1927,12 +2192,12 @@ fn insert_withdrawal(
         origin: Some(origin.into()),
         terms: zone.terms_key(challenge, &signer, &signing_mode),
         request: OnceCell::new_with(Some(Ok(SentWithdrawal {
-            block_number: 1,
+            block_hash: Some(RECEIPT_BLOCK),
             sender: payer().address(),
             transaction_hash: B256::ZERO,
             sender_tags: Some(vec![sender_tag]),
         }))),
-        sender_tags: Mutex::default(),
+        derived: Mutex::default(),
         redeemed_late: Mutex::default(),
         waiters: Default::default(),
         sending: Default::default(),
@@ -2251,7 +2516,7 @@ async fn test_payment_under_another_origin_keeps_an_earlier_withdrawal() {
         origin: Some("https://api.example.com".into()),
         terms: zone.terms_key(&earlier, &signer, &signing_mode),
         request: OnceCell::new(),
-        sender_tags: Mutex::default(),
+        derived: Mutex::default(),
         redeemed_late: Mutex::default(),
         waiters: Default::default(),
         sending: Default::default(),
@@ -2289,7 +2554,7 @@ async fn test_withdrawal_being_sent_is_never_forgotten_as_abandoned() {
         origin: None,
         terms: zone.terms_key(&challenge, &signer, &signing_mode),
         request: OnceCell::new(),
-        sender_tags: Mutex::default(),
+        derived: Mutex::default(),
         redeemed_late: Mutex::default(),
         waiters: Default::default(),
         sending: std::sync::atomic::AtomicBool::new(true),
