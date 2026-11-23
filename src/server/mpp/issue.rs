@@ -409,6 +409,7 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         }))
     }
 

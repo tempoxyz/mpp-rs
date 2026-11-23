@@ -155,6 +155,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let tx_bytes = vec![0x76, 0xab, 0xcd];
@@ -187,6 +188,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let from: Address = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2"
@@ -215,6 +217,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let tx_bytes = vec![0x76, 0xab, 0xcd, 0xef];
@@ -247,6 +250,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let cred = build_charge_credential(&challenge, &[0x76], 42431, Address::ZERO);
@@ -417,6 +421,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let cred = build_charge_credential(&challenge, &[], 42431, Address::ZERO);
@@ -443,6 +448,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let from: Address = "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2"

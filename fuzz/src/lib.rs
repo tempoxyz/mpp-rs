@@ -283,6 +283,7 @@ impl ChallengeInput {
             digest: self.digest.as_ref().map(DigestInput::build),
             opaque: self.opaque.as_ref().map(OpaqueInput::build),
             header: self.header.as_ref().map(HeaderInput::build),
+            legacy_unicode_escape: false,
         }
     }
 
@@ -322,6 +323,41 @@ pub fn quoted_values(challenge: &PaymentChallenge) -> Vec<&str> {
     ];
     values.extend(optional.into_iter().flatten());
     values
+}
+
+/// Whether `c` can be written in a quoted-string, as itself or after a
+/// backslash: HTAB and printable ASCII.
+pub fn is_quoted_text(c: char) -> bool {
+    c == '\t' || (' '..='~').contains(&c)
+}
+
+/// Whether every quoted value but `description` is quoted text. The
+/// formatter refuses other characters in those values, which a quoted-pair
+/// can't carry; it writes them in `description` as `\uXXXX`.
+pub fn has_quoted_text_values(challenge: &PaymentChallenge) -> bool {
+    let mut bound = challenge.clone();
+    bound.description = None;
+    quoted_values(&bound)
+        .iter()
+        .all(|value| value.chars().all(is_quoted_text))
+}
+
+/// The challenge a parser reads back from the formatted header: each UTF-16
+/// unit of `description` that isn't quoted text is written as `\uXXXX`,
+/// which a parser reads as the quoted-pair text `uXXXX`.
+pub fn read_back(challenge: &PaymentChallenge) -> PaymentChallenge {
+    let mut read = challenge.clone();
+    read.description = challenge.description.as_deref().map(|description| {
+        let mut text = String::with_capacity(description.len());
+        for unit in description.encode_utf16() {
+            match char::from_u32(u32::from(unit)) {
+                Some(c) if is_quoted_text(c) => text.push(c),
+                _ => text.push_str(&format!("u{unit:04x}")),
+            }
+        }
+        text
+    });
+    read
 }
 
 /// Whether a received challenge or Credential echo may carry this `header`

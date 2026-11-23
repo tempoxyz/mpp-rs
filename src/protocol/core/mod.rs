@@ -77,6 +77,8 @@ mod receipt;
 pub mod types;
 
 // Re-export all public types
+#[cfg(all(feature = "server", any(feature = "tempo", feature = "stripe")))]
+pub(crate) use auth_params::validate_realm;
 #[cfg(feature = "server")]
 pub(crate) use binding::constant_time_eq;
 #[cfg(any(feature = "tempo", all(feature = "server", feature = "stripe")))]
@@ -89,10 +91,10 @@ pub use challenge::{ChallengeEcho, PaymentChallenge};
 pub use credential::{PaymentCredential, PaymentPayload};
 pub use headers::{
     extract_payment_scheme, format_authorization, format_receipt, format_www_authenticate,
-    format_www_authenticate_many, parse_authorization, parse_receipt, parse_www_authenticate,
-    parse_www_authenticate_all, parse_www_authenticate_all_bytes, with_private_cache_control,
-    AUTHORIZATION_HEADER, PAYMENT_AUTHORIZATION_HEADER, PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME,
-    WWW_AUTHENTICATE_HEADER,
+    format_www_authenticate_many, parse_authorization, parse_payable_challenges, parse_receipt,
+    parse_www_authenticate, parse_www_authenticate_all, parse_www_authenticate_all_bytes,
+    with_private_cache_control, AUTHORIZATION_HEADER, PAYMENT_AUTHORIZATION_HEADER,
+    PAYMENT_RECEIPT_HEADER, PAYMENT_SCHEME, WWW_AUTHENTICATE_HEADER,
 };
 pub use receipt::{extract_tx_hash, Receipt};
 

@@ -66,6 +66,27 @@ fn test_create_stripe_rejects_short_secret_key() {
 
 #[cfg(feature = "stripe")]
 #[test]
+fn test_create_stripe_rejects_non_ascii_realm() {
+    use crate::server::{stripe, StripeConfig};
+
+    let err = Mpp::create_stripe(
+        stripe(StripeConfig {
+            secret_key: "sk_test_mock",
+            network_id: "test-net",
+            payment_method_types: &["card"],
+            currency: "usd",
+            decimals: 2,
+        })
+        .realm("Caf\u{e9} API")
+        .secret_key(&"k".repeat(32)),
+    )
+    .err()
+    .expect("non-ASCII realm");
+    assert!(err.to_string().contains("Invalid realm"), "{err}");
+}
+
+#[cfg(feature = "stripe")]
+#[test]
 fn test_stripe_challenge_has_method_details() {
     let mpp = test_stripe_mpp();
     let challenge = mpp.stripe_charge("1.00").unwrap();

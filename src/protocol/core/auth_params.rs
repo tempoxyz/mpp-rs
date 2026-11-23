@@ -52,6 +52,11 @@ pub(super) struct Tokenizer<'a> {
     after_comma: bool,
     /// Whether the auth-param value read last was a quoted-string.
     quoted: bool,
+    /// Whether the value read last was quoted and held a quoted-pair `\u`
+    /// followed by four hex digits: the `\uXXXX` escape that older servers
+    /// wrote for characters above U+00FF, which a quoted-pair reads as
+    /// `uXXXX`.
+    unicode_escape: bool,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -64,6 +69,7 @@ impl<'a> Tokenizer<'a> {
             name_equals: None,
             after_comma: false,
             quoted: false,
+            unicode_escape: false,
         }
     }
 
@@ -77,6 +83,12 @@ impl<'a> Tokenizer<'a> {
     /// rather than a token.
     pub(super) fn quoted(&self) -> bool {
         self.quoted
+    }
+
+    /// Whether the auth-param value returned last was quoted and held a
+    /// legacy `\uXXXX` escape.
+    pub(super) fn read_unicode_escape(&self) -> bool {
+        self.unicode_escape
     }
 
     /// The next token if it is an auth-param. Any other token is left for
@@ -117,6 +129,7 @@ impl<'a> Tokenizer<'a> {
     /// Reads the value of an auth-param: a quoted-string, or the text up to a
     /// comma or whitespace.
     fn value(&mut self) -> Result<Cow<'a, str>> {
+        self.unicode_escape = false;
         let bytes = self.input.as_bytes();
         let start = self.seek(self.pos, |byte| !byte.is_ascii_whitespace());
         self.quoted = bytes.get(start) == Some(&b'"');
@@ -134,11 +147,17 @@ impl<'a> Tokenizer<'a> {
                 Some(b'"') => break,
                 Some(b'\\') => {
                     unescaped.push_str(&self.input[segment_start..i]);
+                    // A quoted-pair (RFC 9110 §5.6.4) stands for the character
+                    // after the backslash, so \u2014 is the text "u2014".
                     i += 1;
-                    if let Some((decoded, next)) = read_unicode_escape(self.input, i) {
-                        unescaped.push(decoded);
-                        i = next;
-                    } else if let Some(escaped) = self.input[i..].chars().next() {
+                    if bytes.get(i) == Some(&b'u')
+                        && bytes
+                            .get(i + 1..i + 5)
+                            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+                    {
+                        self.unicode_escape = true;
+                    }
+                    if let Some(escaped) = self.input[i..].chars().next() {
                         unescaped.push(escaped);
                         i += escaped.len_utf8();
                     }
@@ -252,58 +271,49 @@ pub(super) fn starts_with_payment_scheme(input: &str) -> bool {
     matches!(Tokenizer::new(input).next(), Some(Ok(token)) if token.is_payment_scheme())
 }
 
-fn read_unicode_escape(input: &str, at: usize) -> Option<(char, usize)> {
-    let (unit, next) = read_escaped_code_unit(input, at)?;
-
-    if !(0xD800..=0xDFFF).contains(&unit) {
-        return char::from_u32(u32::from(unit)).map(|decoded| (decoded, next));
-    }
-
-    if (0xD800..=0xDBFF).contains(&unit) && input.as_bytes().get(next) == Some(&b'\\') {
-        if let Some((low, after)) = read_escaped_code_unit(input, next + 1) {
-            if (0xDC00..=0xDFFF).contains(&low) {
-                let code =
-                    0x1_0000 + ((u32::from(unit) - 0xD800) << 10) + (u32::from(low) - 0xDC00);
-                return char::from_u32(code).map(|decoded| (decoded, after));
-            }
-        }
-    }
-
-    Some((char::REPLACEMENT_CHARACTER, next))
-}
-
-fn read_escaped_code_unit(input: &str, at: usize) -> Option<(u16, usize)> {
-    if input.as_bytes().get(at) != Some(&b'u') {
-        return None;
-    }
-    let digits = input.get(at + 1..at + 5)?;
-    if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    u16::from_str_radix(digits, 16)
-        .ok()
-        .map(|unit| (unit, at + 5))
-}
-
 /// Escape a string for use in a quoted-string header value.
 ///
-/// Only printable ASCII and HTAB are emitted as-is. Everything else is written
-/// as `\uXXXX` UTF-16 code units, so the result is always a valid header value.
-/// Rejects CRLF to prevent header injection attacks.
+/// Only printable ASCII and HTAB can be written: a quoted-pair (RFC 9110
+/// §5.6.4) escapes a single character, so nothing else survives a round trip.
+/// Rejects other characters, such as CR and LF, which would allow header
+/// injection, and text that a parser would read back differently.
 pub(super) fn escape_quoted_value(s: &str) -> Result<String> {
-    if s.contains('\r') || s.contains('\n') {
-        return Err(MppError::invalid_challenge_reason(
-            "Header value contains invalid CRLF characters",
-        ));
+    reject_line_breaks(s)?;
+    if let Some(c) = s.chars().find(|c| !is_quoted_text(*c)) {
+        return Err(MppError::invalid_challenge_reason(format!(
+            "Header value contains a character outside printable ASCII: {:?}",
+            c
+        )));
     }
+    Ok(escape_quoted_text(s))
+}
+
+/// Check that a server realm can be written into a Challenge header.
+///
+/// The realm is bound into the Challenge ID, so [`escape_quoted_value`]
+/// refuses it on every request when it holds a character outside printable
+/// ASCII; checking it once when the server is configured reports that early.
+#[cfg(all(feature = "server", any(feature = "tempo", feature = "stripe")))]
+pub(crate) fn validate_realm(realm: &str) -> Result<()> {
+    escape_quoted_value(realm).map(|_| ()).map_err(|_| {
+        MppError::InvalidConfig(format!(
+            "Invalid realm {realm:?}: a realm must be printable ASCII, since a Challenge header can't carry other characters."
+        ))
+    })
+}
+
+/// Escape free text, such as a description, for a quoted-string header value.
+///
+/// Like [`escape_quoted_value`], but writes any other character as `\uXXXX`
+/// UTF-16 code units instead of rejecting it, as mppx does, so a server can
+/// always send its Challenge. Parsers read the escape as the text `uXXXX`, so
+/// use this only for values that are not bound into the Challenge ID.
+pub(super) fn escape_quoted_description(s: &str) -> Result<String> {
+    reject_line_breaks(s)?;
     let mut escaped = String::with_capacity(s.len());
     for unit in s.encode_utf16() {
-        match unit {
-            0x005c => escaped.push_str("\\\\"),
-            0x0022 => escaped.push_str("\\\""),
-            0x0009 | 0x0020..=0x007e => {
-                escaped.push(char::from_u32(u32::from(unit)).expect("ASCII is valid Unicode"))
-            }
+        match char::from_u32(u32::from(unit)) {
+            Some(c) if is_quoted_text(c) => push_quoted_char(&mut escaped, c),
             _ => {
                 use std::fmt::Write as _;
                 write!(escaped, "\\u{unit:04x}").expect("writing to String cannot fail");
@@ -311,6 +321,36 @@ pub(super) fn escape_quoted_value(s: &str) -> Result<String> {
         }
     }
     Ok(escaped)
+}
+
+fn reject_line_breaks(s: &str) -> Result<()> {
+    if s.contains('\r') || s.contains('\n') {
+        return Err(MppError::invalid_challenge_reason(
+            "Header value contains invalid CRLF characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `c` can appear in a quoted-string, either as itself or after a
+/// backslash.
+fn is_quoted_text(c: char) -> bool {
+    c == '\t' || (' '..='~').contains(&c)
+}
+
+fn escape_quoted_text(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        push_quoted_char(&mut escaped, c);
+    }
+    escaped
+}
+
+fn push_quoted_char(escaped: &mut String, c: char) {
+    if matches!(c, '\\' | '"') {
+        escaped.push('\\');
+    }
+    escaped.push(c);
 }
 
 #[cfg(test)]
@@ -430,6 +470,17 @@ mod tests {
         assert!(matches!(plain, Cow::Borrowed("x, Payment y")));
         let (_, escaped) = tokens.param().unwrap().unwrap();
         assert_eq!(escaped, "\"q\" \\ \u{e9} \u{1f600}");
+        assert!(tokens.next().is_none());
+    }
+
+    #[test]
+    fn test_tokenizer_reads_quoted_pairs() {
+        // Every quoted-pair drops its backslash; \uXXXX is not decoded.
+        let input = r#"Payment a="\u2014 \ud83d\ude00 \\u0041 \x\"""#;
+        let mut tokens = Tokenizer::new(input);
+        assert_eq!(tokens.next().unwrap().unwrap(), Scheme("Payment"));
+        let (_, value) = tokens.param().unwrap().unwrap();
+        assert_eq!(value, r#"u2014 ud83dude00 \u0041 x""#);
         assert!(tokens.next().is_none());
     }
 
