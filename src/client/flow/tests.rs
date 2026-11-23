@@ -535,7 +535,7 @@ async fn only_unsupported_credential_header_offer_is_never_paid() {
 fn www_authenticate_legacy_escape(id: &str, escape: &str) -> String {
     www_authenticate(id, "tempo", "charge").replace(
         r#"realm="127.0.0.1""#,
-        &format!(r#"realm="caf{escape}.127.0.0.1""#),
+        &format!(r#"realm="shop{escape}.127.0.0.1""#),
     )
 }
 
