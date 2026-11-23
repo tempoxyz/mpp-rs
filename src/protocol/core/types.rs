@@ -275,15 +275,28 @@ pub fn base64url_encode(data: &[u8]) -> String {
 /// Decode a base64url string to bytes.
 ///
 /// Accepts both URL-safe (`-`, `_`) and standard (`+`, `/`) alphabets,
-/// with or without `=` padding. This follows Postel's law — be strict in
-/// what you produce (see [`base64url_encode`]) but lenient in what you
+/// with or without trailing `=` padding. `=` anywhere else, or padding
+/// where no bits are missing, is rejected. This follows Postel's law — be
+/// strict in what you produce (see [`base64url_encode`]) but lenient in what you
 /// accept — and aligns with the mppx TypeScript SDK which also accepts
 /// both variants.
 pub fn base64url_decode(input: &str) -> Result<Vec<u8>> {
-    // Normalize standard base64 to URL-safe alphabet and strip padding.
-    let normalized: String = input
+    // Padding may only end the input, as in mppx: `=` anywhere else is not
+    // padding and must not be dropped.
+    let unpadded = input
+        .strip_suffix("==")
+        .or_else(|| input.strip_suffix('='))
+        .unwrap_or(input);
+    if unpadded.contains('=') || (unpadded.len() < input.len() && unpadded.len().is_multiple_of(4))
+    {
+        return Err(MppError::InvalidBase64Url(
+            "Invalid base64url: '=' is only allowed as trailing padding".to_string(),
+        ));
+    }
+
+    // Normalize standard base64 to the URL-safe alphabet.
+    let normalized: String = unpadded
         .chars()
-        .filter(|c| *c != '=')
         .map(|c| match c {
             '+' => '-',
             '/' => '_',
@@ -487,6 +500,15 @@ mod tests {
         assert!(standard.contains('=') || standard.contains('+') || standard.contains('/'));
         let decoded = base64url_decode(&standard).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_base64url_decode_rejects_misplaced_padding() {
+        for input in ["=Ace0", "Ac=E", "A=A=", "AA===", "=", "e30=e30", "=e30"] {
+            assert!(base64url_decode(input).is_err(), "{input}");
+        }
+        assert_eq!(base64url_decode("AA==").unwrap(), [0]);
+        assert_eq!(base64url_decode("AA=").unwrap(), [0]);
     }
 
     #[test]
