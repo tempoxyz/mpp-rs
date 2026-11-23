@@ -128,3 +128,48 @@ pub struct ChargeOptions<'a> {
     /// Framework adapter route/resource/query scope.
     pub mppx_scope: Option<&'a serde_json::Value>,
 }
+
+/// Runs `f` and returns the level and message of each `tracing` event it
+/// emits on this thread.
+#[cfg(test)]
+pub(crate) fn capture_logs(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span;
+
+    type Events = Arc<Mutex<Vec<(tracing::Level, String)>>>;
+    struct Capture(Events);
+    struct Message(String);
+    impl Visit for Message {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    let events = Events::default();
+    tracing::subscriber::with_default(Capture(Arc::clone(&events)), f);
+    let events = events.lock().unwrap().clone();
+    events
+}

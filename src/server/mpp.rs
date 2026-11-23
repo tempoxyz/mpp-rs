@@ -109,6 +109,20 @@ fn shared_runtime(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option
         .map(|name| format!("{name} is set"))
 }
 
+/// Reads a production or platform marker for [`Mpp::create`].
+///
+/// Library unit tests read none, so they behave the same whatever the host's
+/// environment; they pass markers to `Mpp::create_with_env` instead.
+#[cfg(all(feature = "tempo", not(test)))]
+fn process_env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
+}
+
+#[cfg(all(feature = "tempo", test))]
+fn process_env(_name: &str) -> Option<std::ffi::OsString> {
+    None
+}
+
 /// Why the charge method must not use the default in-memory replay store in
 /// production or on a multi-instance platform, where a credential accepted by
 /// one instance could be accepted again by another, or `None` when it may.
@@ -503,9 +517,10 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
     /// Without a `store` in production or on a multi-instance platform (see
     /// [`TempoBuilder::store`](super::TempoBuilder::store)), the handler is
     /// still created, so it can serve sessions, but issuing or verifying a
-    /// charge returns an error.
+    /// charge returns an error, and the refusal is logged at warn level with
+    /// [`tracing`](https://docs.rs/tracing).
     pub fn create(builder: super::TempoBuilder) -> Result<Self> {
-        Self::create_with_env(builder, |name| std::env::var_os(name))
+        Self::create_with_env(builder, process_env)
     }
 
     /// [`create()`](Self::create), reading production and platform markers
@@ -515,6 +530,9 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
         lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
         let charge_store_refusal = default_store_refusal(&builder, lookup);
+        if let Some(refusal) = &charge_store_refusal {
+            tracing::warn!("mpp: charges will be refused: {refusal}");
+        }
         builder
             .chain_id
             .get_or_insert_with(|| super::tempo::chain_id_from_rpc_url(&builder.rpc_url));

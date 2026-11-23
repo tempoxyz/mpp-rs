@@ -229,15 +229,17 @@ impl TempoBuilder {
     /// included, also makes zero-amount proof credentials single-use per
     /// challenge.
     ///
-    /// If omitted, in production (`MPP_ENV` or `NODE_ENV` is `production`)
-    /// and on multi-instance platforms (such as AWS Lambda, Cloud Run, Fly.io,
-    /// Heroku, Railway, Render or Vercel), a handler from
-    /// [`Mpp::create()`](super::Mpp::create) refuses to issue or verify
-    /// charges (mppx refuses to start), unless a relay is configured.
-    /// Sessions, whose method has its own store, are unaffected. Elsewhere,
-    /// such as local development and tests, it falls back to an in-memory
-    /// store. Pass `Arc::new(MemoryStore::new())` explicitly to accept
-    /// replay protection scoped to one instance.
+    /// If omitted, a handler from [`Mpp::create()`](super::Mpp::create)
+    /// logs a warning and refuses to issue or verify charges (mppx refuses to
+    /// start) when `MPP_ENV` or `NODE_ENV` is `production` or one of these
+    /// platform variables is set: `AWS_LAMBDA_FUNCTION_NAME`,
+    /// `DENO_DEPLOYMENT_ID`, `DYNO`, `FLY_APP_NAME`, `K_SERVICE`, `NETLIFY`,
+    /// `RAILWAY_ENVIRONMENT`, `RENDER` or `VERCEL`, unless a relay is
+    /// configured. Sessions, whose method has its own store, are unaffected.
+    /// Otherwise it falls back to an in-memory store, so other multi-instance
+    /// deployments, such as Kubernetes replicas, are not detected and must
+    /// pass a shared store themselves. Pass `Arc::new(MemoryStore::new())`
+    /// explicitly to accept replay protection scoped to one instance.
     pub fn store(mut self, store: std::sync::Arc<dyn crate::store::Store>) -> Self {
         self.store = Some(store);
         self.store_configured = true;

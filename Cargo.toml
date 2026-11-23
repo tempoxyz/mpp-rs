@@ -35,7 +35,7 @@ default = ["reqwest-default-tls"]
 
 # Side selection
 client = ["dep:reqwest"]
-server = ["tokio", "futures-core", "async-stream", "http-types"]
+server = ["tokio", "futures-core", "async-stream", "http-types", "dep:tracing"]
 
 # Method implementations
 evm = ["alloy", "hex"]
@@ -150,6 +150,7 @@ base64 = "0.22"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 alloy = { version = "2.1.0", default-features = false, features = [
   "contract",
   "provider-http",

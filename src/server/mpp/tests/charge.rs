@@ -309,6 +309,39 @@ async fn test_mpp_create_refuses_charges_with_the_default_store_in_production() 
     assert!(stored.charge("1.00").is_ok());
 }
 
+/// The refusal is logged when the handler is created, so an operator sees it
+/// before the first charge fails.
+#[cfg(feature = "tempo")]
+#[test]
+fn test_mpp_create_logs_the_default_store_refusal() {
+    let logs = crate::server::capture_logs(|| {
+        Mpp::create_with_env(store_test_builder(), vercel).unwrap();
+    });
+    assert!(
+        logs.iter()
+            .any(|(level, message)| *level == tracing::Level::WARN
+                && message.contains("tempo has no store configured")
+                && message.contains("VERCEL is set")),
+        "{logs:?}"
+    );
+
+    let memory: Arc<dyn crate::store::Store> = Arc::new(crate::store::MemoryStore::new());
+    let logs = crate::server::capture_logs(|| {
+        Mpp::create_with_env(store_test_builder(), |_| None).unwrap();
+        Mpp::create_with_env(store_test_builder().store(memory), vercel).unwrap();
+    });
+    assert!(logs.is_empty(), "{logs:?}");
+}
+
+/// Library tests build default-store handlers with `Mpp::create`, which reads
+/// no markers under test, so they pass whatever the host's environment.
+#[cfg(feature = "tempo")]
+#[test]
+fn test_mpp_create_ignores_the_host_environment_in_tests() {
+    let mpp = Mpp::create(store_test_builder()).unwrap();
+    assert!(mpp.charge("1.00").is_ok());
+}
+
 #[cfg(feature = "tempo")]
 #[test]
 fn test_mpp_create_requires_secret_key() {
