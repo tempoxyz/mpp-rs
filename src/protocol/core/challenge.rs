@@ -501,6 +501,20 @@ impl PaymentChallenge {
         })
     }
 
+    /// Refuse a Challenge flagged as carrying a legacy `\uXXXX` escape
+    /// ([`legacy_unicode_escape`](Self::legacy_unicode_escape)), without the
+    /// Credential size check [`ensure_payable`](Self::ensure_payable) adds.
+    /// Session voucher, top-up and close paths call it before signing.
+    pub(crate) fn ensure_not_legacy_escaped(&self) -> crate::error::Result<()> {
+        if self.legacy_unicode_escape {
+            return Err(crate::error::MppError::invalid_challenge(
+                self.id.clone(),
+                super::headers::LEGACY_UNICODE_ESCAPE_REASON,
+            ));
+        }
+        Ok(())
+    }
+
     /// Refuse a Challenge whose server escaped an auth-param it binds or
     /// echoes as a legacy `\uXXXX` escape
     /// ([`legacy_unicode_escape`](Self::legacy_unicode_escape)): no Credential
@@ -515,12 +529,7 @@ impl PaymentChallenge {
     ///
     /// [`MppError::is_legacy_unicode_escape`]: crate::MppError::is_legacy_unicode_escape
     pub fn ensure_payable(&self) -> crate::error::Result<()> {
-        if self.legacy_unicode_escape {
-            return Err(crate::error::MppError::invalid_challenge(
-                self.id.clone(),
-                super::headers::LEGACY_UNICODE_ESCAPE_REASON,
-            ));
-        }
+        self.ensure_not_legacy_escaped()?;
         // A Credential carries the echoed Challenge base64url-encoded. One
         // that can't fit the Authorization size servers read would be refused
         // after a pushed payment already moved funds.
