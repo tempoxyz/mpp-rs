@@ -282,15 +282,27 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
 }
 
 /// Like [`read_challenge`], and also whether a quoted value of an auth-param
-/// other than `description` held a legacy `\uXXXX` escape.
+/// the Challenge keeps, other than `description`, held a legacy `\uXXXX`
+/// escape.
 fn read_challenge_flagged(tokens: &mut Tokenizer<'_>) -> Result<(PaymentChallenge, bool)> {
     let mut params = HashMap::new();
     let mut unicode_escape = false;
     while let Some((name, value)) = tokens.param()? {
         // Auth-param names are case-insensitive (RFC 9110 §11.2).
         let key = name.to_ascii_lowercase();
-        // Every auth-param but `description` is bound by the challenge id.
-        unicode_escape |= key != "description" && tokens.read_unicode_escape();
+        // These are bound by the challenge id or echoed in the Credential;
+        // `description` and unrecognized auth-params are neither.
+        unicode_escape |= matches!(
+            key.as_str(),
+            "id" | "realm"
+                | "method"
+                | "intent"
+                | "request"
+                | "expires"
+                | "digest"
+                | "opaque"
+                | "header"
+        ) && tokens.read_unicode_escape();
         if key == "request" && value.len() > MAX_TOKEN_LEN {
             return Err(MppError::invalid_challenge_reason(format!(
                 "Request parameter exceeds maximum length of {} bytes",
@@ -427,7 +439,8 @@ pub fn parse_www_authenticate_all_bytes<'a>(
 /// paying one of them.
 ///
 /// Like [`parse_www_authenticate_all_bytes`], except that a challenge with a
-/// legacy `\uXXXX` escape in any auth-param but `description` is an error
+/// legacy `\uXXXX` escape in an auth-param it keeps, other than
+/// `description`, is an error
 /// (see [`MppError::is_legacy_unicode_escape`]). Servers that escaped
 /// characters above U+00FF that way (mppx 0.8.18 to 0.21.1, pympp 0.15 to
 /// 0.26, mpp-go 0.4 to 0.9.1) bound the decoded character in the challenge id,
@@ -1415,7 +1428,6 @@ mod tests {
             ("realm", r"merchant\u2014api.example.com"),
             ("realm", r"lower hex \u00E9 and \uabcd"),
             ("id", r"ch\u00e9"),
-            ("ext", r"x\u00e9"),
         ] {
             let header = test_header_with(param, value);
             let parsed = parse_www_authenticate(&header).unwrap();
@@ -1442,6 +1454,7 @@ mod tests {
             ("realm", r"short \u12 tail", "short u12 tail"),
             ("realm", r"not hex \u12g4", "not hex u12g4"),
             ("description", r"em dash \u2014", "api"),
+            ("ext", r"unbound \u00e9", "api"),
         ] {
             let header = test_header_with(param, value);
             let results = parse_payable_challenges([header.as_bytes()]);
