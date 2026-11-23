@@ -2130,6 +2130,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let override_addr: Address = "0x1111111111111111111111111111111111111111"
@@ -2159,6 +2160,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let result = resolve_escrow(&challenge, 42431, None).unwrap();
@@ -2189,6 +2191,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(resolve_escrow(&challenge, 42431, None).is_err());
@@ -2217,6 +2220,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert_eq!(
@@ -2246,6 +2250,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert_eq!(
@@ -2442,6 +2447,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let result = resolve_escrow(&challenge, 9999, None);
@@ -2468,6 +2474,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let payload = SessionCredentialPayload::Voucher {
@@ -2600,6 +2607,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert_eq!(resolve_chain_id(&challenge), 4217);
@@ -2625,6 +2633,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert_eq!(resolve_chain_id(&challenge), CHAIN_ID);
@@ -2648,6 +2657,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         // Match MPPx's default Tempo client: mainnet when no chain is advertised.
@@ -2678,6 +2688,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         // Invalid address in challenge should fall back to default
@@ -2705,6 +2716,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let override_addr: Address = "0x3333333333333333333333333333333333333333"
@@ -2763,6 +2775,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let payload = SessionCredentialPayload::Voucher {
@@ -2803,6 +2816,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
         let payer: Address = "0x0000000000000000000000000000000000000099"
             .parse()
@@ -2988,6 +3002,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         for allow_custom_escrow in [false, true] {
