@@ -71,6 +71,8 @@ identity-tempo-id = [
 identity-attestation = ["identity", "dep:reqwest", "dep:ed25519-dalek"]
 # Email OTP identity attestations (requires identity-attestation)
 identity-email-otp = ["identity-attestation"]
+# Persona KYC identity: inquiries, a payment check and wallet linking (requires identity)
+identity-persona = ["identity", "evm", "dep:reqwest"]
 
 # Utilities
 utils = ["hex"]

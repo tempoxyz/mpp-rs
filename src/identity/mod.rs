@@ -13,7 +13,8 @@
 //! - On a client, a [`Prover`](client::Prover) adds one identity protocol to
 //!   outbound requests, and [`ChargeClient::with_identity`](crate::client::ChargeClient::with_identity)
 //!   applies provers to every attempt of a paid request.
-//! - [`ext`] holds identity providers: [Tempo ID](ext::tempo_id) so far.
+//! - [`ext`] holds identity providers, such as Tempo ID, email OTP and
+//!   Persona KYC.
 //!
 //! A rejected identity has one of four fixed statuses ([`RejectionStatus`]),
 //! each with one HTTP status code: `missing` and `invalid` (401),
