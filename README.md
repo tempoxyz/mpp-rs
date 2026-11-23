@@ -22,7 +22,7 @@ Rust SDK for the [**Machine Payments Protocol**](https://mpp.dev)
 [![Crates.io](https://img.shields.io/crates/v/mpp.svg)](https://crates.io/crates/mpp)
 [![License](https://img.shields.io/crates/l/mpp.svg)](LICENSE-MIT)
 
-[MPP](https://mpp.dev/) (the Machine Payments Protocol) is an open standard for machine-to-machine payments, co-authored by [Tempo](https://tempo.xyz/) and [Stripe](https://stripe.com/). Paying for a resource over HTTP typically requires API keys, billing accounts, or checkout flows set up ahead of time. MPP lets any client, including an AI agent, an app, or a person, pay as part of the HTTP exchange using the native [`402 Payment Required` response](https://mpp.dev/protocol/http-402).
+[MPP](https://mpp.dev/) (the Machine Payments Protocol) is an open standard for machine-to-machine payments, co-authored by [Tempo](https://tempo.com/) and [Stripe](https://stripe.com/). Paying for a resource over HTTP typically requires API keys, billing accounts, or checkout flows set up ahead of time. MPP lets any client, including an AI agent, an app, or a person, pay as part of the HTTP exchange using the native [`402 Payment Required` response](https://mpp.dev/protocol/http-402).
 
 This crate is the [Rust SDK](https://mpp.dev/sdk/rust) for MPP. It supports developers building either side of a paid HTTP exchange: servers that charge for access with Tempo or Stripe, and clients that automatically handle 402 payment challenges. Typical scenarios include gating an API behind per-call payments or building an agent that pays for tools or data as it works. See the [quickstart](https://mpp.dev/quickstart) for server and client patterns.
 
@@ -166,7 +166,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 |---------|-------------|
 | `client` | Client-side payment providers (`PaymentProvider` trait, `Fetch` extension) |
 | `server` | Server-side payment verification (`ChargeMethod` trait) |
-| `tempo` | [Tempo](https://tempo.xyz) blockchain support (includes `evm`) |
+| `tempo` | [Tempo](https://tempo.com) blockchain support (includes `evm`) |
 | `stripe` | [Stripe](https://stripe.com) payment support via SPTs |
 | `evm` | Shared EVM utilities (Address, U256, parsing) |
 | `middleware` | reqwest-middleware support with `PaymentMiddleware` (implies `client`) |
