@@ -812,9 +812,10 @@ impl TempoZone {
         };
         // Derived until a read succeeds, then kept, so a failed read on the
         // Zone is retried with the challenge without withdrawing again: the
-        // withdrawal stays pending. A block whose state shows no withdrawal of
-        // this payer's, or too many, never changes, so that outcome is unknown
-        // rather than retryable.
+        // withdrawal stays pending, and the payment fails with the resumable
+        // settlement-pending error that HTTP and MCP flows retry. A block
+        // whose state shows no withdrawal of this payer's, or too many, never
+        // changes, so that outcome is unknown rather than retryable.
         let cached = sent.sender_tags.clone().or_else(|| {
             withdrawal
                 .sender_tags
@@ -825,37 +826,42 @@ impl TempoZone {
         let sender_tags = match cached {
             Some(sender_tags) => sender_tags,
             None => {
-                let derived = match self
-                    .bounded(derive_sender_tag_candidates(
+                // The send check reserved no time for this read, so it ends at
+                // the challenge's expiry: a read still running then fails as
+                // pending, and a retry resumes it, rather than the Credential
+                // going out late.
+                let read = within(
+                    remaining_bound(paid, self.rpc_timeout),
+                    derive_sender_tag_candidates(
                         &self.rpc_provider,
                         sent.block_number,
                         sent.sender,
                         sent.transaction_hash,
-                    ))
-                    .await
-                {
-                    Some(Ok(tags)) => Ok(tags),
+                    ),
+                )
+                .await;
+                match read {
+                    Some(Ok(derived)) => {
+                        *withdrawal
+                            .sender_tags
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(derived.clone());
+                        derived
+                    }
                     Some(Err(CandidateError::Refused(_))) => {
                         return Err(MppError::PaymentOutcomeUnknown {
                             transaction_hash: format!("{:#x}", sent.transaction_hash),
                         });
                     }
-                    Some(Err(CandidateError::Read(cause))) => Err(cause),
-                    None => Err(MppError::Http(
-                        "timed out reading the Zone outbox's lastFallbackNonce".into(),
-                    )),
+                    Some(Err(CandidateError::Read(_))) | None => {
+                        // Pin where the settlement search starts now, so a
+                        // retry that reads the tags much later still covers a
+                        // settlement made in between.
+                        self.pin_settlement_search(tempo, &withdrawal).await;
+                        return Err(pending_error(Vec::new()));
+                    }
                 }
-                .map_err(|cause| {
-                    MppError::Http(format!(
-                        "Zone withdrawal transaction {:#x} was sent, but its sender tag could not be read from the Zone. Retry the challenge to resume without withdrawing again. Cause: {cause}",
-                        sent.transaction_hash
-                    ))
-                })?;
-                *withdrawal
-                    .sender_tags
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(derived.clone());
-                derived
             }
         };
         let tag_strings = || {
@@ -1236,6 +1242,32 @@ impl TempoZone {
         }
     }
 
+    /// Records the first Tempo block a pending withdrawal's settlement search
+    /// covers, when none is recorded yet: the lookback window before Tempo's
+    /// latest block. The withdrawal was sent before now, so its settlement
+    /// can't precede that window. A failed read leaves it unrecorded.
+    async fn pin_settlement_search(
+        &self,
+        tempo: &impl Provider<TempoNetwork>,
+        withdrawal: &PendingWithdrawal,
+    ) {
+        let pinned = withdrawal
+            .settlement_cursor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if pinned {
+            return;
+        }
+        if let Some(Ok(latest)) = self.bounded(tempo.get_block_number()).await {
+            withdrawal
+                .settlement_cursor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get_or_insert(latest.saturating_sub(LOOKBACK_BLOCKS));
+        }
+    }
+
     /// Looks for the receipt of a withdrawal whose send response failed.
     ///
     /// The recovery timeout bounds the whole search, including a lookup that
@@ -1357,7 +1389,8 @@ async fn derive_sender_tag_candidates(
             .await
             .map_err(|e| {
                 MppError::Http(format!(
-                    "failed to read the Zone outbox's lastFallbackNonce: {e}"
+                    "failed to read the Zone outbox's lastFallbackNonce: {}",
+                    describe_rpc_error(&e)
                 ))
             })?;
         IZoneOutbox::lastFallbackNonceCall::abi_decode_returns(&result)
@@ -1380,6 +1413,45 @@ async fn derive_sender_tag_candidates(
     Ok((before + 1..=after)
         .map(|fallback_nonce| zone::sender_tag(sender, transaction_hash, fallback_nonce))
         .collect())
+}
+
+/// What a failed Zone RPC call reports, without the request URL a transport
+/// error carries: the URL may hold an API key in its path or query, and the
+/// message can reach a proxy's response body and payment events.
+fn describe_rpc_error(error: &alloy::transports::TransportError) -> String {
+    use alloy::transports::{RpcError, TransportErrorKind};
+    match error {
+        RpcError::ErrorResp(payload) => format!(
+            "the Zone RPC answered error {}: {}",
+            payload.code, payload.message
+        ),
+        RpcError::Transport(
+            TransportErrorKind::HttpError(http)
+            | TransportErrorKind::HttpErrorWithRetryAfter { error: http, .. },
+        ) => format!("the Zone RPC answered HTTP status {}", http.status),
+        RpcError::NullResp | RpcError::DeserError { .. } => {
+            "the Zone RPC returned an invalid response".into()
+        }
+        _ => "the Zone RPC request failed".into(),
+    }
+}
+
+/// `bound`, cut short at the challenge's expiry; `bound` itself once it has
+/// expired or when it never expires.
+fn remaining_bound(challenge: &PaymentChallenge, bound: Duration) -> Duration {
+    if is_expired(challenge) {
+        bound
+    } else {
+        settlement_timeout(challenge, bound)
+    }
+}
+
+/// Runs `call` for at most `timeout`: `None` when it runs longer.
+async fn within<T>(timeout: Duration, call: impl std::future::Future<Output = T>) -> Option<T> {
+    match tokio::time::Instant::now().checked_add(timeout) {
+        Some(deadline) => tokio::time::timeout_at(deadline, call).await.ok(),
+        None => Some(call.await),
+    }
 }
 
 /// Whether a Zone withdrawal can be sent and waited on for up to `timeout`

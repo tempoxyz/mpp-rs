@@ -731,11 +731,18 @@ async fn test_retries_a_failed_sender_tag_read_without_withdrawing_again() {
         .unwrap();
     let challenge = challenge_with(json!({}), None);
 
-    let error = provider.pay(&challenge).await.unwrap_err();
-    assert!(
-        error.to_string().contains("sender tag could not be read"),
-        "{error}"
-    );
+    // A failed read is resumable: HTTP and MCP flows retry this error.
+    match provider.pay(&challenge).await.unwrap_err() {
+        MppError::ZoneSettlementPending {
+            challenge_id,
+            sender_tags,
+            ..
+        } => {
+            assert_eq!(challenge_id, "zone-challenge");
+            assert!(sender_tags.is_empty());
+        }
+        error => panic!("expected ZoneSettlementPending, got {error}"),
+    }
     fail_reads.store(false, Ordering::SeqCst);
     let credential = provider.pay(&challenge).await.unwrap();
     assert_eq!(
@@ -743,6 +750,134 @@ async fn test_retries_a_failed_sender_tag_read_without_withdrawing_again() {
         Some(format!("{:#x}", sent_sender_tag(&sent)).as_str())
     );
     assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_failed_sender_tag_read_pins_the_settlement_search() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let fail_reads = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (zone_url, _) = spawn_rpc(redacting_zone_handler(
+        sent.clone(),
+        6,
+        7,
+        fail_reads.clone(),
+    ))
+    .await;
+    let block = Arc::new(std::sync::atomic::AtomicU64::new(10_000));
+    let from_blocks = Arc::new(Mutex::new(Vec::new()));
+    let pinned = format!("{:#x}", 10_000 - LOOKBACK_BLOCKS);
+    let (tempo_url, _) = {
+        let sent = sent.clone();
+        let block = block.clone();
+        let from_blocks = from_blocks.clone();
+        let pinned = pinned.clone();
+        spawn_rpc(Arc::new(move |method, params| match method {
+            "eth_chainId" => Ok(json!("0xa5bf")),
+            "eth_blockNumber" => Ok(json!(format!("{:#x}", block.load(Ordering::SeqCst)))),
+            "eth_getLogs" => {
+                let from = params[0]["fromBlock"].as_str().unwrap_or_default();
+                from_blocks.lock().unwrap().push(from.to_string());
+                // The withdrawal settled within the window before the
+                // first failed read, and nowhere a later window covers.
+                if from == pinned {
+                    Ok(json!([settlement_log(
+                        sent_sender_tag(&sent),
+                        true,
+                        B256::repeat_byte(0x33)
+                    )]))
+                } else {
+                    Ok(json!([]))
+                }
+            }
+            _ => Err((-32000, format!("l1: {method}"))),
+        }))
+        .await
+    };
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap();
+    let challenge = challenge_with(json!({}), None);
+
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(
+        matches!(error, MppError::ZoneSettlementPending { .. }),
+        "{error}"
+    );
+    // Tempo moved far past the lookback window before the tags could be
+    // read: the search still starts where it would have at the failed read.
+    block.store(30_000, Ordering::SeqCst);
+    fail_reads.store(false, Ordering::SeqCst);
+    let credential = provider.pay(&challenge).await.unwrap();
+    assert_eq!(from_blocks.lock().unwrap().first(), Some(&pinned));
+    assert_eq!(
+        credential.charge_payload().unwrap().zone_sender_tag(),
+        Some(format!("{:#x}", sent_sender_tag(&sent)).as_str())
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_sender_tag_read_ends_at_the_challenge_expiry() {
+    // The Zone redacts outbox events and never answers the outbox's
+    // lastFallbackNonce, so the sender tag read stalls.
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let selector = format!(
+        "0x{}",
+        alloy::hex::encode(IZoneOutbox::lastFallbackNonceCall::SELECTOR)
+    );
+    let (zone_url, _) = spawn_rpc_stalling_when(
+        redacting_zone_handler(sent.clone(), 6, 7, Arc::default()),
+        move |method, params| {
+            method == "eth_call" && params[0]["data"].as_str() == Some(selector.as_str())
+        },
+    )
+    .await;
+    let mut zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    // Longer than the challenge has left: the expiry, not this, ends the read.
+    zone.rpc_timeout = Duration::from_secs(60);
+    let (provider, _) = provider_with_zone(zone).await;
+    // Leaves just over the settlement timeout plus the submission margin
+    // the send check reserves.
+    let lifetime = SUBMISSION_MARGIN.as_secs() as i64 + 2;
+    let challenge = challenge_with(json!({}), expires_in(lifetime));
+
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(Duration::from_secs(30), provider.pay(&challenge))
+        .await
+        .expect("the sender tag read outlived the challenge")
+        .unwrap_err();
+    assert!(
+        matches!(error, MppError::ZoneSettlementPending { .. }),
+        "{error}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(lifetime as u64 + 2));
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_sender_tag_read_error_omits_the_zone_rpc_url() {
+    // Nothing listens on port 1, so the read fails in the transport, whose
+    // error names the request URL.
+    let zone = super::super::rpc_provider(
+        "http://127.0.0.1:1/zone-path-key?apikey=query-key"
+            .parse()
+            .unwrap(),
+        None,
+    );
+    let error = sender_tag_candidates(&zone, 10, Address::ZERO, B256::repeat_byte(0xab))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("lastFallbackNonce"), "{error}");
+    for part in ["zone-path-key", "query-key", "127.0.0.1"] {
+        assert!(!error.contains(part), "{error}");
+    }
 }
 
 #[tokio::test]
@@ -2179,20 +2314,30 @@ async fn spawn_stalling_rpc(
     handler: Handler,
     stalled: &'static [&'static str],
 ) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_rpc_stalling_when(handler, move |method, _| stalled.contains(&method)).await
+}
+
+/// A JSON-RPC server that never answers a call `stalls` matches and answers
+/// every other call with `handler`, recording each method.
+async fn spawn_rpc_stalling_when(
+    handler: Handler,
+    stalls: impl Fn(&str, &Value) -> bool + Send + Sync + 'static,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    type Stalls = Arc<dyn Fn(&str, &Value) -> bool + Send + Sync>;
     #[derive(Clone)]
     struct Rpc {
         handler: Handler,
-        stalled: &'static [&'static str],
+        stalled: Stalls,
         calls: Arc<Mutex<Vec<String>>>,
     }
     async fn rpc(State(state): State<Rpc>, Json(request): Json<Value>) -> Json<Value> {
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let method = request["method"].as_str().unwrap_or_default().to_string();
         state.calls.lock().unwrap().push(method.clone());
-        if state.stalled.contains(&method.as_str()) {
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        if (state.stalled)(&method, &params) {
             std::future::pending::<()>().await;
         }
-        let params = request.get("params").cloned().unwrap_or(Value::Null);
         Json(match (state.handler)(&method, &params) {
             Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
             Err((code, message)) => {
@@ -2203,7 +2348,7 @@ async fn spawn_stalling_rpc(
     let calls = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new().route("/", post(rpc)).with_state(Rpc {
         handler,
-        stalled,
+        stalled: Arc::new(stalls),
         calls: calls.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
