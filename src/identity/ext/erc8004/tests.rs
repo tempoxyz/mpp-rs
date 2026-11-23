@@ -94,6 +94,7 @@ async fn signed(signer: PrivateKeySigner, agent_id: u64) -> IdentityRequest {
     };
     let mut outbound = reqwest::Request::new(reqwest::Method::GET, URL.parse().unwrap());
     prover.prove(&mut outbound, &context).await.unwrap();
+    assert!(outbound.headers()["agent-signature"].is_sensitive());
     let headers: Vec<(&str, String)> = ["agent-id", "agent-signature"]
         .into_iter()
         .map(|name| (name, outbound.headers()[name].to_str().unwrap().to_owned()))
@@ -422,6 +423,151 @@ mod signed {
         let rejection = rejected(agents.verifier.verify(&signed(agent_key(), 1).await).await);
         assert_eq!(rejection.status, RejectionStatus::Forbidden);
     }
+
+    #[tokio::test]
+    async fn rejects_an_erc1271_return_that_is_not_the_encoded_magic() {
+        let magic = [0x16, 0x26, 0xba, 0x7e];
+        // Echoed calldata starts with the same four bytes as the magic value.
+        let echoed = IERC1271::isValidSignatureCall {
+            hash: FixedBytes([7; 32]),
+            signature: Bytes::from(vec![1; 65]),
+        }
+        .abi_encode();
+        let mut dirty = [0u8; 32];
+        dirty[..4].copy_from_slice(&magic);
+        dirty[31] = 1;
+        for output in [echoed, dirty.to_vec(), magic.to_vec()] {
+            let asserter = registry();
+            let agents = setup(&asserter, |config| config);
+            wallet(&asserter, CONTRACT_WALLET);
+            asserter.push_success(&Bytes::from(output));
+            let rejection = rejected(agents.verifier.verify(&signed(agent_key(), 3).await).await);
+            assert_eq!(
+                rejection.reason,
+                "The agent's wallet did not sign the request."
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denied_agent_claims_no_nonce() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let open = Arc::new(AtomicBool::new(false));
+        let gate = open.clone();
+        let asserter = registry();
+        let agents = setup(&asserter, move |config| {
+            config.allow(move |_| gate.load(Ordering::SeqCst))
+        });
+        wallet(&asserter, agent_key().address());
+        wallet(&asserter, agent_key().address());
+        let first = signed(agent_key(), 1).await;
+        let rejection = rejected(agents.verifier.verify(&first).await);
+        assert_eq!(rejection.status, RejectionStatus::Forbidden);
+        open.store(true, Ordering::SeqCst);
+        let again = request(&[
+            ("agent-id", first.header("agent-id").unwrap().to_owned()),
+            (
+                "agent-signature",
+                first.header("agent-signature").unwrap().to_owned(),
+            ),
+        ]);
+        assert!(agents.verifier.verify(&again).await.is_valid());
+    }
+
+    #[tokio::test]
+    async fn a_signed_payment_runs_allow_after_the_signature() {
+        let asserter = registry();
+        let agents = setup(&asserter, |config| config.allow(|_| false));
+        wallet(&asserter, agent_key().address());
+        let credential = credential(
+            "charge",
+            serde_json::to_value(PaymentPayload::transaction("0x76")).unwrap(),
+            agent_key().address(),
+        );
+        let rejection = rejected(check(&agents, &signed(agent_key(), 1).await, &credential).await);
+        assert_eq!(rejection.status, RejectionStatus::Forbidden);
+        assert_eq!(rejection.reason, "This agent may not call this API.");
+    }
+}
+
+#[tokio::test]
+async fn the_payment_proves_the_agent_without_allow() {
+    let asserter = registry();
+    let agents = setup(&asserter, |config| config);
+    let payer = agent_key().address();
+    wallet(&asserter, payer);
+    let request = request(&[("agent-id", id(1))]);
+    let credential = credential(
+        "charge",
+        serde_json::to_value(PaymentPayload::transaction("0x76")).unwrap(),
+        payer,
+    );
+    assert!(check(&agents, &request, &credential).await.is_valid());
+}
+
+#[tokio::test]
+async fn needs_the_signature_before_allow_or_when_required() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let payer = agent_key().address();
+    let asked = Arc::new(AtomicBool::new(false));
+    let seen = asked.clone();
+    let with_allow = move |config: Config| {
+        let seen = seen.clone();
+        config.allow(move |_| {
+            seen.store(true, Ordering::SeqCst);
+            true
+        })
+    };
+    let required = |config: Config| config.require_signature();
+    let configs: [Box<dyn FnOnce(Config) -> Config>; 2] =
+        [Box::new(with_allow), Box::new(required)];
+    for config in configs {
+        let asserter = registry();
+        let agents = setup(&asserter, config);
+        wallet(&asserter, payer);
+        let request = request(&[("agent-id", id(1))]);
+        let credential = credential(
+            "charge",
+            serde_json::to_value(PaymentPayload::transaction("0x76")).unwrap(),
+            payer,
+        );
+        let rejection = rejected(check(&agents, &request, &credential).await);
+        assert_eq!(rejection.status, RejectionStatus::Invalid);
+        assert_eq!(
+            rejection.reason,
+            "The agent signature is missing or malformed."
+        );
+    }
+    assert!(
+        !asked.load(Ordering::SeqCst),
+        "allow ran without a signature"
+    );
+}
+
+#[tokio::test]
+async fn rejects_an_oversized_signature_header() {
+    let asserter = registry();
+    let agents = setup(&asserter, |config| config);
+    wallet(&asserter, agent_key().address());
+    let header = format!("{}.n.0x{}", now(), "ab".repeat(16 * 1024));
+    let request = request(&[("agent-id", id(1)), ("agent-signature", header)]);
+    let rejection = rejected(agents.verifier.verify(&request).await);
+    assert_eq!(
+        rejection.reason,
+        "The agent signature is missing or malformed."
+    );
+}
+
+#[test]
+fn keeps_rpc_credentials_out_of_debug_and_errors() {
+    let config = Config::new(ORIGIN).rpc_url("https://user:key@rpc.example:8545/v1/key?apikey=key");
+    let debug = format!("{config:?}");
+    assert!(debug.contains("https://rpc.example:8545"), "{debug}");
+    assert!(!debug.contains("key"), "{debug}");
+    let error = create(Config::new(ORIGIN).rpc_url("not a url key")).unwrap_err();
+    assert!(!error.to_string().contains("key"));
 }
 
 #[tokio::test]

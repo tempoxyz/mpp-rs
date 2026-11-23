@@ -121,7 +121,9 @@ impl Prover for Erc8004Prover {
             );
             let invalid = |_| ProverError::new("the agent headers are not valid header values");
             let id = HeaderValue::from_str(&self.id).map_err(invalid)?;
-            let value = HeaderValue::from_str(&value).map_err(invalid)?;
+            let mut value = HeaderValue::from_str(&value).map_err(invalid)?;
+            // A proof is a bearer credential until it is spent: keep it out of Debug output.
+            value.set_sensitive(true);
             let headers = request.headers_mut();
             headers.insert(ID_HEADER, id);
             headers.insert(SIGNATURE_HEADER, value);

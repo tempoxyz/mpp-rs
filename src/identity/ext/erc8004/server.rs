@@ -4,8 +4,11 @@ use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 
-use alloy::primitives::{eip191_hash_message, Address, Bytes, FixedBytes, Signature};
+use alloy::network::TransactionBuilder;
+use alloy::primitives::{eip191_hash_message, Address, Bytes, Signature};
 use alloy::providers::{DynProvider, Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
+use alloy::sol_types::SolCall;
 use reqwest::Url;
 use serde_json::Value;
 
@@ -26,7 +29,6 @@ alloy::sol! {
         function getAgentWallet(uint256 agentId) external view returns (address);
     }
 
-    #[sol(rpc)]
     interface IERC1271 {
         function isValidSignature(bytes32 hash, bytes signature) external view returns (bytes4);
     }
@@ -37,6 +39,14 @@ const ERC1271_MAGIC: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
 
 /// How long a registry or ERC-1271 call may take before the chain counts as unavailable.
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The longest `Agent-Signature` header read. A smart-account signature is
+/// a few kilobytes of hex at most.
+const MAX_SIGNATURE_HEADER: usize = 16 * 1024;
+
+/// Seconds a nonce claim outlives the signature's last accepted second, so a
+/// verifier whose clock runs behind the store's still finds the claim.
+const CLAIM_GRACE: u64 = 300;
 
 /// Whether the agent's wallet signed a request.
 enum Signed {
@@ -59,6 +69,7 @@ pub struct Config {
     provider: Option<DynProvider>,
     rpc_url: Option<String>,
     store: Option<Arc<dyn Store>>,
+    require_signature: bool,
 }
 
 impl fmt::Debug for Config {
@@ -67,7 +78,8 @@ impl fmt::Debug for Config {
             .field("origin", &self.origin)
             .field("chain_id", &self.chain_id)
             .field("registry", &self.registry)
-            .field("rpc_url", &self.rpc_url)
+            .field("rpc_url", &self.rpc_url.as_deref().map(redacted))
+            .field("require_signature", &self.require_signature)
             .finish_non_exhaustive()
     }
 }
@@ -89,6 +101,7 @@ impl Config {
             provider: None,
             rpc_url: None,
             store: None,
+            require_signature: false,
         }
     }
 
@@ -121,13 +134,29 @@ impl Config {
     /// Accepts each request signature once. Without it, a signature can be
     /// replayed for six minutes. The store must implement
     /// `put_if_absent_with_ttl` atomically.
+    ///
+    /// Each claim is kept up to twelve minutes. A store that cannot expire
+    /// keys, such as [`FileStore`](crate::store::FileStore), keeps every
+    /// claim for good, one entry per signed request: use one that expires
+    /// them, such as [`MemoryStore`](crate::store::MemoryStore) or a SQL or
+    /// Redis store.
     pub fn store(mut self, store: Arc<dyn Store>) -> Self {
         self.store = Some(store);
         self
     }
 
+    /// Requires the agent's request signature on the paid retry too, rather
+    /// than accepting a `tempo` charge from the agent's wallet as proof of the
+    /// agent. Use it when the tempo method settles through a relay
+    /// (`tempo::RelayConfig`), which matches the Credential's source to its
+    /// signer away from this server.
+    pub fn require_signature(mut self) -> Self {
+        self.require_signature = true;
+        self
+    }
+
     /// Decides whether a verified agent may call the API, such as by its ID
-    /// or reputation.
+    /// or reputation. It runs only on an agent whose wallet signed the request.
     pub fn allow<F>(self, allow: F) -> Self
     where
         F: Fn(&Agent) -> bool + Send + Sync + 'static,
@@ -188,7 +217,7 @@ pub fn create(config: Config) -> Result<Erc8004, ConfigError> {
         None => {
             let url = config.rpc_url.as_deref().unwrap_or(RPC_URL);
             let url =
-                Url::parse(url).map_err(|_| ConfigError(format!("`{url}` is not an RPC URL.")))?;
+                Url::parse(url).map_err(|_| ConfigError("The RPC URL is not a URL.".to_owned()))?;
             ProviderBuilder::new().connect_http(url).erased()
         }
     };
@@ -198,6 +227,7 @@ pub fn create(config: Config) -> Result<Erc8004, ConfigError> {
         requires: vec![Requirement::new(TYPE)],
         lookup: MemoKey::new(),
         signed: MemoKey::new(),
+        admitted: MemoKey::new(),
         config,
     });
     Ok(Erc8004 {
@@ -213,8 +243,10 @@ struct Core {
     requires: Vec<Requirement>,
     /// One registry lookup per request, shared by the verifier and payment check.
     lookup: MemoKey,
-    /// One signature check per request, so a nonce is spent once.
+    /// One signature check per request.
     signed: MemoKey,
+    /// One `allow` decision and nonce claim per request, so a nonce is spent once.
+    admitted: MemoKey,
 }
 
 /// The request-stage verifier of [`Erc8004`].
@@ -231,10 +263,7 @@ impl Verifier for Erc8004Verifier {
     type Value = Agent;
 
     fn verify<'a>(&'a self, request: &'a IdentityRequest) -> BoxFuture<'a, Verification<Agent>> {
-        Box::pin(async move {
-            let signed = self.core.signed(request).await;
-            self.core.allowed(signed).await
-        })
+        Box::pin(async move { self.core.admitted(request).await })
     }
 }
 
@@ -253,7 +282,8 @@ impl PaymentCheck for Erc8004PaymentCheck {
             // accept another sender), and neither do sessions, Zones or other
             // methods, so they need the agent's signature instead.
             let binds_source = input.credential.filter(|credential| {
-                input.challenge.method.as_str() == "tempo"
+                !core.config.require_signature
+                    && input.challenge.method.as_str() == "tempo"
                     && input.challenge.intent.as_str() == "charge"
                     && matches!(
                         credential.payload.get("type").and_then(Value::as_str),
@@ -261,10 +291,22 @@ impl PaymentCheck for Erc8004PaymentCheck {
                     )
             });
             let Some(credential) = binds_source else {
-                let signed = core.signed(input.request).await;
-                return core.allowed(signed).await;
+                return core.admitted(input.request).await;
             };
-            let agent = match core.lookup(input.request).await {
+            // The tempo method matches the source to the payment's signer only
+            // when it settles, after this check. So `allow` runs only on an
+            // agent whose wallet also signed the request; without `allow`, the
+            // payment alone proves the agent, as in mppx.
+            let signs =
+                core.config.allow.is_some() || input.request.header(SIGNATURE_HEADER).is_some();
+            let agent = if signs {
+                core.authenticated(input.request)
+                    .await
+                    .map(|(agent, _)| agent)
+            } else {
+                core.lookup(input.request).await
+            };
+            let agent = match agent {
                 Verification::Valid(agent) => agent,
                 rejected => return rejected,
             };
@@ -274,7 +316,7 @@ impl PaymentCheck for Erc8004PaymentCheck {
                 .source
                 .as_deref()
                 .unwrap_or_default()
-                .split(':')
+                .splitn(6, ':')
                 .collect();
             let account = match parts.as_slice() {
                 ["did", "pkh", "eip155", chain, address] if *chain == chain_id.to_string() => {
@@ -291,9 +333,20 @@ impl PaymentCheck for Erc8004PaymentCheck {
             if account != agent.wallet {
                 return Rejection::forbidden("The payment is not from the agent's wallet.").into();
             }
-            core.allowed(Verification::Valid(agent)).await
+            if signs {
+                return core.admitted(input.request).await;
+            }
+            Verification::Valid(agent)
         })
     }
+}
+
+/// A verified signature's nonce, still to be claimed.
+#[derive(Clone)]
+struct Claim {
+    nonce: String,
+    /// The last second the signature is accepted.
+    expires: u64,
 }
 
 impl Core {
@@ -310,14 +363,63 @@ impl Core {
 
     async fn lookup(&self, request: &IdentityRequest) -> Verification<Agent> {
         request
-            .memoize(&self.lookup, self.read_agent(request))
+            .memoize(&self.lookup, Box::pin(self.read_agent(request)))
             .await
     }
 
-    async fn signed(&self, request: &IdentityRequest) -> Verification<Agent> {
+    // Each memoized step is boxed: nested inline, the futures outgrow a test thread's stack.
+    async fn authenticated(&self, request: &IdentityRequest) -> Verification<(Agent, Claim)> {
         request
-            .memoize(&self.signed, self.verify_signature(request))
+            .memoize(&self.signed, Box::pin(self.verify_signature(request)))
             .await
+    }
+
+    async fn admitted(&self, request: &IdentityRequest) -> Verification<Agent> {
+        request
+            .memoize(&self.admitted, Box::pin(self.admit(request)))
+            .await
+    }
+
+    /// The agent that signed the request, if `allow` lets it in: then its
+    /// nonce is claimed, so a denied agent holds no claim.
+    async fn admit(&self, request: &IdentityRequest) -> Verification<Agent> {
+        let (agent, claim) = match self.authenticated(request).await {
+            Verification::Valid(signed) => signed,
+            Verification::Rejected(rejection) => return rejection.into(),
+        };
+        let agent = match self.allowed(Verification::Valid(agent)).await {
+            Verification::Valid(agent) => agent,
+            rejected => return rejected,
+        };
+        if let Some(store) = &self.config.store {
+            let key = format!(
+                "mppx:erc8004:nonce:{}",
+                eip191_hash_message(format!("{}:{}", agent.id, claim.nonce))
+            );
+            // Held past expiry: the signature still verifies through the whole
+            // second `now == expires`, and on verifiers whose clocks run behind
+            // the store's.
+            let ttl = claim.expires.saturating_sub(now()) + 1 + CLAIM_GRACE;
+            match store
+                .put_if_absent_with_ttl(
+                    &key,
+                    Value::Bool(true),
+                    std::time::Duration::from_secs(ttl),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Rejection::invalid("The agent signature was already used.").into()
+                }
+                Err(_) => return Rejection::unavailable("The replay store is unavailable.").into(),
+            }
+        }
+        // The wallet, `allow` and the store may have taken a while.
+        if now() > claim.expires {
+            return Rejection::invalid("The agent signature has expired.").into();
+        }
+        Verification::Valid(agent)
     }
 
     /// Reads the request's agent and its wallet from the registry.
@@ -357,20 +459,27 @@ impl Core {
     }
 
     /// Checks that the agent's wallet signed this request.
-    async fn verify_signature(&self, request: &IdentityRequest) -> Verification<Agent> {
+    async fn verify_signature(&self, request: &IdentityRequest) -> Verification<(Agent, Claim)> {
         let agent = match self.lookup(request).await {
             Verification::Valid(agent) => agent,
-            rejected => return rejected,
+            Verification::Rejected(rejection) => return rejection.into(),
         };
+        let malformed =
+            || Rejection::invalid("The agent signature is missing or malformed.").into();
         let header = request.header(SIGNATURE_HEADER).unwrap_or_default();
-        let parts: Vec<&str> = header.split('.').collect();
-        let [created, nonce, signature] = parts.as_slice() else {
-            return Rejection::invalid("The agent signature is missing or malformed.").into();
+        if header.len() > MAX_SIGNATURE_HEADER {
+            return malformed();
+        }
+        let mut parts = header.splitn(4, '.');
+        let (Some(created), Some(nonce), Some(signature), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return malformed();
         };
         let signature = signature
             .strip_prefix("0x")
             .filter(|hex| !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()));
-        let created = Some(*created)
+        let created = Some(created)
             .filter(|created| {
                 !created.is_empty()
                     && created.len() <= 12
@@ -378,10 +487,10 @@ impl Core {
             })
             .and_then(|created| created.parse::<u64>().ok());
         let (Some(created), Some(signature)) = (created, signature) else {
-            return Rejection::invalid("The agent signature is missing or malformed.").into();
+            return malformed();
         };
         if nonce.is_empty() {
-            return Rejection::invalid("The agent signature is missing or malformed.").into();
+            return malformed();
         }
         let now = now();
         let expires = created + MAX_AGE + CLOCK_TOLERANCE;
@@ -406,33 +515,19 @@ impl Core {
                 return Rejection::unavailable("The agent's wallet could not be checked.").into()
             }
         }
-        if let Some(store) = &self.config.store {
-            let key = format!(
-                "mppx:erc8004:nonce:{}",
-                eip191_hash_message(format!("{}:{nonce}", agent.id))
-            );
-            // Held one second past expiry: the signature still verifies
-            // through the whole second `now == expires`.
-            let ttl = std::time::Duration::from_secs(expires - now + 1);
-            match store
-                .put_if_absent_with_ttl(&key, Value::Bool(true), ttl)
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Rejection::invalid("The agent signature was already used.").into()
-                }
-                Err(_) => return Rejection::unavailable("The replay store is unavailable.").into(),
-            }
-        }
-        Verification::Valid(agent)
+        let claim = Claim {
+            nonce: nonce.to_owned(),
+            expires,
+        };
+        Verification::Valid((agent, claim))
     }
 
     /// Returns whether `wallet` signed `message`: by EOA recovery, else by ERC-1271.
     ///
-    /// A revert, an error response or empty return data (a plain EOA) is
-    /// [`Signed::No`]; a transport failure or timeout is [`Signed::Unavailable`],
-    /// so a contract wallet is told to retry rather than that it didn't sign.
+    /// A revert, an error response or any return other than the ABI-encoded
+    /// magic value (empty for a plain EOA) is [`Signed::No`]; a transport
+    /// failure or timeout is [`Signed::Unavailable`], so a contract wallet is
+    /// told to retry rather than that it didn't sign.
     async fn signed_by(&self, wallet: Address, message: &str, signature: &str) -> Signed {
         let Ok(bytes) = alloy::hex::decode(signature) else {
             return Signed::No;
@@ -443,15 +538,17 @@ impl Core {
         if recovered == Some(wallet) {
             return Signed::Yes;
         }
-        let contract = IERC1271::new(wallet, &self.provider);
-        let call = contract.isValidSignature(eip191_hash_message(message), Bytes::from(bytes));
-        match tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
-            Ok(Ok(magic)) if magic == FixedBytes(ERC1271_MAGIC) => Signed::Yes,
-            Ok(Err(alloy::contract::Error::TransportError(error)))
-                if error.as_error_resp().is_none() =>
-            {
-                Signed::Unavailable
-            }
+        let data = IERC1271::isValidSignatureCall {
+            hash: eip191_hash_message(message),
+            signature: Bytes::from(bytes),
+        }
+        .abi_encode();
+        let call = TransactionRequest::default()
+            .with_to(wallet)
+            .with_input(data);
+        match tokio::time::timeout(RPC_TIMEOUT, self.provider.call(call)).await {
+            Ok(Ok(output)) if is_magic(&output) => Signed::Yes,
+            Ok(Err(error)) if error.as_error_resp().is_none() => Signed::Unavailable,
             Ok(_) => Signed::No,
             Err(_) => Signed::Unavailable,
         }
@@ -474,6 +571,25 @@ pub(super) fn target(origin: &str, request: &IdentityRequest) -> String {
     match uri.query().filter(|query| !query.is_empty()) {
         Some(query) => format!("{origin}{path}?{query}"),
         None => format!("{origin}{path}"),
+    }
+}
+
+/// Whether an `isValidSignature` return is exactly the ABI-encoded magic
+/// value: one 32-byte word, the magic left-aligned and the rest zero.
+fn is_magic(output: &[u8]) -> bool {
+    output.len() == 32 && output[..4] == ERC1271_MAGIC && output[4..].iter().all(|&byte| byte == 0)
+}
+
+/// `scheme://host[:port]` of a URL, without its userinfo, path or query, which
+/// can carry a provider key.
+fn redacted(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(url) => match (url.host_str(), url.port()) {
+            (Some(host), Some(port)) => format!("{}://{host}:{port}", url.scheme()),
+            (Some(host), None) => format!("{}://{host}", url.scheme()),
+            (None, _) => format!("{}:", url.scheme()),
+        },
+        Err(_) => "<not a URL>".to_owned(),
     }
 }
 
