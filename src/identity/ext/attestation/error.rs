@@ -26,7 +26,7 @@ pub enum IdentityError {
     Request(#[source] reqwest::Error),
 
     /// A [`RemoteSigner`](super::RemoteSigner) failed to sign an attestation.
-    #[error("the attestation signer failed: {0}")]
+    #[error("the attestation signer failed")]
     Signer(#[source] super::RemoteSignerError),
 
     /// A [`RemoteSigner`](super::RemoteSigner) returned a signature that does

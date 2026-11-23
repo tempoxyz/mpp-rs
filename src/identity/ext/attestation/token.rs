@@ -117,6 +117,9 @@ pub trait RemoteSigner: Send + Sync {
     fn sign<'a>(&'a self, payload: &'a [u8]) -> RemoteSignerFuture<'a>;
 }
 
+/// Length of a base64url-encoded (unpadded) 64-byte Ed25519 signature.
+const SIGNATURE_LENGTH: usize = 86;
+
 /// Signs attestation claims as a compact JWS (EdDSA over Ed25519) with a
 /// [`RemoteSigner`], as mppx's `Attestation.sign` does.
 ///
@@ -136,6 +139,13 @@ pub async fn sign_with<C: Serialize>(
         None => thumbprint(&public_key),
     };
     let input = signing_input(claims, &key_id)?;
+    // An Ed25519 signature is 86 base64url characters. Refuse a token the SDK's
+    // own decoder would reject before spending a remote signature on it.
+    if input.len() + 1 + SIGNATURE_LENGTH > MAX_LENGTH {
+        return Err(IdentityError::InvalidConfig(format!(
+            "attestation would be longer than {MAX_LENGTH} characters"
+        )));
+    }
     let signature = signer
         .sign(input.as_bytes())
         .await
@@ -652,9 +662,25 @@ pub(crate) mod tests {
             ..TestSigner::new(signing_key())
         };
         let err = sign_with(&claims(1), &signer, None).await.unwrap_err();
+        // The cause is reported once, through source(), not in Display too.
+        assert_eq!(err.to_string(), "the attestation signer failed");
         match err {
             IdentityError::Signer(source) => assert_eq!(source.to_string(), "KMS unavailable."),
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_oversized_tokens_before_calling_the_signer() {
+        let signer = TestSigner::new(signing_key());
+        let mut oversized = claims(1);
+        oversized["pad"] = Value::String("a".repeat(MAX_LENGTH));
+        let err = sign_with(&oversized, &signer, None).await.unwrap_err();
+        assert!(matches!(err, IdentityError::InvalidConfig(_)), "{err}");
+        assert!(signer.calls.lock().unwrap().is_empty());
+
+        // The longest accepted token still decodes.
+        let token = sign_with(&claims(1), &signer, None).await.unwrap();
+        assert!(token.len() <= MAX_LENGTH && decode(&token).is_some());
     }
 }
