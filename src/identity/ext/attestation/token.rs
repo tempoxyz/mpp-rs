@@ -1,10 +1,14 @@
 //! Attestation tokens: compact EdDSA JWS signing, decoding and verification.
 
+use std::future::Future;
+use std::pin::Pin;
+
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ed25519_dalek::{Signature, Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use super::jwks::KeyResolver;
 use super::{rejection, IdentityError};
@@ -73,22 +77,95 @@ pub struct VerifyOptions {
 /// Signs attestation claims as a compact JWS (EdDSA over Ed25519).
 ///
 /// For issuers and tests. `key_id` should be the RFC 7638 thumbprint of the
-/// public key published in the issuer's JSON Web Key Set.
+/// public key published in the issuer's JSON Web Key Set (see [`thumbprint`]).
+/// To sign with a key that stays in a KMS, an HSM or a wallet service, use
+/// [`sign_with`].
 pub fn sign<C: Serialize>(
     claims: &C,
     key: &SigningKey,
     key_id: &str,
 ) -> Result<String, IdentityError> {
-    let header = serde_json::json!({ "alg": ALGORITHM, "kid": key_id, "typ": TOKEN_TYPE });
-    let encode = |value: &serde_json::Value| URL_SAFE_NO_PAD.encode(value.to_string());
-    let claims = serde_json::to_value(claims)
-        .map_err(|err| IdentityError::InvalidConfig(format!("claims: {err}")))?;
-    let input = format!("{}.{}", encode(&header), encode(&claims));
+    let input = signing_input(claims, key_id)?;
     let signature = key.sign(input.as_bytes());
     Ok(format!(
         "{input}.{}",
         URL_SAFE_NO_PAD.encode(signature.to_bytes())
     ))
+}
+
+/// Error a [`RemoteSigner`] fails with.
+pub type RemoteSignerError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Future returned by [`RemoteSigner::sign`].
+pub type RemoteSignerFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<u8>, RemoteSignerError>> + Send + 'a>>;
+
+/// An Ed25519 key pair whose private key may stay outside this process, such
+/// as in a cloud KMS, an HSM or a wallet service, as mppx's `Signer`.
+///
+/// [`sign_with`] checks every signature it returns against
+/// [`public_key`](Self::public_key) before using it, so a wrong key, a
+/// signature over a digest or a DER- or base64-encoded signature fails at the
+/// issuer instead of at the verifier. A local [`SigningKey`] signs with
+/// [`sign`] and [`thumbprint`] instead.
+pub trait RemoteSigner: Send + Sync {
+    /// The public key of the private key that signs.
+    fn public_key(&self) -> VerifyingKey;
+
+    /// Signs `payload` (the complete JWS signing input, not a digest) and
+    /// returns the raw 64-byte Ed25519 signature.
+    fn sign<'a>(&'a self, payload: &'a [u8]) -> RemoteSignerFuture<'a>;
+}
+
+/// Signs attestation claims as a compact JWS (EdDSA over Ed25519) with a
+/// [`RemoteSigner`], as mppx's `Attestation.sign` does.
+///
+/// `key_id` defaults to the RFC 7638 thumbprint of the signer's public key
+/// ([`thumbprint`]), the `kid` an issuer's JSON Web Key Set publishes for
+/// it. The signer is called once, and its signature must verify with its
+/// public key: otherwise this fails with [`IdentityError::InvalidSignature`].
+/// A signer failure is returned as [`IdentityError::Signer`].
+pub async fn sign_with<C: Serialize>(
+    claims: &C,
+    signer: &(impl RemoteSigner + ?Sized),
+    key_id: Option<&str>,
+) -> Result<String, IdentityError> {
+    let public_key = signer.public_key();
+    let key_id = match key_id {
+        Some(key_id) => key_id.to_string(),
+        None => thumbprint(&public_key),
+    };
+    let input = signing_input(claims, &key_id)?;
+    let signature = signer
+        .sign(input.as_bytes())
+        .await
+        .map_err(IdentityError::Signer)?;
+    let valid = <[u8; 64]>::try_from(signature.as_slice())
+        .map(|bytes| Signature::from_bytes(&bytes))
+        .is_ok_and(|parsed| public_key.verify_strict(input.as_bytes(), &parsed).is_ok());
+    if !valid {
+        return Err(IdentityError::InvalidSignature);
+    }
+    Ok(format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature)))
+}
+
+/// The RFC 7638 JWK thumbprint of an Ed25519 public key: the `kid` an issuer
+/// publishes for it and [`sign_with`] uses by default.
+pub fn thumbprint(key: &VerifyingKey) -> String {
+    let jwk = format!(
+        r#"{{"crv":"Ed25519","kty":"OKP","x":"{}"}}"#,
+        URL_SAFE_NO_PAD.encode(key.as_bytes())
+    );
+    URL_SAFE_NO_PAD.encode(Sha256::digest(jwk.as_bytes()))
+}
+
+/// The JWS signing input `<header>.<payload>` for `claims`.
+fn signing_input<C: Serialize>(claims: &C, key_id: &str) -> Result<String, IdentityError> {
+    let header = serde_json::json!({ "alg": ALGORITHM, "kid": key_id, "typ": TOKEN_TYPE });
+    let encode = |value: &serde_json::Value| URL_SAFE_NO_PAD.encode(value.to_string());
+    let claims = serde_json::to_value(claims)
+        .map_err(|err| IdentityError::InvalidConfig(format!("claims: {err}")))?;
+    Ok(format!("{}.{}", encode(&header), encode(&claims)))
 }
 
 /// Decodes an attestation without verifying it, or returns `None` if it is malformed.
@@ -440,5 +517,144 @@ pub(crate) mod tests {
             parse_header(["a.b.c, d.e.f", " ,g.h.i"]),
             vec!["a.b.c", "d.e.f", "g.h.i"]
         );
+    }
+
+    /// A remote signer backed by `key` that reports `public` as its public
+    /// key, records each payload and returns `edit`'s change of the signature.
+    struct TestSigner {
+        key: SigningKey,
+        public: VerifyingKey,
+        calls: std::sync::Mutex<Vec<Vec<u8>>>,
+        edit: fn(Vec<u8>) -> Result<Vec<u8>, RemoteSignerError>,
+    }
+
+    impl TestSigner {
+        fn new(key: SigningKey) -> Self {
+            Self {
+                public: key.verifying_key(),
+                key,
+                calls: Default::default(),
+                edit: Ok,
+            }
+        }
+    }
+
+    impl RemoteSigner for TestSigner {
+        fn public_key(&self) -> VerifyingKey {
+            self.public
+        }
+
+        fn sign<'a>(&'a self, payload: &'a [u8]) -> RemoteSignerFuture<'a> {
+            self.calls.lock().unwrap().push(payload.to_vec());
+            let signature = Signer::sign(&self.key, payload).to_bytes().to_vec();
+            let result = (self.edit)(signature);
+            Box::pin(async move { result })
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_signer_signs_the_same_token_as_the_local_key() {
+        // Ed25519 is deterministic, so the same key and claims give an identical token.
+        let now = 1_800_000_000;
+        let local = sign(&claims(now), &signing_key(), KID).unwrap();
+        let signer = TestSigner::new(signing_key());
+        let token = sign_with(&claims(now), &signer, Some(KID)).await.unwrap();
+        assert_eq!(token, local);
+        assert!(verify(&token, &options(now), &keys()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_signer_gets_the_signing_input_once() {
+        let signer = TestSigner::new(signing_key());
+        let token = sign_with(&claims(1), &signer, None).await.unwrap();
+        let calls = signer.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0], token.rsplit_once('.').unwrap().0.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn key_id_defaults_to_the_thumbprint() {
+        let now = 1_800_000_000;
+        let kid = thumbprint(&signing_key().verifying_key());
+        let resolver = StaticKeys::new([(kid.clone(), signing_key().verifying_key())]);
+        let remote = TestSigner::new(signing_key());
+        for token in [
+            sign(&claims(now), &signing_key(), &kid).unwrap(),
+            sign_with(&claims(now), &remote, None).await.unwrap(),
+        ] {
+            assert_eq!(decode(&token).unwrap().header["kid"], kid.as_str());
+            assert!(verify(&token, &options(now), &resolver).await.is_ok());
+        }
+        let explicit = sign_with(&claims(now), &remote, Some("issuer-key-1"))
+            .await
+            .unwrap();
+        assert_eq!(decode(&explicit).unwrap().header["kid"], "issuer-key-1");
+    }
+
+    #[test]
+    fn thumbprint_matches_rfc_8037() {
+        // RFC 8037 Appendix A.2 and A.3.
+        let x = URL_SAFE_NO_PAD
+            .decode("11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo")
+            .unwrap();
+        let key = VerifyingKey::from_bytes(&x.try_into().unwrap()).unwrap();
+        assert_eq!(
+            thumbprint(&key),
+            "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_signatures_that_do_not_verify_with_the_public_key() {
+        let mismatched = TestSigner {
+            public: signing_key().verifying_key(),
+            ..TestSigner::new(SigningKey::from_bytes(&[9u8; 32]))
+        };
+        let short = TestSigner {
+            edit: |mut sig| {
+                sig.pop();
+                Ok(sig)
+            },
+            ..TestSigner::new(signing_key())
+        };
+        let long = TestSigner {
+            edit: |mut sig| {
+                sig.push(0);
+                Ok(sig)
+            },
+            ..TestSigner::new(signing_key())
+        };
+        let prefixed = TestSigner {
+            edit: |sig| Ok([&[0x30, 0x44][..], &sig].concat()),
+            ..TestSigner::new(signing_key())
+        };
+        let digest = TestSigner {
+            edit: |_| {
+                let digest = Sha256::digest(b"payload");
+                Ok(Signer::sign(&signing_key(), &digest).to_bytes().to_vec())
+            },
+            ..TestSigner::new(signing_key())
+        };
+        let empty = TestSigner {
+            edit: |_| Ok(Vec::new()),
+            ..TestSigner::new(signing_key())
+        };
+        for signer in [mismatched, short, long, prefixed, digest, empty] {
+            let err = sign_with(&claims(1), &signer, None).await.unwrap_err();
+            assert!(matches!(err, IdentityError::InvalidSignature), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn propagates_a_signer_failure() {
+        let signer = TestSigner {
+            edit: |_| Err("KMS unavailable.".into()),
+            ..TestSigner::new(signing_key())
+        };
+        let err = sign_with(&claims(1), &signer, None).await.unwrap_err();
+        match err {
+            IdentityError::Signer(source) => assert_eq!(source.to_string(), "KMS unavailable."),
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }
