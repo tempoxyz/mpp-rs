@@ -8,6 +8,12 @@ pub enum IdentityError {
     #[error("invalid identity configuration: {0}")]
     InvalidConfig(String),
 
+    /// An [`AttestationIssuer`](super::AttestationIssuer) cannot sign these
+    /// parameters, such as a malformed claim or a token longer than servers
+    /// accept, as mppx's `Attestation.Issuer.InvalidParametersError`.
+    #[error("{0}")]
+    InvalidParameters(String),
+
     /// An attestation could not be decoded.
     #[error("Identity attestation is malformed.")]
     MalformedAttestation,

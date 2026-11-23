@@ -11,9 +11,10 @@
 //! - **Client:** [`AttestationProver`] is a [`Prover`](crate::identity::client::Prover)
 //!   that presents cached attestations and, when a server answers with
 //!   `Identity-Attestation-Required`, obtains one and resends the request.
-//! - **Issuers** sign attestations with [`sign`], or with [`sign_with`] and a
-//!   [`RemoteSigner`] whose private key stays in a KMS, an HSM or a wallet
-//!   service.
+//! - **Issuers** sign attestations and serve their key with an
+//!   [`AttestationIssuer`], or sign them directly with [`sign`], or with
+//!   [`sign_with`] and a [`RemoteSigner`] whose private key stays in a KMS,
+//!   an HSM or a wallet service.
 //!
 //! [`email_otp`](super::email_otp) builds on it.
 //!
@@ -32,6 +33,7 @@
 //! ```
 
 mod error;
+pub(crate) mod issuer;
 pub(crate) mod jwks;
 mod server;
 pub(crate) mod token;
@@ -41,11 +43,13 @@ mod client;
 
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 pub use error::IdentityError;
+pub use issuer::{AttestationIssuer, SignParameters, DEFAULT_TTL};
 pub use jwks::{JwksResolver, KeyResolveError, KeyResolver, KeyResolverFuture};
 pub use server::AttestationVerifier;
 pub use token::{
     decode, is_issuer, parse_header, sign, sign_with, thumbprint, verify, AttestationClaims,
-    DecodedAttestation, RemoteSigner, RemoteSignerError, RemoteSignerFuture, VerifyOptions,
+    Confirmation, DecodedAttestation, RemoteSigner, RemoteSignerError, RemoteSignerFuture,
+    VerifyOptions,
 };
 
 #[cfg(feature = "client")]
@@ -107,6 +111,35 @@ pub(crate) fn now() -> u64 {
 /// `value` without trailing slashes, as issuers are compared.
 pub(crate) fn trim_issuer(value: &str) -> &str {
     value.trim_end_matches('/')
+}
+
+/// The canonical form of an issuer URL, or `None` when it is not one.
+///
+/// It must be an `https` URL (`http` only on localhost) without userinfo,
+/// a query, a fragment, whitespace or a backslash. The URL parser's
+/// serialization, without trailing slashes, is returned, so the `iss` an
+/// issuer signs, the key set path it serves and the paths clients build from
+/// it all name the same URL.
+pub(crate) fn canonical_issuer(value: &str) -> Option<String> {
+    if value
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '\\' | '?' | '#'))
+    {
+        return None;
+    }
+    let url = reqwest::Url::parse(value).ok()?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    let canonical = trim_issuer(url.as_str()).to_owned();
+    token::is_issuer(&canonical).then_some(canonical)
+}
+
+/// Whether `url` names this host (`localhost` or `127.0.0.1`).
+#[cfg(feature = "client")]
+pub(crate) fn is_loopback(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .is_ok_and(|url| matches!(url.host_str(), Some("localhost" | "127.0.0.1")))
 }
 
 /// The origin of `url`, as `new URL(url).origin` serializes it.
