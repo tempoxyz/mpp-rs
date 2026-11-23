@@ -583,10 +583,12 @@ async fn test_pays_and_resumes_a_settlement_wait_without_withdrawing_again() {
             challenge: pending_challenge,
             challenge_id,
             sender_tag: pending_tag,
+            sender_tags,
             zone_id,
         } => {
             assert_eq!(challenge_id, "zone-challenge");
             assert_eq!(pending_tag, format!("{sender_tag:#x}"));
+            assert_eq!(sender_tags, [pending_tag]);
             assert_eq!(zone_id, 3);
             *pending_challenge
         }
@@ -633,36 +635,243 @@ fn test_zone_settlement_pending_message() {
         challenge: Box::new(challenge_with(json!({}), None)),
         challenge_id: "abc".into(),
         sender_tag: "0x01".into(),
+        sender_tags: vec!["0x01".into()],
         zone_id: 3,
     };
     assert_eq!(
         error.to_string(),
         "Zone 3 withdrawal 0x01 for challenge \"abc\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again."
     );
+    let error = settlement_pending(
+        &challenge_with(json!({}), None),
+        vec!["0x01".into(), "0x02".into()],
+        3,
+    );
+    assert_eq!(
+        error.to_string(),
+        "Zone 3 withdrawal with sender tag 0x01 or 0x02 for challenge \"zone-challenge\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again."
+    );
+}
+
+/// A Zone RPC that leaves the outbox's events out of receipts, as a
+/// production Zone RPC does with other contracts' logs, and whose outbox
+/// reports `before` as its `lastFallbackNonce` at block 0 and `after` at the
+/// withdrawal's block 1. While `fail_reads` is set, those reads fail.
+fn redacting_zone_handler(
+    sent: Arc<Mutex<Vec<String>>>,
+    before: u64,
+    after: u64,
+    fail_reads: Arc<std::sync::atomic::AtomicBool>,
+) -> Handler {
+    let inner = zone_handler(|raw| Ok(zone_receipt(raw, "0x1", json!([]))));
+    let selector = format!(
+        "0x{}",
+        alloy::hex::encode(IZoneOutbox::lastFallbackNonceCall::SELECTOR)
+    );
+    Arc::new(move |method, params| {
+        if method == "eth_sendRawTransactionSync" {
+            sent.lock()
+                .unwrap()
+                .push(params[0].as_str().unwrap_or_default().to_string());
+        }
+        if method == "eth_call" && params[0]["data"].as_str() == Some(selector.as_str()) {
+            if fail_reads.load(Ordering::SeqCst) {
+                return Err((-32000, "read failed".into()));
+            }
+            let nonce = if params[1] == json!("0x0") {
+                before
+            } else {
+                after
+            };
+            return Ok(json!(format!("{:#066x}", nonce)));
+        }
+        inner(method, params)
+    })
 }
 
 #[tokio::test]
-async fn test_withdrawal_without_its_event_is_outcome_unknown() {
-    // The withdrawal succeeded, but its WithdrawalRequested event is missing.
-    let (zone_url, zone_calls) =
-        spawn_rpc(zone_handler(|raw| Ok(zone_receipt(raw, "0x1", json!([]))))).await;
+async fn test_pays_when_the_zone_rpc_redacts_outbox_events() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    // The withdrawal took fallback nonce 7, the one its block added.
+    let (zone_url, _) = spawn_rpc(redacting_zone_handler(sent.clone(), 6, 7, Arc::default())).await;
+    let settlement = Arc::new(Mutex::new((true, B256::repeat_byte(0x33))));
+    let (tempo_url, _) = settling_tempo_rpc(sent.clone(), settlement).await;
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap())
+        .unwrap();
+    let challenge = challenge_with(json!({}), None);
+
+    let credential = provider.pay(&challenge).await.unwrap();
+    let payload = credential.charge_payload().unwrap();
+    assert_eq!(payload.data(), format!("{:#x}", B256::repeat_byte(0x33)));
+    assert_eq!(
+        payload.zone_sender_tag(),
+        Some(format!("{:#x}", sent_sender_tag(&sent)).as_str())
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_retries_a_failed_sender_tag_read_without_withdrawing_again() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let fail_reads = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (zone_url, _) = spawn_rpc(redacting_zone_handler(
+        sent.clone(),
+        6,
+        7,
+        fail_reads.clone(),
+    ))
+    .await;
+    let settlement = Arc::new(Mutex::new((true, B256::repeat_byte(0x33))));
+    let (tempo_url, _) = settling_tempo_rpc(sent.clone(), settlement).await;
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap())
+        .unwrap();
+    let challenge = challenge_with(json!({}), None);
+
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(
+        error.to_string().contains("sender tag could not be read"),
+        "{error}"
+    );
+    fail_reads.store(false, Ordering::SeqCst);
+    let credential = provider.pay(&challenge).await.unwrap();
+    assert_eq!(
+        credential.charge_payload().unwrap().zone_sender_tag(),
+        Some(format!("{:#x}", sent_sender_tag(&sent)).as_str())
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_withdrawal_whose_block_added_no_withdrawal_is_never_sent_again() {
+    // The withdrawal succeeded, but neither its event nor the outbox shows it.
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) = spawn_rpc(redacting_zone_handler(sent.clone(), 7, 7, Arc::default())).await;
     let (provider, _) =
         provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
     let challenge = challenge_with(json!({}), None);
     for _ in 0..2 {
         let error = provider.pay(&challenge).await.unwrap_err();
-        assert!(
-            matches!(error, MppError::PaymentOutcomeUnknown { .. }),
-            "{error}"
-        );
+        let message = error.to_string();
+        assert!(message.contains("sender tag could not be read"), "{error}");
+        assert!(message.contains("did not request a withdrawal"), "{error}");
     }
-    let sends = zone_calls
-        .lock()
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_settlement_pending_error_carries_every_candidate_sender_tag() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    // The withdrawal's block added two, so either may be the payer's.
+    let (zone_url, _) = spawn_rpc(redacting_zone_handler(sent.clone(), 5, 7, Arc::default())).await;
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
         .unwrap()
-        .iter()
-        .filter(|call| *call == "eth_sendRawTransactionSync")
-        .count();
-    assert_eq!(sends, 1);
+        .with_settlement_timeout(Duration::ZERO);
+    let (provider, _) = provider_with_zone(zone).await;
+    let challenge = challenge_with(json!({}), None);
+
+    let error = provider.pay(&challenge).await.unwrap_err();
+    let hash = tx_hash(sent.lock().unwrap().last().unwrap());
+    let candidates =
+        [6, 7].map(|nonce| format!("{:#x}", zone::sender_tag(payer().address(), hash, nonce)));
+    match &error {
+        MppError::ZoneSettlementPending {
+            sender_tag,
+            sender_tags,
+            ..
+        } => {
+            assert!(sender_tag.is_empty());
+            assert_eq!(sender_tags, &candidates);
+        }
+        error => panic!("expected ZoneSettlementPending, got {error}"),
+    }
+    assert!(
+        error.to_string().contains(&format!(
+            "with sender tag {} or {}",
+            candidates[0], candidates[1]
+        )),
+        "{error}"
+    );
+}
+
+/// A Zone RPC whose outbox reports `before` as its `lastFallbackNonce` at
+/// block 9 and `after` at block 10.
+async fn outbox_rpc(before: u64, after: u64) -> alloy::providers::RootProvider<TempoNetwork> {
+    let (url, _) = spawn_rpc(Arc::new(move |method, params| {
+        if method != "eth_call" {
+            return Err((-32000, format!("unexpected {method}")));
+        }
+        let nonce = if params[1] == json!("0x9") {
+            before
+        } else {
+            after
+        };
+        Ok(json!(format!("{:#066x}", nonce)))
+    }))
+    .await;
+    super::super::rpc_provider(url.parse().unwrap(), None)
+}
+
+#[tokio::test]
+async fn test_sender_tag_candidates_derives_one_tag_per_nonce_the_block_added() {
+    let sender = address!("0000000000000000000000000000000000000001");
+    let hash = B256::repeat_byte(0xab);
+    let tags = sender_tag_candidates(&outbox_rpc(4, 6).await, 10, sender, hash)
+        .await
+        .unwrap();
+    assert_eq!(
+        tags,
+        [
+            zone::sender_tag(sender, hash, 5),
+            zone::sender_tag(sender, hash, 6)
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_sender_tag_candidates_rejects_a_block_that_added_no_withdrawal() {
+    let error = sender_tag_candidates(
+        &outbox_rpc(4, 4).await,
+        10,
+        Address::ZERO,
+        B256::repeat_byte(0xab),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("did not request a withdrawal"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn test_sender_tag_candidates_rejects_a_nonce_range_no_block_could_hold() {
+    let error = sender_tag_candidates(
+        &outbox_rpc(0, 1 << 63).await,
+        10,
+        Address::ZERO,
+        B256::repeat_byte(0xab),
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("more than 64"), "{error}");
+}
+
+#[tokio::test]
+async fn test_settlement_wait_needs_a_sender_tag() {
+    let (tempo_url, _) = tempo_rpc(Arc::new(Mutex::new(json!([])))).await;
+    let tempo = super::super::rpc_provider(tempo_url.parse().unwrap(), None);
+    let error =
+        wait_for_settled_withdrawal(&tempo, zone::portal_address(3), &[], None, Duration::ZERO)
+            .await
+            .unwrap_err();
+    assert!(
+        error.to_string().contains("at least one sender tag"),
+        "{error}"
+    );
 }
 
 /// A Zone handler recording the raw transactions it is sent.
@@ -1285,7 +1494,7 @@ async fn test_settlement_wait_bounds_a_stalled_rpc() {
     let result = wait_for_settlement_from(
         &provider,
         zone::portal_address(3),
-        B256::repeat_byte(0x01),
+        &[B256::repeat_byte(0x01)],
         None,
         Duration::ZERO,
         Duration::from_millis(200),
@@ -1325,7 +1534,7 @@ async fn test_settlement_wait_retries_a_failed_tempo_rpc_call() {
     let settlement = wait_for_settlement_from(
         &provider,
         zone::portal_address(3),
-        sender_tag,
+        &[sender_tag],
         None,
         Duration::from_secs(30),
         Duration::from_secs(30),
@@ -1505,7 +1714,12 @@ fn insert_withdrawal(
         challenge: challenge.clone(),
         origin: Some(origin.into()),
         terms: zone.terms_key(challenge, &signer, &signing_mode),
-        request: OnceCell::new_with(Some(Ok(sender_tag))),
+        request: OnceCell::new_with(Some(Ok(SentWithdrawal {
+            block_number: 1,
+            sender: payer().address(),
+            transaction_hash: B256::ZERO,
+            sender_tags: Some(vec![sender_tag]),
+        }))),
         redeemed_late: Mutex::default(),
         waiters: Default::default(),
         sending: Default::default(),
@@ -1715,6 +1929,7 @@ fn test_settlement_pending_message_omits_unknown_sender_tag() {
         challenge: Box::new(challenge.clone()),
         challenge_id: challenge.id.clone(),
         sender_tag: String::new(),
+        sender_tags: Vec::new(),
         zone_id: 3,
     };
     assert_eq!(

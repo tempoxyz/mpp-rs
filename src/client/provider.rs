@@ -1124,6 +1124,7 @@ mod tests {
             )),
             challenge_id: "id".into(),
             sender_tag: String::new(),
+            sender_tags: Vec::new(),
             zone_id: 3,
         };
         // Retried up to the limit, then returned.

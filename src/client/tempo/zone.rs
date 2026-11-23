@@ -51,6 +51,12 @@ const RECEIPT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// must not keep later withdrawals from the same account waiting.
 const ZONE_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The most sender tags derived for one withdrawal whose receipt lacks its
+/// `WithdrawalRequested` event: the withdrawals its Zone block may hold, as
+/// mppx's `maxSenderTagCandidates`. Each candidate is a topic in every
+/// settlement poll's `eth_getLogs` filter.
+const MAX_SENDER_TAG_CANDIDATES: u64 = 64;
+
 /// The error code `eth_sendRawTransactionSync` answers with when the node
 /// admitted the transaction but no receipt arrived in time (EIP-7966).
 const SYNC_SEND_TIMEOUT_CODE: i64 = 4;
@@ -146,7 +152,9 @@ struct PendingWithdrawal {
     /// `None` when the Challenge's metadata can't be read, so it never
     /// matches another.
     terms: Option<String>,
-    request: OnceCell<Result<B256, WithdrawalFailure>>,
+    /// The sent withdrawal, or why it failed. A sender tag that could not be
+    /// read is derived again by every payment, never by withdrawing again.
+    request: OnceCell<Result<SentWithdrawal, WithdrawalFailure>>,
     /// The sender tag of a withdrawal whose Credential was returned after its
     /// challenge expired, as mppx's `redeemedLate`. Only a retry of that
     /// challenge may get the Credential again; until its redemption window
@@ -162,6 +170,21 @@ struct PendingWithdrawal {
     /// resumed wait searches from there again, so a settlement older than
     /// the lookback window is still found.
     settlement_cursor: Mutex<Option<u64>>,
+}
+
+/// A sent Zone withdrawal: its sender tag when the receipt carried it, and
+/// what derives it otherwise, as mppx's `ZoneWithdrawal`.
+#[derive(Clone, Debug)]
+struct SentWithdrawal {
+    /// The Zone block that included the withdrawal transaction.
+    block_number: u64,
+    /// The paying account.
+    sender: Address,
+    /// The withdrawal transaction's hash.
+    transaction_hash: B256,
+    /// The withdrawal's sender tag, or `None` when a Zone RPC left the
+    /// outbox's `WithdrawalRequested` event out of the receipt.
+    sender_tags: Option<Vec<B256>>,
 }
 
 /// Why a Zone withdrawal request failed, shared by every payment of its
@@ -504,12 +527,11 @@ impl TempoZone {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             if let Some(sender_tag) = redeemed_late {
-                return Err(MppError::ZoneSettlementPending {
-                    challenge: Box::new(entry.challenge.clone()),
-                    challenge_id: entry.challenge.id.clone(),
-                    sender_tag,
-                    zone_id: self.zone_id.unwrap_or_default(),
-                });
+                return Err(settlement_pending(
+                    &entry.challenge,
+                    vec![sender_tag],
+                    self.zone_id.unwrap_or_default(),
+                ));
             }
             // A payment still waiting on it is another payment in flight, not
             // one this challenge retries: sharing its Credential would leave
@@ -637,12 +659,8 @@ impl TempoZone {
         };
         // The withdrawal pays its own challenge, which may be an earlier one.
         let paid = &withdrawal.challenge;
-        let pending_error = |sender_tag: String| MppError::ZoneSettlementPending {
-            challenge: Box::new(paid.clone()),
-            challenge_id: paid.id.clone(),
-            sender_tag,
-            zone_id,
-        };
+        let pending_error =
+            |sender_tags: Vec<String>| settlement_pending(paid, sender_tags, zone_id);
         let checked = (|| {
             // A withdrawal started for an earlier challenge pays only that
             // challenge, so its Credential goes only back to the origin that
@@ -657,13 +675,13 @@ impl TempoZone {
                     && origin != withdrawal.origin.as_deref()
             };
             if other_origin {
-                return Err(pending_error(String::new()));
+                return Err(pending_error(Vec::new()));
             }
             // Past its redemption window, the server refuses the challenge's
             // Credential, but the withdrawal may still have paid it: fail
             // closed rather than withdraw again.
             if !is_redeemable(paid) {
-                return Err(pending_error(String::new()));
+                return Err(pending_error(Vec::new()));
             }
             let request: ChargeRequest = paid.request.decode()?;
             request.recipient_address()
@@ -733,7 +751,7 @@ impl TempoZone {
                             )
                             .await
                         {
-                            Ok(sender_tag) => Ok(Ok(sender_tag)),
+                            Ok(sent) => Ok(Ok(sent)),
                             Err((WithdrawalFailure::Abandoned, error)) => {
                                 own_error = Some(error);
                                 Err(())
@@ -772,8 +790,8 @@ impl TempoZone {
                 )));
             }
         };
-        let sender_tag = match outcome {
-            Ok(sender_tag) => sender_tag,
+        let sent = match outcome {
+            Ok(sent) => sent,
             Err(failure) => {
                 // Only a failure before the transaction was sent is safe to
                 // retry. After that, the withdrawal may have gone through, so
@@ -786,6 +804,37 @@ impl TempoZone {
                 }
                 return Err(own_error.unwrap_or_else(|| failure.to_error()));
             }
+        };
+        // Derived on every attempt, so a failed read on the Zone is retried
+        // with the challenge without withdrawing again: the withdrawal stays
+        // pending.
+        let sender_tags = match sent.sender_tags {
+            Some(sender_tags) => sender_tags,
+            None => self
+                .bounded(sender_tag_candidates(
+                    &self.rpc_provider,
+                    sent.block_number,
+                    sent.sender,
+                    sent.transaction_hash,
+                ))
+                .await
+                .unwrap_or_else(|| {
+                    Err(MppError::Http(
+                        "timed out reading the Zone outbox's lastFallbackNonce".into(),
+                    ))
+                })
+                .map_err(|cause| {
+                    MppError::Http(format!(
+                        "Zone withdrawal transaction {:#x} was sent, but its sender tag could not be read from the Zone. Retry the challenge to resume without withdrawing again. Cause: {cause}",
+                        sent.transaction_hash
+                    ))
+                })?,
+        };
+        let tag_strings = || {
+            sender_tags
+                .iter()
+                .map(|tag| format!("{tag:#x}"))
+                .collect::<Vec<_>>()
         };
 
         let timeout = settlement_timeout(paid, self.settlement_timeout);
@@ -801,14 +850,16 @@ impl TempoZone {
         let settlement = wait_for_settlement_from(
             tempo,
             zone::portal_address(zone_id),
-            sender_tag,
+            &sender_tags,
             Some(recipient),
             timeout,
             limit,
             &withdrawal.settlement_cursor,
         )
         .await
-        .map_err(|_| pending_error(format!("{sender_tag:#x}")))?;
+        .map_err(|_| pending_error(tag_strings()))?;
+        // The tag of the withdrawal that settled, among the candidates.
+        let sender_tag = settlement.sender_tag;
         // The Credential pays once: a later challenge with the same terms is a
         // new payment. One made after its challenge expired is accepted only by
         // a server that grants a grace period, so the withdrawal stays for a
@@ -846,7 +897,8 @@ impl TempoZone {
     }
 
     /// Requests a Zone withdrawal of the challenge amount to its recipient,
-    /// bound to the challenge by its memo, and returns its sender tag.
+    /// bound to the challenge by its memo, and returns it with its sender tag,
+    /// or what derives the tag when the Zone RPC hides it from the receipt.
     // The error pairs the cached failure with the caller's own error; it is
     // returned once per withdrawal, so boxing it buys nothing.
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
@@ -859,7 +911,7 @@ impl TempoZone {
         signing_mode: &TempoSigningMode,
         abandoned: &(dyn Fn() -> bool + Sync),
         begin_send: &(dyn Fn() -> bool + Sync),
-    ) -> Result<B256, (WithdrawalFailure, MppError)> {
+    ) -> Result<SentWithdrawal, (WithdrawalFailure, MppError)> {
         let abandon = || (WithdrawalFailure::Abandoned, abandoned_error());
         let retryable = |error: MppError| (WithdrawalFailure::Retryable(error.to_string()), error);
         let request: ChargeRequest = challenge.request.decode().map_err(retryable)?;
@@ -1042,23 +1094,45 @@ impl TempoZone {
             }
             _ => return Err(unknown()),
         }
-        // The withdrawal succeeded but its event can't be found, or doesn't
-        // describe the withdrawal signed here: its outcome is unknown, so no
-        // flow pays the challenge another way.
-        let requested = withdrawal_requested(&receipt)
-            .filter(|event| {
-                event.sender == from
+        // The withdrawal succeeded, but its event doesn't describe the
+        // withdrawal signed here: its outcome is unknown, so no flow pays the
+        // challenge another way. A Zone RPC that redacts other contracts' logs
+        // leaves the event out of the receipt: then the sender tag is derived
+        // from the outbox's state at the receipt's block.
+        let sender_tags = match withdrawal_requested(&receipt) {
+            Some(event) => {
+                if !(event.sender == from
                     && event.token == currency
                     && event.to == recipient
                     && event.amount == amount_u128
-                    && event.memo == B256::from(memo)
-            })
-            .ok_or_else(unknown)?;
-        Ok(zone::sender_tag(
-            requested.sender,
-            hash,
-            requested.fallbackNonce,
-        ))
+                    && event.memo == B256::from(memo))
+                {
+                    return Err(unknown());
+                }
+                Some(vec![zone::sender_tag(
+                    event.sender,
+                    hash,
+                    event.fallbackNonce,
+                )])
+            }
+            None => None,
+        };
+        let block_number = receipt
+            .get("blockNumber")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|number| u64::from_str_radix(number.strip_prefix("0x")?, 16).ok());
+        // Without the event, only the block derives the tag.
+        let block_number = match (block_number, &sender_tags) {
+            (Some(block_number), _) => block_number,
+            (None, Some(_)) => 0,
+            (None, None) => return Err(unknown()),
+        };
+        Ok(SentWithdrawal {
+            block_number,
+            sender: from,
+            transaction_hash: hash,
+            sender_tags,
+        })
     }
 
     /// Whether the Zone refused the withdrawal `hash` whose send failed with
@@ -1174,6 +1248,91 @@ fn withdrawal_requested(receipt: &serde_json::Value) -> Option<IZoneOutbox::With
         .find_map(|log| IZoneOutbox::WithdrawalRequested::decode_log_data(log.data()).ok())
 }
 
+/// The error for a Zone withdrawal paying `challenge` that has not settled,
+/// carrying `sender_tags`: its sender tag alone when known, else every
+/// candidate. `sender_tag` is set only when exactly one remains, so it never
+/// names a tag that may not be this payment's.
+fn settlement_pending(
+    challenge: &PaymentChallenge,
+    sender_tags: Vec<String>,
+    zone_id: u32,
+) -> MppError {
+    let sender_tag = match sender_tags.as_slice() {
+        [sender_tag] => sender_tag.clone(),
+        _ => String::new(),
+    };
+    MppError::ZoneSettlementPending {
+        challenge: Box::new(challenge.clone()),
+        challenge_id: challenge.id.clone(),
+        sender_tag,
+        sender_tags,
+        zone_id,
+    }
+}
+
+/// Derives the sender tags a Zone withdrawal transaction may carry when its
+/// receipt has no `WithdrawalRequested` event, as on a Zone RPC that redacts
+/// logs, as mppx's `Zone.senderTagCandidates`.
+///
+/// The outbox numbers each withdrawal with the next `lastFallbackNonce`, so
+/// the transaction's withdrawal took one of the nonces its block added. Every
+/// candidate hashes the payer's address and transaction, so only the payer's
+/// withdrawal can match one.
+///
+/// # Errors
+///
+/// Fails when a read fails, when the block added no withdrawal, and when it
+/// added more than 64: the nonces come from the Zone RPC, so a range no block
+/// could hold is refused rather than hashed.
+pub async fn sender_tag_candidates(
+    zone: &impl Provider<TempoNetwork>,
+    block_number: u64,
+    sender: Address,
+    transaction_hash: B256,
+) -> Result<Vec<B256>, MppError> {
+    let did_not_request = || {
+        MppError::Http(format!(
+            "Zone withdrawal transaction {transaction_hash:#x} did not request a withdrawal from the outbox."
+        ))
+    };
+    let previous = block_number.checked_sub(1).ok_or_else(did_not_request)?;
+    let last_fallback_nonce = |block_number: u64| async move {
+        let data = alloy::hex::encode_prefixed(IZoneOutbox::lastFallbackNonceCall {}.abi_encode());
+        let result: Bytes = zone
+            .raw_request(
+                "eth_call".into(),
+                (
+                    serde_json::json!({ "to": zone::ZONE_OUTBOX, "data": data }),
+                    format!("{block_number:#x}"),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                MppError::Http(format!(
+                    "failed to read the Zone outbox's lastFallbackNonce: {e}"
+                ))
+            })?;
+        IZoneOutbox::lastFallbackNonceCall::abi_decode_returns(&result)
+            .map_err(|e| MppError::Http(format!("invalid Zone outbox lastFallbackNonce: {e}")))
+    };
+    let (before, after) = tokio::try_join!(
+        last_fallback_nonce(previous),
+        last_fallback_nonce(block_number)
+    )?;
+    if after <= before {
+        return Err(did_not_request());
+    }
+    let count = after - before;
+    if count > MAX_SENDER_TAG_CANDIDATES {
+        return Err(MppError::Http(format!(
+            "Zone withdrawal transaction {transaction_hash:#x} has {count} candidate sender tags, more than {MAX_SENDER_TAG_CANDIDATES}."
+        )));
+    }
+    Ok((before + 1..=after)
+        .map(|fallback_nonce| zone::sender_tag(sender, transaction_hash, fallback_nonce))
+        .collect())
+}
+
 /// Whether a Zone withdrawal can be sent and waited on for up to `timeout`
 /// before the challenge expires.
 fn settles_before_expiry(challenge: &PaymentChallenge, timeout: Duration) -> bool {
@@ -1270,24 +1429,47 @@ pub async fn wait_for_settlement(
     to: Option<Address>,
     timeout: Duration,
 ) -> Result<B256, MppError> {
+    let (hash, _) =
+        wait_for_settled_withdrawal(provider, portal, &[sender_tag], to, timeout).await?;
+    Ok(hash)
+}
+
+/// Waits until `portal` emits `WithdrawalProcessed` for any of `sender_tags`
+/// (and `to`, when given) on Tempo, and returns the transaction hash that
+/// settled it with the sender tag it carried, as mppx's
+/// `Zone.waitForSettledWithdrawal`.
+///
+/// # Errors
+///
+/// Fails when `sender_tags` is empty, and when no settlement appears within
+/// `timeout`.
+pub async fn wait_for_settled_withdrawal(
+    provider: &impl Provider<TempoNetwork>,
+    portal: Address,
+    sender_tags: &[B256],
+    to: Option<Address>,
+    timeout: Duration,
+) -> Result<(B256, B256), MppError> {
     let limit = timeout.max(FIRST_SCAN_TIMEOUT);
     let settlement = wait_for_settlement_from(
         provider,
         portal,
-        sender_tag,
+        sender_tags,
         to,
         timeout,
         limit,
         &Mutex::new(None),
     )
     .await?;
-    Ok(settlement.hash)
+    Ok((settlement.hash, settlement.sender_tag))
 }
 
 /// A `WithdrawalProcessed` event found on Tempo.
 struct Settlement {
     /// The transaction that emitted it.
     hash: B256,
+    /// The sender tag it carried.
+    sender_tag: B256,
     /// Whether it reports the payout bounced (`callbackSuccess` false).
     bounced: bool,
 }
@@ -1299,17 +1481,27 @@ struct Settlement {
 async fn wait_for_settlement_from(
     provider: &impl Provider<TempoNetwork>,
     portal: Address,
-    sender_tag: B256,
+    sender_tags: &[B256],
     to: Option<Address>,
     timeout: Duration,
     limit: Duration,
     cursor: &Mutex<Option<u64>>,
 ) -> Result<Settlement, MppError> {
+    if sender_tags.is_empty() {
+        return Err(MppError::Http(
+            "Zone settlement needs at least one sender tag.".into(),
+        ));
+    }
     // A timeout past what an Instant can hold waits without a deadline.
     let deadline = tokio::time::Instant::now().checked_add(timeout);
     let timed_out = || {
+        let tags = sender_tags
+            .iter()
+            .map(|tag| format!("{tag:#x}"))
+            .collect::<Vec<_>>()
+            .join(" or ");
         MppError::Http(format!(
-            "Zone withdrawal {sender_tag:#x} did not settle on Tempo within {}ms.",
+            "Zone withdrawal {tags} did not settle on Tempo within {}ms.",
             timeout.as_millis()
         ))
     };
@@ -1337,23 +1529,31 @@ async fn wait_for_settlement_from(
                     let mut filter = Filter::new()
                         .address(portal)
                         .event_signature(IZonePortal::WithdrawalProcessed::SIGNATURE_HASH)
-                        .topic2(sender_tag)
+                        .topic2(sender_tags.to_vec())
                         .from_block(from)
                         .to_block(latest);
                     if let Some(to) = to {
                         filter = filter.topic1(to.into_word());
                     }
                     if let Ok(logs) = provider.get_logs(&filter).await {
-                        if let Some((log, hash)) = logs
-                            .iter()
-                            .find_map(|log| Some((log, log.transaction_hash?)))
-                        {
+                        if let Some((log, hash, sender_tag)) = logs.iter().find_map(|log| {
+                            let sender_tag = *log.topics().get(2)?;
+                            sender_tags.contains(&sender_tag).then_some((
+                                log,
+                                log.transaction_hash?,
+                                sender_tag,
+                            ))
+                        }) {
                             // Only an event that reports a bounce counts as one: the
                             // server verifies the Credential's settlement either way.
                             let bounced =
                                 IZonePortal::WithdrawalProcessed::decode_log_data(log.data())
                                     .is_ok_and(|event| !event.callbackSuccess);
-                            return Ok(Settlement { hash, bounced });
+                            return Ok(Settlement {
+                                hash,
+                                sender_tag,
+                                bounced,
+                            });
                         }
                         from_block = Some(latest + 1);
                     }
