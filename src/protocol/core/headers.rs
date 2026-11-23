@@ -293,12 +293,6 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
                 "Invalid auth-param name: expected a token",
             ));
         }
-        // An empty unquoted value is still read as "", as mppx reads it.
-        if !tokens.quoted() && !value.is_empty() && !is_token(&value) {
-            return Err(MppError::invalid_challenge_reason(
-                "Invalid auth-param value: expected a token or quoted-string",
-            ));
-        }
         // Auth-param names are case-insensitive (RFC 9110 §11.2).
         let key = name.to_ascii_lowercase();
         if key == "request" && value.len() > MAX_TOKEN_LEN {
@@ -312,6 +306,13 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
                 "Duplicate parameter: {}",
                 name
             )));
+        }
+        // Checked after the length and duplicate checks, which reject cheaply.
+        // An empty unquoted value is still read as "", as mppx reads it.
+        if !tokens.quoted() && !value.is_empty() && !is_token(&value) {
+            return Err(MppError::invalid_challenge_reason(
+                "Invalid auth-param value: expected a token or quoted-string",
+            ));
         }
         params.insert(key, value.into_owned());
     }
