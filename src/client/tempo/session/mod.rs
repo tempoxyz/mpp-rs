@@ -143,6 +143,9 @@ pub struct TempoSessionProvider {
     autoswap: Option<AutoswapConfig>,
     /// Token paying gas for unsponsored opens and top-ups.
     fee_token: Option<Address>,
+    /// Gas token for unsponsored opens and top-ups that neither the server
+    /// nor an autoswap picked one for; see [`Self::with_default_fee_token`].
+    default_fee_token: Option<Address>,
     /// Session currencies this client pays in; see [`Self::with_currencies`].
     currencies: Option<Vec<String>>,
     /// Session recipients this client pays; see [`Self::with_expected_recipients`].
@@ -396,6 +399,7 @@ impl TempoSessionProvider {
             top_up_amount: None,
             autoswap: None,
             fee_token: None,
+            default_fee_token: None,
             currencies: None,
             expected_recipients: None,
             max_amount: None,
@@ -663,6 +667,24 @@ impl TempoSessionProvider {
     pub fn with_fee_token(mut self, token: Address) -> Self {
         self.fee_token = Some(token);
         self
+    }
+
+    /// Pay gas for unsponsored channel opens and top-ups in `token` when
+    /// nothing else picks a gas token.
+    ///
+    /// Unlike [`Self::with_fee_token`], this ranks below the server's
+    /// advertised `feeToken` and the input token of a swap autoswap actually
+    /// made, and only replaces the session currency. A wallet holding exactly
+    /// the deposit in the session currency would otherwise be left short by
+    /// the gas it pays in that currency.
+    pub fn with_default_fee_token(mut self, token: Address) -> Self {
+        self.default_fee_token = Some(token);
+        self
+    }
+
+    /// Get the default fee token, if set.
+    pub fn default_fee_token(&self) -> Option<Address> {
+        self.default_fee_token
     }
 
     /// Only pay sessions in these TIP-20 currencies, compared
@@ -1213,15 +1235,19 @@ impl TempoSessionProvider {
     }
 
     /// The gas token without an advertised one: the configured fee token, else
-    /// the token autoswap chose for `route` ([`AutoswapConfig::fee_token_for`]),
-    /// else the session currency.
+    /// the input token of the swap in `route`, else the default fee token, else
+    /// the token autoswap picks for a currency that cannot pay its own gas
+    /// ([`AutoswapConfig::fee_token_for`]), else the session currency.
     fn fee_token(&self, currency: Address, route: Option<&AutoswapRoute>) -> Address {
+        let autoswap = self.autoswap.as_ref();
         self.fee_token
             .or_else(|| {
-                self.autoswap
-                    .as_ref()
-                    .and_then(|config| config.fee_token_for(route, currency))
+                autoswap
+                    .zip(route)
+                    .and_then(|(config, route)| route.fee_token(config))
             })
+            .or(self.default_fee_token)
+            .or_else(|| autoswap.and_then(|config| config.fee_token_for(route, currency)))
             .unwrap_or(currency)
     }
 
@@ -5191,6 +5217,103 @@ mod tests {
                 .with_fee_token(fee_token)
                 .fee_token(currency, Some(&route)),
             fee_token
+        );
+    }
+
+    /// An unsponsored session holding exactly the USDC.e deposit opens without
+    /// a swap, so gas would come out of the deposit currency and leave it
+    /// short; the default fee token pays gas in pathUSD instead.
+    #[tokio::test]
+    async fn default_fee_token_pays_gas_for_exactly_funded_session() {
+        use alloy::{
+            providers::{mock::Asserter, ProviderBuilder},
+            sol_types::SolCall,
+        };
+        use tempo_alloy::contracts::precompiles::{ITIP20, TIP20_CHANNEL_RESERVE_ADDRESS};
+
+        let usdc: Address = crate::protocol::methods::tempo::USDC.parse().unwrap();
+        let path_usd: Address = crate::protocol::methods::tempo::PATH_USD.parse().unwrap();
+        let deposit = 1_000_000u128;
+        let provider = make_test_provider()
+            .with_autoswap(AutoswapConfig::new(path_usd, 100).with_fallback(false));
+
+        // The payer's USDC.e balance equals the deposit: no swap is needed.
+        let asserter = Asserter::new();
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            ITIP20::balanceOfCall::abi_encode_returns(&U256::from(deposit)),
+        ));
+        let rpc =
+            ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
+        let (calls, route) = provider
+            .autoswap_calls(&rpc, 42431, Address::repeat_byte(0x11), usdc, deposit)
+            .await
+            .unwrap();
+        assert!(calls.is_empty());
+        assert!(route.is_none());
+
+        let request = |details: serde_json::Value| SessionRequest {
+            amount: "1".into(),
+            currency: usdc.to_string(),
+            recipient: Some(Address::repeat_byte(0x22).to_string()),
+            method_details: Some(details),
+            ..Default::default()
+        };
+        let escrow = TIP20_CHANNEL_RESERVE_ADDRESS.to_string();
+        let unsponsored = request(serde_json::json!({
+            "chainId": 42431,
+            "escrowContract": escrow,
+        }));
+
+        // Unset, the session currency pays gas as before.
+        assert_eq!(
+            provider
+                .session_fee_token(&unsponsored, usdc, None)
+                .unwrap(),
+            usdc
+        );
+
+        let provider = provider.with_default_fee_token(path_usd);
+        assert_eq!(
+            provider
+                .session_fee_token(&unsponsored, usdc, None)
+                .unwrap(),
+            path_usd
+        );
+
+        // A token the server advertises still wins over the default.
+        let advertised = Address::repeat_byte(0x33);
+        let advertising = request(serde_json::json!({
+            "chainId": 42431,
+            "escrowContract": escrow,
+            "feeToken": advertised.to_string(),
+        }));
+        assert_eq!(
+            provider
+                .session_fee_token(&advertising, usdc, None)
+                .unwrap(),
+            advertised
+        );
+
+        // So does the input token of a swap autoswap actually made.
+        let swapped = AutoswapRoute {
+            token_in: Address::repeat_byte(0x44),
+            calls: Vec::new(),
+        };
+        assert_eq!(
+            provider
+                .session_fee_token(&unsponsored, usdc, Some(&swapped))
+                .unwrap(),
+            swapped.token_in
+        );
+
+        // And an explicit fee token wins over everything.
+        let explicit = Address::repeat_byte(0x55);
+        assert_eq!(
+            provider
+                .with_fee_token(explicit)
+                .session_fee_token(&advertising, usdc, Some(&swapped))
+                .unwrap(),
+            explicit
         );
     }
 

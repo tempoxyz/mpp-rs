@@ -75,6 +75,7 @@ struct SessionSettings {
     top_up_amount: Option<u128>,
     max_deposit: Option<u128>,
     fee_token: Option<Address>,
+    default_fee_token: Option<Address>,
     prepaid_requests: Option<u32>,
     events: Option<ClientEvents>,
     hint_client: Option<reqwest::Client>,
@@ -466,6 +467,14 @@ impl TempoAccountsProvider {
         self
     }
 
+    /// Pay gas for unsponsored session opens and top-ups in `token` when
+    /// neither the server nor an autoswap picks a gas token; see
+    /// [`TempoSessionProvider::with_default_fee_token`].
+    pub fn with_session_default_fee_token(mut self, token: Address) -> Self {
+        self.session_settings.default_fee_token = Some(token);
+        self
+    }
+
     /// Get the session provider for the pinned chain, so callers can close or
     /// top up the channels it opened.
     ///
@@ -609,6 +618,9 @@ impl TempoAccountsProvider {
         }
         if let Some(token) = settings.fee_token {
             provider = provider.with_fee_token(token);
+        }
+        if let Some(token) = settings.default_fee_token {
+            provider = provider.with_default_fee_token(token);
         }
         if let Some(requests) = settings.prepaid_requests {
             provider = provider.with_prepaid_requests(requests);
@@ -1139,7 +1151,8 @@ mod tests {
             ))
             .with_session_default_deposit(20_000)
             .with_session_top_up_amount(20_000)
-            .with_session_max_deposit(1_000_000);
+            .with_session_max_deposit(1_000_000)
+            .with_session_default_fee_token(swap_token);
         assert_eq!(provider.session_settings.top_up_amount, Some(20_000));
         let session = provider.configured_session_provider(None).unwrap();
 
@@ -1152,6 +1165,7 @@ mod tests {
         assert!(session.supports("tempo", "session"));
         assert_eq!(session.signer().address(), expected_key);
         assert_eq!(session.autoswap().unwrap().token_in, swap_token);
+        assert_eq!(session.default_fee_token(), Some(swap_token));
         std::fs::remove_file(path).unwrap();
     }
 
