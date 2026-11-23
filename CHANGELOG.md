@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.23.0 (2026-11-23)
+
+### Minor Changes
+
+- Restricted payment method names to lowercase letters (a-z), as mppx does; Challenges, Credentials and Receipts with digits, `:`, `_` or `-` in the method are rejected, so rename custom methods that use them. (by @brendanjryan, [#755](https://github.com/tempoxyz/mpp-rs/pull/755))
+- Fixed `WWW-Authenticate` parsing to read a backslash escape as an RFC 9110 quoted-pair (`\u2014` is the text `u2014`), and formatting now rejects characters outside printable ASCII in every auth-param but `description`, which still escapes them as `\uXXXX`, as mppx does. Clients now skip, before paying, a Challenge whose server escaped a parameter it binds or echoes (any recognized one but `description`) as `\uXXXX`, and fail with "Legacy unicode-escaped challenge" when no other Challenge remains (see `parse_payable_challenges`).
+- Added the public field `PaymentChallenge::legacy_unicode_escape`, so code that builds a `PaymentChallenge` with a struct literal must set it (or build it with `PaymentChallenge::new`). (by @brendanjryan, [#755](https://github.com/tempoxyz/mpp-rs/pull/755))
+- Changed `parse_authorization` to read only `Payment <base64url-json>`, as mppx's `Credential.deserialize` does: pass an `Authorization` value that lists other schemes through `extract_payment_scheme` first. Challenge parsing required a comma between auth-params, and RFC 9110 tokens for parameter names and unquoted values. (by @brendanjryan, [#755](https://github.com/tempoxyz/mpp-rs/pull/755))
+
+### Patch Changes
+
+- Fixed `sign_with` to refuse, before calling the remote signer, an attestation the SDK could not decode (longer than 8,192 characters, with an empty key ID, or with claims that are not a JSON object or are nested too deeply), and stopped `IdentityError::Signer` from repeating its cause in its message. (by @brendanjryan, [#755](https://github.com/tempoxyz/mpp-rs/pull/755))
+- Fixed `base64url_decode`, and the header parsers built on it, accepting `=` anywhere but as trailing padding, so a Payment-Receipt or credential such as `=eyJ...` no longer parses, as in mppx. (by @brendanjryan, [#755](https://github.com/tempoxyz/mpp-rs/pull/755))
+- Made `Mpp::create` and `Mpp::create_stripe` reject a realm outside printable ASCII, which a Challenge header can't carry, instead of failing every Challenge at request time. (by @brendanjryan, [#755](https://github.com/tempoxyz/mpp-rs/pull/755))
+- Added `attestation::sign_with` and the `RemoteSigner` trait, so issuers can sign attestations with an Ed25519 key that stays in a cloud KMS, an HSM or a wallet service, as mppx's `Attestation.sign` does. Each remote signature is verified against the signer's public key before it is used, and the `kid` defaults to the key's RFC 7638 `thumbprint`. (by @brendanjryan, [#755](https://github.com/tempoxyz/mpp-rs/pull/755))
+- Fixed TIP-1034 session credentials to name the channel's funding payer from the channel descriptor as their `source`, so a delegated voucher signer still identifies the funding account, as mppx does. Legacy escrow sessions keep naming the signing wallet, and a provider clone for another wallet no longer replays a pending open signed for the first. (by @brendanjryan, [#755](https://github.com/tempoxyz/mpp-rs/pull/755))
+
 ## 0.22.0 (2026-11-23)
 
 ### Minor Changes
