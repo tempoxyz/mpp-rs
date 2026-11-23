@@ -1436,7 +1436,7 @@ mod tests {
     #[test]
     fn test_parse_payable_challenges_reads_other_quoted_pairs() {
         for (param, value, expected) in [
-            ("realm", r#"quote " here"#, r#"quote " here"#),
+            ("realm", r#"quote \" here"#, r#"quote " here"#),
             ("realm", r"slash \\ here", r"slash \ here"),
             ("realm", r"escaped slash \\u00e9", r"escaped slash \u00e9"),
             ("realm", r"short \u12 tail", "short u12 tail"),
