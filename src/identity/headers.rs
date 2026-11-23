@@ -7,6 +7,8 @@
 /// proxy. Provers declare their own extra sensitive headers in
 /// [`Prover::headers`](super::client::Prover::headers).
 pub const REQUEST: &[&str] = &[
+    "agent-id",
+    "agent-signature",
     "dpop",
     "identity-attestation",
     "identity-presentation",

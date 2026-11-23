@@ -71,6 +71,8 @@ identity-tempo-id = [
 identity-attestation = ["identity", "dep:reqwest", "dep:ed25519-dalek"]
 # Email OTP identity attestations (requires identity-attestation)
 identity-email-otp = ["identity-attestation"]
+# ERC-8004 agent identity provider (requires identity)
+identity-erc8004 = ["identity", "evm", "dep:reqwest"]
 
 # Utilities
 utils = ["hex"]

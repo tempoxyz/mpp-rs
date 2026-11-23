@@ -13,5 +13,8 @@ pub mod attestation;
 #[cfg(feature = "identity-email-otp")]
 pub mod email_otp;
 
+#[cfg(feature = "identity-erc8004")]
+pub mod erc8004;
+
 #[cfg(feature = "identity-tempo-id")]
 pub mod tempo_id;

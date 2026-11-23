@@ -28,6 +28,8 @@ const PAYMENT_HEADERS: &[&str] = &[
 /// headers, Tempo ID's DPoP proof and ID token), which name the user to the
 /// proxy and never go upstream.
 const IDENTITY_HEADERS: &[&str] = &[
+    "agent-id",
+    "agent-signature",
     "dpop",
     "identity-attestation",
     "identity-presentation",
