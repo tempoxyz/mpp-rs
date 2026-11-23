@@ -1301,20 +1301,36 @@ mod tests {
             r#"Payment id=0 realm="\," method="a" intent="a" request=e30"#,
             r#"Payment id="0", realm="api" method="tempo", intent="charge", request="e30""#,
         ] {
-            assert!(parse_www_authenticate(header).is_err(), "{header}");
-            assert!(parse_www_authenticate_all([header])[0].is_err(), "{header}");
+            let error = parse_www_authenticate(header).unwrap_err().to_string();
+            assert!(error.contains("Expected ','"), "{header}: {error}");
+            let all = parse_www_authenticate_all([header]);
+            let error = all[0].as_ref().unwrap_err().to_string();
+            assert!(error.contains("Expected ','"), "{header}: {error}");
         }
     }
 
     #[test]
     fn test_parse_www_authenticate_rejects_non_token_names_and_values() {
-        for header in [
-            r#"Payment id=\,", realm="api", method="tempo", intent="charge", request="e30""#,
-            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", d"escription="x""#,
-            r#"Payment id=a:b, realm="api", method="tempo", intent="charge", request="e30""#,
-            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request=e30=e30"#,
+        for (header, reason) in [
+            (
+                r#"Payment id=\,", realm="api", method="tempo", intent="charge", request="e30""#,
+                "Invalid auth-param value",
+            ),
+            (
+                r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", d"escription="x""#,
+                "Invalid auth-param name",
+            ),
+            (
+                r#"Payment id=a:b, realm="api", method="tempo", intent="charge", request="e30""#,
+                "Invalid auth-param value",
+            ),
+            (
+                r#"Payment id="abc", realm="api", method="tempo", intent="charge", request=e30=e30"#,
+                "Invalid auth-param value",
+            ),
         ] {
-            assert!(parse_www_authenticate(header).is_err(), "{header}");
+            let error = parse_www_authenticate(header).unwrap_err().to_string();
+            assert!(error.contains(reason), "{header}: {error}");
         }
         let header =
             "Payment id=a!#$%&'*+-.^_`|~9, realm=api, method=tempo, intent=charge, request=e30";
