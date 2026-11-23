@@ -9,7 +9,7 @@
 //!
 //! The parser is implemented without regex for minimal dependencies.
 
-use super::auth_params::{escape_quoted_value, Tokenizer};
+use super::auth_params::{escape_quoted_value, is_token, Tokenizer};
 use super::challenge::PaymentChallenge;
 use super::credential::PaymentCredential;
 use super::receipt::Receipt;
@@ -280,6 +280,27 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
 fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
     let mut params = HashMap::new();
     while let Some((name, value)) = tokens.param()? {
+        // auth-params = auth-param *( OWS "," OWS auth-param )
+        if !params.is_empty() && !tokens.after_comma() {
+            return Err(MppError::invalid_challenge_reason(format!(
+                "Expected ',' before parameter: {}",
+                name
+            )));
+        }
+        // auth-param = token BWS "=" BWS ( token / quoted-string )
+        if !is_token(name) {
+            return Err(MppError::invalid_challenge_reason(format!(
+                "Invalid parameter name: {:?}",
+                name
+            )));
+        }
+        // An empty unquoted value is still read as "", as mppx reads it.
+        if !tokens.quoted() && !value.is_empty() && !is_token(&value) {
+            return Err(MppError::invalid_challenge_reason(format!(
+                "Invalid value for parameter {}: expected a token or quoted-string",
+                name
+            )));
+        }
         // Auth-param names are case-insensitive (RFC 9110 §11.2).
         let key = name.to_ascii_lowercase();
         if key == "request" && value.len() > MAX_TOKEN_LEN {
@@ -553,9 +574,12 @@ pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<V
     challenges.iter().map(format_www_authenticate).collect()
 }
 
-/// Parse an Authorization header into a PaymentCredential.
+/// Parse a Payment credential into a PaymentCredential.
 ///
-/// Format: `Payment <base64url-json>`
+/// Format: `Payment <base64url-json>`, and nothing else, as mppx's
+/// `Credential.deserialize` reads it. To read the credential from an
+/// `Authorization` field value that may list other schemes too, pass it
+/// through [`extract_payment_scheme`] first.
 ///
 /// Headers longer than 64 KiB are rejected before decoding.
 pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
@@ -567,11 +591,18 @@ pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
         )));
     }
 
-    let payment_part = extract_payment_scheme(header)
+    // credentials = "Payment" 1*SP base64url-nopad, with optional
+    // whitespace around the field value.
+    let value = header.trim_matches([' ', '\t']);
+    let token = value
+        .get(..PAYMENT_SCHEME.len())
+        .filter(|scheme| scheme.eq_ignore_ascii_case(PAYMENT_SCHEME))
+        .map(|_| &value[PAYMENT_SCHEME.len()..])
+        .and_then(|rest| {
+            let token = rest.trim_start_matches([' ', '\t']);
+            (token.len() < rest.len() && !token.is_empty()).then_some(token)
+        })
         .ok_or_else(|| MppError::malformed_credential("Expected 'Payment' scheme"))?;
-
-    // Strip "Payment " prefix to get the token
-    let token = payment_part.get(8..).unwrap_or("").trim();
 
     let decoded =
         base64url_decode(token).map_err(|_| MppError::malformed_credential("Invalid base64url"))?;
@@ -1230,8 +1261,68 @@ mod tests {
 
         // Prepend a Bearer scheme to simulate mixed Authorization
         let mixed = format!("Bearer some-token, {}", formatted);
-        let parsed = parse_authorization(&mixed).unwrap();
+        let parsed = parse_authorization(extract_payment_scheme(&mixed).unwrap()).unwrap();
         assert_eq!(parsed.challenge.id, "abc123");
+    }
+
+    #[test]
+    fn test_parse_authorization_rejects_text_around_the_credential() {
+        let formatted = format_authorization(&PaymentCredential::new(
+            test_challenge().to_echo(),
+            PaymentPayload::transaction("0xabc"),
+        ))
+        .unwrap();
+        let token = &formatted["Payment ".len()..];
+        for accepted in [
+            formatted.clone(),
+            format!("payment {token}"),
+            format!("Payment  {token}"),
+            format!("Payment\t{token}"),
+            format!(" Payment {token} "),
+        ] {
+            assert!(parse_authorization(&accepted).is_ok(), "{accepted:?}");
+        }
+        for rejected in [
+            format!("{formatted}, Basic realm=\"x\""),
+            format!("Bearer abc, {formatted}"),
+            format!(",{formatted}"),
+            format!("Payment {token} x"),
+            format!("Payment{token}"),
+            "Payment ".to_string(),
+            "Payment".to_string(),
+        ] {
+            assert!(parse_authorization(&rejected).is_err(), "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_requires_commas_between_params() {
+        for header in [
+            r#"Payment id="0" method=a realm="" intent="a" request="e30""#,
+            r#"Payment id=0 realm="\," method="a" intent="a" request=e30"#,
+            r#"Payment id="0", realm="api" method="tempo", intent="charge", request="e30""#,
+        ] {
+            assert!(parse_www_authenticate(header).is_err(), "{header}");
+            assert!(parse_www_authenticate_all([header])[0].is_err(), "{header}");
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_non_token_names_and_values() {
+        for header in [
+            r#"Payment id=\,", realm="api", method="tempo", intent="charge", request="e30""#,
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", d"escription="x""#,
+            r#"Payment id=a:b, realm="api", method="tempo", intent="charge", request="e30""#,
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request=e30=e30"#,
+        ] {
+            assert!(parse_www_authenticate(header).is_err(), "{header}");
+        }
+        let header =
+            "Payment id=a!#$%&'*+-.^_`|~9, realm=api, method=tempo, intent=charge, request=e30";
+        assert_eq!(
+            parse_www_authenticate(header).unwrap().id,
+            "a!#$%&'*+-.^_`|~9"
+        );
     }
 
     #[test]

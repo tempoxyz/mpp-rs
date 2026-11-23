@@ -287,8 +287,7 @@ fn prover_failed(error: ProverError) -> HttpError {
 fn credential_challenge(headers: &HeaderMap) -> Option<ChallengeEcho> {
     headers.values().find_map(|value| {
         let value = value.to_str().ok()?;
-        extract_payment_scheme(value)?;
-        parse_authorization(value)
+        parse_authorization(extract_payment_scheme(value)?)
             .ok()
             .map(|credential| credential.challenge)
     })

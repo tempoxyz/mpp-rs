@@ -48,6 +48,10 @@ pub(super) struct Tokenizer<'a> {
     /// The first non-whitespace byte at or after `name_end`, cached for the
     /// same reason.
     name_equals: Option<(usize, usize)>,
+    /// Whether a comma separates the token returned last from the one before.
+    after_comma: bool,
+    /// Whether the auth-param value read last was a quoted-string.
+    quoted: bool,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -58,7 +62,21 @@ impl<'a> Tokenizer<'a> {
             start: 0,
             name_end: None,
             name_equals: None,
+            after_comma: false,
+            quoted: false,
         }
+    }
+
+    /// Whether a comma separates the token returned last from the token
+    /// before it.
+    pub(super) fn after_comma(&self) -> bool {
+        self.after_comma
+    }
+
+    /// Whether the value of the auth-param returned last was a quoted-string
+    /// rather than a token.
+    pub(super) fn quoted(&self) -> bool {
+        self.quoted
     }
 
     /// The next token if it is an auth-param. Any other token is left for
@@ -101,7 +119,8 @@ impl<'a> Tokenizer<'a> {
     fn value(&mut self) -> Result<Cow<'a, str>> {
         let bytes = self.input.as_bytes();
         let start = self.seek(self.pos, |byte| !byte.is_ascii_whitespace());
-        if bytes.get(start) != Some(&b'"') {
+        self.quoted = bytes.get(start) == Some(&b'"');
+        if !self.quoted {
             self.pos = self.seek(start, |byte| byte == b',' || byte.is_ascii_whitespace());
             return Ok(Cow::Borrowed(&self.input[start..self.pos]));
         }
@@ -153,9 +172,11 @@ impl<'a> Iterator for Tokenizer<'a> {
         let first = self.pos == 0;
         // A list element starts at the beginning of the value and after a comma.
         let mut element_start = first;
+        self.after_comma = false;
         while let Some(&byte) = bytes.get(self.pos) {
             if byte == b',' {
                 element_start = true;
+                self.after_comma = true;
             } else if !byte.is_ascii_whitespace() {
                 break;
             }
@@ -208,6 +229,14 @@ impl<'a> Iterator for Tokenizer<'a> {
             Token::Word(word)
         }))
     }
+}
+
+/// Whether `value` is an RFC 9110 token (§5.6.2): one or more tchar.
+pub(super) fn is_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
 /// Whether a field value starts with the `Payment` auth-scheme.
@@ -407,6 +436,39 @@ mod tests {
             assert_eq!(tokens.next().unwrap().unwrap(), param("id", "a"));
             assert!(tokens.next().unwrap().is_err());
             assert!(tokens.next().is_none());
+        }
+    }
+
+    #[test]
+    fn test_tokenizer_reports_commas_and_quoting() {
+        let mut tokens = Tokenizer::new(r#"Payment a="1" b=2 ,c=3"#);
+        assert_eq!(tokens.next().unwrap().unwrap(), Scheme("Payment"));
+        tokens.param().unwrap().unwrap();
+        assert!(!tokens.after_comma());
+        assert!(tokens.quoted());
+        tokens.param().unwrap().unwrap();
+        assert!(!tokens.after_comma());
+        assert!(!tokens.quoted());
+        tokens.param().unwrap().unwrap();
+        assert!(tokens.after_comma());
+    }
+
+    #[test]
+    fn test_is_token() {
+        for token in ["a", "e30", "Payment", "a!#$%&'*+-.^_`|~9"] {
+            assert!(is_token(token), "{token}");
+        }
+        for not_token in [
+            "",
+            "\\",
+            "a b",
+            "d\"escription",
+            "a=b",
+            "a,b",
+            "a:b",
+            "caf\u{e9}",
+        ] {
+            assert!(!is_token(not_token), "{not_token}");
         }
     }
 

@@ -317,7 +317,7 @@ impl PaymentCredential {
         })
     }
 
-    /// Parse a PaymentCredential from an Authorization header value.
+    /// Parse a PaymentCredential from a `Payment <base64url-json>` credential.
     ///
     /// This is a convenience method equivalent to [`parse_authorization`](super::parse_authorization).
     pub fn from_header(header: &str) -> crate::error::Result<Self> {
