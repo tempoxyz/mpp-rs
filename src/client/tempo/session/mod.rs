@@ -741,6 +741,9 @@ impl TempoSessionProvider {
     }
 
     fn check_policy(&self, challenge: &PaymentChallenge) -> Result<(), MppError> {
+        // Every direct session path (voucher, top-up, close) checks policy
+        // first: refuse a legacy-escaped Challenge before anything is signed.
+        challenge.ensure_not_legacy_escaped()?;
         if self.currencies.is_none()
             && self.expected_recipients.is_none()
             && self.max_amount.is_none()
@@ -2020,7 +2023,7 @@ impl TempoSessionProvider {
                 .await
             {
                 if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-                    let refreshed = crate::protocol::core::parse_www_authenticate_all_bytes(
+                    let refreshed = crate::protocol::core::parse_payable_challenges(
                         response
                             .headers()
                             .get_all(WWW_AUTHENTICATE)
@@ -2078,7 +2081,7 @@ impl TempoSessionProvider {
             .mpp_http("session bootstrap challenge request failed")?;
 
         let response = if challenge_response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-            let challenge = crate::protocol::core::parse_www_authenticate_all_bytes(
+            let challenge = crate::protocol::core::parse_payable_challenges(
                 challenge_response
                     .headers()
                     .get_all(WWW_AUTHENTICATE)
@@ -2772,6 +2775,7 @@ impl TempoSessionProvider {
         entry: &ChannelEntry,
         additional_deposit: u128,
     ) -> Result<PaymentCredential, MppError> {
+        challenge.ensure_not_legacy_escaped()?;
         let session_req: SessionRequest = challenge
             .request
             .decode()
@@ -3162,7 +3166,7 @@ impl TempoSessionProvider {
             )
             .await?;
         if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-            let fresh_challenge = crate::protocol::core::parse_www_authenticate_all_bytes(
+            let fresh_challenge = crate::protocol::core::parse_payable_challenges(
                 response
                     .headers()
                     .get_all(WWW_AUTHENTICATE)
@@ -3495,6 +3499,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         requested_cumulative: Option<u128>,
     ) -> Result<PaymentCredential, MppError> {
+        challenge.ensure_not_legacy_escaped()?;
         let key = self
             .channel_id_to_key
             .lock()
@@ -3655,7 +3660,7 @@ impl TempoSessionProvider {
         if response.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
             return None;
         }
-        crate::protocol::core::parse_www_authenticate_all_bytes(
+        crate::protocol::core::parse_payable_challenges(
             response
                 .headers()
                 .get_all(reqwest::header::WWW_AUTHENTICATE)
@@ -5108,6 +5113,33 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let result = TempoSessionProvider::new(signer, "not a url");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_direct_session_paths_refuse_a_legacy_escaped_challenge() {
+        let provider =
+            TempoSessionProvider::new(PrivateKeySigner::random(), "https://rpc.example.com")
+                .unwrap();
+        let mut challenge = make_scoped_challenge(
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+            Address::repeat_byte(3),
+        );
+        challenge.legacy_unicode_escape = true;
+        let channel_id = format!("{:#x}", B256::repeat_byte(4));
+        let errors = [
+            provider
+                .voucher_credential_for_challenge(&challenge, &channel_id, 100)
+                .await
+                .unwrap_err(),
+            provider
+                .close_credential_at_for_challenge(&challenge, &channel_id, 100)
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(error.is_legacy_unicode_escape(), "{error}");
+        }
     }
 
     #[test]

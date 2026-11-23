@@ -11,8 +11,7 @@ use futures::{SinkExt, StreamExt};
 use http::{HeaderMap, HeaderName, HeaderValue};
 use mpp::{
     client::{PaymentContext, PaymentProvider, PendingPayment},
-    format_authorization, parse_www_authenticate_all_bytes, MppError, PaymentChallenge,
-    PaymentCredential,
+    format_authorization, parse_payable_challenges, MppError, PaymentChallenge, PaymentCredential,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -490,7 +489,10 @@ async fn probe_challenge<P: PaymentProvider>(
             status: response.status().as_u16(),
         });
     }
-    let challenges = parse_www_authenticate_all_bytes(
+    // A challenge escaped by an older server is skipped like an unusable
+    // offer, before anything is signed.
+    let mut legacy_escape = None;
+    let challenges = parse_payable_challenges(
         response
             .headers()
             .get_all(reqwest::header::WWW_AUTHENTICATE)
@@ -498,16 +500,23 @@ async fn probe_challenge<P: PaymentProvider>(
             .map(|value| value.as_bytes()),
     )
     .into_iter()
-    .filter_map(Result::ok)
+    .filter_map(|result| match result {
+        Ok(challenge) => Some(challenge),
+        Err(error) if error.is_legacy_unicode_escape() => {
+            legacy_escape.get_or_insert(error);
+            None
+        }
+        Err(_) => None,
+    })
     .filter(|challenge| provider.supports(challenge.method.as_str(), challenge.intent.as_str()))
     .collect::<Vec<_>>();
     // Choose like the HTTP flow, so a provider policy (such as a Tempo
     // session spending cap) can skip an offer for a later acceptable one.
     let candidates = challenges.iter().collect::<Vec<_>>();
-    provider
-        .select_challenge(&candidates)
-        .cloned()
-        .ok_or(MppWsError::UnsupportedChallenge)
+    match provider.select_challenge(&candidates) {
+        Some(challenge) => Ok(challenge.clone()),
+        None => Err(legacy_escape.map_or(MppWsError::UnsupportedChallenge, MppWsError::Payment)),
+    }
 }
 
 fn challenge_needs_refresh(challenge: &PaymentChallenge) -> bool {

@@ -10,8 +10,8 @@ panics.
 
 | Target | Input | Invariants |
 |--------|-------|------------|
-| `fuzz_www_authenticate` | text | `parse_www_authenticate` and `parse_www_authenticate_all` never panic; they and `PaymentProtocol::detect` agree on the first challenge of a header; an accepted header formats and parses back to the same challenge |
-| `fuzz_challenge_roundtrip` | structured challenge | the formatter accepts exactly the well-formed challenges; formatted headers are printable ASCII and parse back field for field |
+| `fuzz_www_authenticate` | text | `parse_www_authenticate` and `parse_www_authenticate_all` never panic; they and `PaymentProtocol::detect` agree on the first challenge of a header; an accepted header formats unless a value holds a line break or a bound value holds text outside printable ASCII, and parses back to the same challenge, with `description` escapes read as quoted-pair text |
+| `fuzz_challenge_roundtrip` | structured challenge | the formatter accepts exactly the well-formed challenges whose bound values are printable ASCII; formatted headers are printable ASCII and parse back field for field, with `description` escapes read as quoted-pair text |
 | `fuzz_challenge_list` | 1–5 challenges, decoy schemes, separators | `parse_www_authenticate_all` returns exactly the Payment challenges, in order, among `Basic`/`Bearer`/`Digest` challenges whose quoted values look like Payment ones |
 | `fuzz_challenge_id` | structured challenge, field mutations | a signed challenge verifies, also through the header and the credential echo; changing a bound field or the id fails verification |
 | `fuzz_authorization` | text, as header and as credential JSON | `parse_authorization` and `extract_payment_scheme` never panic; an accepted credential formats and parses back unchanged |

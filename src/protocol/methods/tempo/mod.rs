@@ -427,6 +427,7 @@ pub fn charge_challenge_with_options(
         digest: None,
         opaque: None,
         header: None,
+        legacy_unicode_escape: false,
     })
 }
 

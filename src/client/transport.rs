@@ -96,12 +96,23 @@ impl Transport for HttpTransport {
         if headers.iter().next().is_none() {
             return Err(MppError::MissingHeader("WWW-Authenticate".to_string()));
         }
-        crate::protocol::core::parse_www_authenticate_all_bytes(
+        // A challenge escaped by an older server is skipped like an unusable
+        // offer, and reported when no other challenge remains.
+        let mut legacy_escape = None;
+        for result in crate::protocol::core::parse_payable_challenges(
             headers.iter().map(|header| header.as_bytes()),
-        )
-        .into_iter()
-        .find_map(Result::ok)
-        .ok_or_else(|| MppError::MalformedCredential(Some("no valid Payment challenge".into())))
+        ) {
+            match result {
+                Ok(challenge) => return Ok(challenge),
+                Err(error) if error.is_legacy_unicode_escape() => {
+                    legacy_escape.get_or_insert(error);
+                }
+                Err(_) => {}
+            }
+        }
+        Err(legacy_escape.unwrap_or_else(|| {
+            MppError::MalformedCredential(Some("no valid Payment challenge".into()))
+        }))
     }
 
     fn set_credential(
@@ -145,6 +156,25 @@ mod tests {
             let response = reqwest::Response::from(response.body("").unwrap());
             assert_eq!(http().get_challenge(&response).unwrap().id, "first");
         }
+    }
+
+    #[test]
+    fn test_http_transport_refuses_legacy_unicode_escaped_challenge() {
+        let legacy = r#"Payment id="legacy", realm="caf\u00e9", method="tempo", intent="charge", request="e30""#;
+        let plain = legacy
+            .replace("legacy", "plain")
+            .replace(r"caf\u00e9", "api");
+        let response = |values: &[&str]| {
+            let mut response = axum::http::Response::builder().status(402);
+            for value in values {
+                response = response.header("WWW-Authenticate", *value);
+            }
+            reqwest::Response::from(response.body("").unwrap())
+        };
+        let error = http().get_challenge(&response(&[legacy])).unwrap_err();
+        assert!(error.is_legacy_unicode_escape(), "{error}");
+        let challenge = http().get_challenge(&response(&[legacy, &plain])).unwrap();
+        assert_eq!(challenge.id, "plain");
     }
 
     #[test]
