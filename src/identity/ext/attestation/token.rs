@@ -181,6 +181,12 @@ fn signing_input<C: Serialize>(claims: &C, key_id: &str) -> Result<String, Ident
     let encode = |value: &serde_json::Value| URL_SAFE_NO_PAD.encode(value.to_string());
     let claims = serde_json::to_value(claims)
         .map_err(|err| IdentityError::InvalidConfig(format!("claims: {err}")))?;
+    // `decode` accepts only an object payload, so refuse anything else before signing.
+    if !claims.is_object() {
+        return Err(IdentityError::InvalidConfig(
+            "claims must serialize to a JSON object".into(),
+        ));
+    }
     Ok(format!("{}.{}", encode(&header), encode(&claims)))
 }
 
@@ -674,6 +680,20 @@ pub(crate) mod tests {
             IdentityError::Signer(source) => assert_eq!(source.to_string(), "KMS unavailable."),
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_non_object_claims_before_calling_the_signer() {
+        let signer = TestSigner::new(signing_key());
+        for claims in [
+            Value::String("claims".into()),
+            Value::Array(vec![]),
+            Value::Null,
+        ] {
+            let err = sign_with(&claims, &signer, None).await.unwrap_err();
+            assert!(matches!(err, IdentityError::InvalidConfig(_)), "{err}");
+        }
+        assert!(signer.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
