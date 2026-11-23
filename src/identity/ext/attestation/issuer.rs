@@ -436,9 +436,20 @@ mod tests {
             assert!(AttestationIssuer::new(bad, key()).is_err(), "{bad}");
         }
         assert!(AttestationIssuer::new("http://localhost:8787", key()).is_ok());
-        // Stored as the URL parser serializes it, so iss, key discovery and handle agree.
-        let canonical =
-            AttestationIssuer::new("https://Issuer.Example:443/tenant/", key()).unwrap();
+        // A form the URL parser rewrites is refused: a verifier configured with
+        // the same string would never trust the iss it signs.
+        for rewritten in [
+            "https://Issuer.Example/tenant",
+            "https://issuer.example:443/tenant",
+            "https://issuer.example/a/../tenant",
+        ] {
+            assert!(
+                AttestationIssuer::new(rewritten, key()).is_err(),
+                "{rewritten}"
+            );
+        }
+        // Trailing slashes are dropped, so iss, key discovery and handle agree.
+        let canonical = AttestationIssuer::new("https://issuer.example/tenant/", key()).unwrap();
         assert_eq!(canonical.issuer(), "https://issuer.example/tenant");
         let request = Request::builder()
             .uri("/tenant/.well-known/jwks.json")

@@ -295,8 +295,18 @@ async fn create_checks_urls_and_audiences() {
     ] {
         assert!(create_issuer(config(&tempo, bad)).is_err(), "{bad}");
     }
-    let canonical = create_issuer(config(&tempo, "https://Attest.Example/tenant/")).unwrap();
+    assert!(create_issuer(config(&tempo, "https://Attest.Example/tenant/")).is_err());
+    let canonical = create_issuer(config(&tempo, "https://attest.example/tenant/")).unwrap();
     assert_eq!(canonical.issuer(), "https://attest.example/tenant");
+    // An injected client may use a proxy, so plaintext key discovery refuses one.
+    assert!(tempo.url.starts_with("http://"));
+    assert!(create_issuer(config(&tempo, ATTEST_URL).http_client(reqwest::Client::new())).is_err());
+    assert!(create_issuer(
+        config(&tempo, ATTEST_URL)
+            .issuer("https://id.example")
+            .http_client(reqwest::Client::new())
+    )
+    .is_ok());
     assert!(create_issuer(config(&tempo, ATTEST_URL).audiences(["http://api.example"])).is_err());
 
     let limited =
@@ -774,6 +784,54 @@ mod client {
         assert!(attest(&bearer(&other_expiry), AUDIENCE, "tempo-id")
             .await
             .is_err());
+        // An iss with a trailing slash is not this issuer: verifiers compare it exactly.
+        let slashed = serve_fixed(|url| {
+            let (token, expires_at) = signed_at(url, |p| p);
+            let mut claims = crate::identity::ext::attestation::decode(&token)
+                .unwrap()
+                .claims;
+            claims.insert("iss".into(), json!(format!("{url}/")));
+            let token =
+                crate::identity::ext::attestation::sign(&claims, &attestation_key(), "k").unwrap();
+            (200, answer(&token, &expires_at))
+        })
+        .await;
+        assert_eq!(
+            attest(&bearer(&slashed), AUDIENCE, "tempo-id")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "The issuer returned an attestation that does not match the request."
+        );
+        // A fraction past the signed second is dropped: the expiry is the signed exp.
+        let fraction = serve_fixed(|url| {
+            let (token, _) = signed_at(url, |p| p);
+            let exp = crate::identity::ext::attestation::decode(&token)
+                .unwrap()
+                .claims["exp"]
+                .as_i64()
+                .unwrap();
+            let late = (time::OffsetDateTime::from_unix_timestamp(exp).unwrap()
+                + time::Duration::milliseconds(999))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+            assert!(late.contains(".999"), "{late}");
+            (200, answer(&token, &late))
+        })
+        .await;
+        let attested = attest(&bearer(&fraction), AUDIENCE, "tempo-id")
+            .await
+            .unwrap()
+            .unwrap();
+        let exp = crate::identity::ext::attestation::decode(&attested.attestation)
+            .unwrap()
+            .claims["exp"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            attested.expires_at,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(exp)
+        );
         // Empty or undecodable attestations are malformed.
         for token in ["", "not-a-token"] {
             let url = serve_fixed(|_| (200, answer(token, "2030-01-01T00:00:00.000Z"))).await;
@@ -805,7 +863,7 @@ mod client {
     }
 
     #[tokio::test]
-    async fn attest_config_canonicalizes_the_issuer_and_skips_proxies_on_localhost() {
+    async fn attest_config_checks_the_issuer_and_skips_proxies_on_localhost() {
         for bad in [
             "https://user:secret@attest.example",
             "https://attest.example/tenant/ ",
@@ -816,7 +874,13 @@ mod client {
                 "{bad}"
             );
         }
-        let canonical = AttestConfig::new("https://Attest.Example/tenant/", || async {
+        assert!(
+            AttestConfig::new("https://Attest.Example/tenant/", || async {
+                Ok(String::new())
+            })
+            .is_err()
+        );
+        let canonical = AttestConfig::new("https://attest.example/tenant/", || async {
             Ok(String::new())
         })
         .unwrap();
@@ -1046,5 +1110,319 @@ mod client {
         gate.notify_one();
         let request = slow.await.unwrap();
         assert!(!request.headers().contains_key("identity-attestation"));
+    }
+
+    /// A request carrying a Payment Credential, as a paid attempt does.
+    fn paid_attempt() -> reqwest::Request {
+        let mut request = paid();
+        request
+            .headers_mut()
+            .insert("authorization", "Payment e30".parse().unwrap());
+        request
+    }
+
+    /// An attestation for user `uid` of the app `CLIENT_ID` that `issuer` signs.
+    fn attestation_for(issuer: &TempoIdIssuer, uid: &str) -> String {
+        let mut claims = serde_json::Map::new();
+        claims.insert("azp".into(), json!(CLIENT_ID));
+        issuer
+            .attestation_issuer()
+            .sign(
+                crate::identity::ext::attestation::SignParameters::new(AUDIENCE, "tempo-id", uid)
+                    .uid(uid)
+                    .claims(claims),
+            )
+            .unwrap()
+    }
+
+    /// An access token source answering each read from `answer`, by call
+    /// index; reads whose index is in `gated` wait for `gate` and report
+    /// their index on `entered` first.
+    fn scripted(
+        url: &str,
+        answer: impl Fn(usize) -> Result<String, crate::identity::client::ProverError>
+            + Send
+            + Sync
+            + 'static,
+        gated: &'static [usize],
+    ) -> (
+        AttestConfig,
+        Arc<tokio::sync::Notify>,
+        tokio::sync::mpsc::UnboundedReceiver<usize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (entered, entries) = tokio::sync::mpsc::unbounded_channel();
+        let answer = Arc::new(answer);
+        let config = {
+            let (calls, gate) = (calls.clone(), gate.clone());
+            AttestConfig::new(url, move || {
+                let (calls, gate, entered, answer) =
+                    (calls.clone(), gate.clone(), entered.clone(), answer.clone());
+                async move {
+                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = entered.send(call);
+                    if gated.contains(&call) {
+                        gate.notified().await;
+                    }
+                    answer(call)
+                }
+            })
+            .unwrap()
+        };
+        (config, gate, entries, calls)
+    }
+
+    #[tokio::test]
+    async fn a_paid_attempt_is_refused_rather_than_sent_without_its_attestations() {
+        let tempo = issuer().await;
+        let (url, issuer) = serve(|url| create_issuer(config(&tempo, url)).unwrap()).await;
+        let first = attestation_for(&issuer, "user_1");
+        let current = Arc::new(std::sync::Mutex::new(Some(token_as(
+            &tempo, &url, "user_1",
+        ))));
+        let source = current.clone();
+        let attest_config =
+            AttestConfig::new(&url, move || {
+                let token = source.lock().unwrap().clone();
+                async move {
+                    token.ok_or_else(|| crate::identity::client::ProverError::new("signed out"))
+                }
+            })
+            .unwrap();
+        let prover = attestations(attest_config, [AUDIENCE], Some(["tempo-id"]), [&first]).unwrap();
+        let carrying = || {
+            let mut request = paid_attempt();
+            request
+                .headers_mut()
+                .insert("identity-attestation", first.parse().unwrap());
+            request
+        };
+        // The same user: the paid attempt keeps its attestation.
+        let mut request = carrying();
+        prover.prove(&mut request, &context()).await.unwrap();
+        assert_eq!(request.headers()["identity-attestation"], first.as_str());
+
+        // Another user signed in after the attestation was added.
+        *current.lock().unwrap() = Some(token_as(&tempo, &url, "user_2"));
+        let mut request = carrying();
+        let error = prover.prove(&mut request, &context()).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "The signed-in Tempo ID user changed: send the request again."
+        );
+
+        // The access token cannot be read.
+        *current.lock().unwrap() = None;
+        let mut request = carrying();
+        let error = prover.prove(&mut request, &context()).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "The Tempo ID access token could not be read: send the request again."
+        );
+
+        // An unpaid attempt still only drops them.
+        let mut request = paid();
+        request
+            .headers_mut()
+            .insert("identity-attestation", first.parse().unwrap());
+        prover.prove(&mut request, &context()).await.unwrap();
+        assert!(!request.headers().contains_key("identity-attestation"));
+    }
+
+    #[tokio::test]
+    async fn retry_reads_the_token_only_when_it_can_answer_and_never_switches_users() {
+        let tempo = issuer().await;
+        let (url, issuer) = serve(|url| create_issuer(config(&tempo, url)).unwrap()).await;
+        let first = attestation_for(&issuer, "user_1");
+        let token = token_as(&tempo, &url, "user_2");
+        let (attest_config, _gate, _entries, calls) =
+            scripted(&url, move |_| Ok(token.clone()), &[]);
+        let prover = attestations(
+            attest_config,
+            [AUDIENCE],
+            Some(["tempo-id"]),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        let request = paid();
+        // A 500, or a 401 that asks for no attestation, never reads the token.
+        for (status, headers) in [
+            (
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                required_response(&url).headers,
+            ),
+            (
+                reqwest::StatusCode::UNAUTHORIZED,
+                reqwest::header::HeaderMap::new(),
+            ),
+        ] {
+            let response = ResponseParts {
+                status,
+                headers,
+                url: request.url().clone(),
+            };
+            assert!(prover
+                .retry(&response, RetryContext { request: &request })
+                .await
+                .is_none());
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A request proved for user_1 is not resent under user_2.
+        let mut carrying = paid();
+        carrying
+            .headers_mut()
+            .insert("identity-attestation", first.parse().unwrap());
+        let response = required_response(&url);
+        assert!(prover
+            .retry(&response, RetryContext { request: &carrying })
+            .await
+            .is_none());
+        // One that carried none of them is answered for the signed-in user.
+        let retry = prover
+            .retry(&response, RetryContext { request: &request })
+            .await
+            .unwrap();
+        let second = retry["identity-attestation"].to_str().unwrap().to_owned();
+        assert_eq!(
+            verified(&issuer, &second, "tempo-id").await.uid(),
+            Some("user_2")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_confirming_the_user_supersedes_an_older_one() {
+        let tempo = issuer().await;
+        let (url, issuer) = serve(|url| create_issuer(config(&tempo, url)).unwrap()).await;
+        let mine = attestation_for(&issuer, "user_1");
+        let tokens = [
+            token_as(&tempo, &url, "user_1"),
+            token_as(&tempo, &url, "user_2"),
+        ];
+        // Read 1 (user_2) waits; every other read names user_1.
+        let (attest_config, gate, mut entries, _calls) = scripted(
+            &url,
+            move |call| Ok(tokens[usize::from(call == 1)].clone()),
+            &[1],
+        );
+        let prover = attestations(attest_config, [AUDIENCE], Some(["tempo-id"]), [&mine]).unwrap();
+        let mut request = paid();
+        prover.prove(&mut request, &context()).await.unwrap();
+        assert_eq!(entries.recv().await, Some(0));
+        assert_eq!(request.headers()["identity-attestation"], mine.as_str());
+
+        // A slow lookup reads user_2's token while a newer one confirms user_1.
+        let slow = tokio::spawn({
+            let prover = prover.clone();
+            async move {
+                let mut request = paid();
+                prover.prove(&mut request, &context()).await.unwrap();
+            }
+        });
+        assert_eq!(entries.recv().await, Some(1));
+        let mut newer = paid();
+        prover.prove(&mut newer, &context()).await.unwrap();
+        assert_eq!(newer.headers()["identity-attestation"], mine.as_str());
+        gate.notify_one();
+        slow.await.unwrap();
+
+        // The slow lookup did not replace user_1's cache.
+        let mut next = paid();
+        prover.prove(&mut next, &context()).await.unwrap();
+        assert_eq!(next.headers()["identity-attestation"], mine.as_str());
+    }
+
+    #[tokio::test]
+    async fn an_older_lookup_presents_nothing_after_a_newer_read_failed() {
+        let tempo = issuer().await;
+        let (url, issuer) = serve(|url| create_issuer(config(&tempo, url)).unwrap()).await;
+        let mine = attestation_for(&issuer, "user_1");
+        let token = token_as(&tempo, &url, "user_1");
+        // Read 1 waits; read 2 fails, as after a sign-out.
+        let (attest_config, gate, mut entries, _calls) = scripted(
+            &url,
+            move |call| {
+                if call == 2 {
+                    Err(crate::identity::client::ProverError::new("signed out"))
+                } else {
+                    Ok(token.clone())
+                }
+            },
+            &[1],
+        );
+        let prover = attestations(attest_config, [AUDIENCE], Some(["tempo-id"]), [&mine]).unwrap();
+        let mut request = paid();
+        prover.prove(&mut request, &context()).await.unwrap();
+        assert_eq!(entries.recv().await, Some(0));
+        assert_eq!(request.headers()["identity-attestation"], mine.as_str());
+
+        let slow = tokio::spawn({
+            let prover = prover.clone();
+            async move {
+                let mut request = paid();
+                prover.prove(&mut request, &context()).await.unwrap();
+                request
+            }
+        });
+        assert_eq!(entries.recv().await, Some(1));
+        let mut newer = paid();
+        prover.prove(&mut newer, &context()).await.unwrap();
+        assert!(!newer.headers().contains_key("identity-attestation"));
+        gate.notify_one();
+        let request = slow.await.unwrap();
+        assert!(!request.headers().contains_key("identity-attestation"));
+    }
+
+    #[tokio::test]
+    async fn prepare_refuses_after_a_switch_when_the_previous_user_held_one_for_the_origin() {
+        use crate::identity::client::PrepareContext;
+        let tempo = issuer().await;
+        let (url, issuer) = serve(|url| create_issuer(config(&tempo, url)).unwrap()).await;
+        let mine = attestation_for(&issuer, "user_1");
+        let current = Arc::new(std::sync::Mutex::new(token_as(&tempo, &url, "user_1")));
+        let source = current.clone();
+        let attest_config = AttestConfig::new(&url, move || {
+            let token = source.lock().unwrap().clone();
+            async move { Ok(token) }
+        })
+        .unwrap();
+        let prover = attestations(attest_config, [AUDIENCE], Some(["tempo-id"]), [&mine]).unwrap();
+        let mut request = paid();
+        prover.prove(&mut request, &context()).await.unwrap();
+        assert_eq!(request.headers()["identity-attestation"], mine.as_str());
+        // A route that asks only with Identity-Attestation-Required lists nothing in its 402.
+        let context = PrepareContext {
+            challenge: crate::protocol::core::PaymentChallenge::new(
+                "id",
+                "realm",
+                "tempo",
+                "charge",
+                crate::protocol::core::Base64UrlJson::from_value(&json!({})).unwrap(),
+            ),
+            requirements: Vec::new(),
+        };
+        let parts = |origin: &str| ResponseParts {
+            status: reqwest::StatusCode::PAYMENT_REQUIRED,
+            headers: reqwest::header::HeaderMap::new(),
+            url: format!("{origin}/paid").parse().unwrap(),
+        };
+        assert!(prover.prepare(&parts(AUDIENCE), &context).await.is_ok());
+        *current.lock().unwrap() = token_as(&tempo, &url, "user_2");
+        let error = prover
+            .prepare(&parts(AUDIENCE), &context)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "The signed-in Tempo ID user changed: send the request again."
+        );
+        // An origin the previous user held nothing for is not refused.
+        *current.lock().unwrap() = token_as(&tempo, &url, "user_3");
+        assert!(prover
+            .prepare(&parts("https://other.example"), &context)
+            .await
+            .is_ok());
     }
 }

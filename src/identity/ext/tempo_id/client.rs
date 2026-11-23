@@ -21,8 +21,8 @@ use crate::identity::client::{
 };
 #[cfg(feature = "identity-attestation")]
 use crate::identity::ext::attestation::{
-    canonical_issuer, decode, is_loopback, origin_of, parse_header, trim_issuer, AttestationProver,
-    IdentityError, HEADER as ATTESTATION_HEADER, MAX_LENGTH,
+    canonical_issuer, decode, is_loopback, origin_of, parse_header, requirements, trim_issuer,
+    AttestationProver, IdentityError, HEADER as ATTESTATION_HEADER, MAX_LENGTH,
 };
 use crate::identity::BoxFuture;
 use crate::protocol::core::headers::extract_payment_scheme;
@@ -349,9 +349,11 @@ async fn read_limited(response: &mut reqwest::Response, limit: usize) -> Option<
 /// as `email` without a verified address), and an error on any other failure.
 ///
 /// It reads at most 16,384 bytes of the issuer's response, and none of a
-/// refusal's. The attestation must decode, name this issuer as `iss`, the
-/// requested audience's origin as `aud` and the requested type, and expire
-/// at `expires_at`, or the exchange fails.
+/// refusal's. The attestation must decode, name this issuer as `iss`
+/// exactly (as verifiers compare it), the requested audience's origin as
+/// `aud` and the requested type, and expire in the second `expires_at`
+/// names, or the exchange fails. The returned `expires_at` is the signed
+/// `exp`, so it is never later than the attestation's own expiry.
 #[cfg(feature = "identity-attestation")]
 pub async fn attest(
     config: &AttestConfig,
@@ -430,7 +432,7 @@ pub async fn attest(
     let matches = requested.is_some()
         && text("aud") == requested.as_deref()
         && text("type") == Some(attestation_type)
-        && text("iss").map(trim_issuer) == Some(config.issuer.as_str())
+        && text("iss") == Some(config.issuer.as_str())
         && claims.get("exp").and_then(serde_json::Value::as_i64)
             == Some(expires_at.unix_timestamp());
     if !matches {
@@ -438,9 +440,12 @@ pub async fn attest(
             "The issuer returned an attestation that does not match the request.".into(),
         ));
     }
+    // The envelope's instant may carry a fraction past the signed second.
+    let exp = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(expires_at.unix_timestamp()).unwrap_or(0));
     Ok(Some(Attested {
         attestation: attestation.to_owned(),
-        expires_at: expires_at.into(),
+        expires_at: exp,
     }))
 }
 
@@ -458,10 +463,15 @@ pub async fn attest(
 /// `sub` and `client_id` name them: when it names another user or app (or
 /// none), the cache is dropped, so a new session never presents the previous
 /// user's attestations. Only attestations whose `uid` is that user and whose
-/// `azp` is that app are kept. When a 402 asks for one of these attestations
-/// and the user changed since this prover last presented, the payment is
-/// refused before it is made, since the paid attempt could not carry them;
-/// sending the request again presents the new user's.
+/// `azp` is that app are kept. When a 402 asks for one of these attestations,
+/// or comes from an origin the previous user held one for, and the user
+/// changed since this prover last looked, the payment is refused before it
+/// is made. A paid attempt that carries attestations for another user than
+/// the one signed in now (or while the access token cannot be read) is
+/// refused before it is sent, so its Credential is released unused, rather
+/// than sent without them. An unpaid request rejected for an attestation is
+/// not resent when it carried one for another user. Sending the request
+/// again presents the new user's.
 ///
 /// The access token is read without verifying it: [`AttestConfig::new`]'s
 /// `access_token` must return this client's own token. `types` defaults to
@@ -544,10 +554,14 @@ struct AttestationsState {
     current: Option<(Option<Holder>, AttestationProver)>,
     /// The sequence number the last lookup took.
     latest: u64,
-    /// The sequence number of the lookup that set `current`. A lookup replaces
-    /// `current` only when no newer lookup has, so a slow lookup cannot roll
-    /// it back, while overlapping lookups still keep a prover.
+    /// The sequence number of the newest lookup that set or confirmed
+    /// `current`. A lookup replaces `current` only when no newer lookup has
+    /// set or confirmed it, so a slow lookup cannot roll it back, while
+    /// overlapping lookups still keep a prover.
     stored: u64,
+    /// The sequence number of the newest lookup that could not read the
+    /// access token. An older lookup that ends later presents nothing.
+    unreadable: u64,
 }
 
 /// Who an attestation or access token names: the user and the app.
@@ -595,12 +609,15 @@ impl Holder {
 /// A lookup of the signed-in user.
 #[cfg(feature = "identity-attestation")]
 struct Resolved {
-    /// The user the cache belonged to before this lookup, if it had one.
-    previous: Option<Option<Holder>>,
+    /// The user the cache belonged to before this lookup, and their prover,
+    /// if it had one.
+    previous: Option<(Option<Holder>, AttestationProver)>,
     /// The user this prover presents for, or `None` when the token names
     /// nobody or could not be read.
     holder: Option<Holder>,
     prover: AttestationProver,
+    /// Whether the access token could not be read.
+    unreadable: bool,
 }
 
 #[cfg(feature = "identity-attestation")]
@@ -614,7 +631,7 @@ impl TempoIdAttestations {
         let claims = decode(token)?.claims;
         let text = |key: &str| claims.get(key).and_then(serde_json::Value::as_str);
         let attestation_type = text("type")?;
-        (trim_issuer(text("iss")?) == self.inner.config.issuer
+        (text("iss")? == self.inner.config.issuer
             && self.inner.types.iter().any(|t| t == attestation_type))
         .then(|| Holder::of_attestation(token))
         .flatten()
@@ -659,32 +676,46 @@ impl TempoIdAttestations {
         };
         let token = (self.inner.config.access_token)().await;
         let mut state = self.state();
-        let previous = state.current.as_ref().map(|(holder, _)| holder.clone());
+        let previous = state.current.clone();
         let unavailable = |previous| Resolved {
             previous,
             holder: None,
             prover: self.inner.unavailable.clone(),
+            unreadable: true,
         };
         let user = match token {
             Ok(token) => Holder::of_access_token(&token),
             // The token could not be read this time: present nothing, but keep the user's cache.
-            Err(_) => return unavailable(previous),
+            Err(_) => {
+                state.unreadable = state.unreadable.max(lookup);
+                return unavailable(previous);
+            }
         };
-        if let Some((current, prover)) = &state.current {
-            if *current == user {
+        // A newer lookup found the token unreadable (such as after sign-out):
+        // an older one ending later presents nothing either.
+        if lookup < state.unreadable {
+            return unavailable(previous);
+        }
+        if let Some((current, prover)) = state.current.clone() {
+            if current == user {
+                // Confirming the user counts as the newest lookup, so an older
+                // lookup that saw another user cannot replace it afterwards.
+                state.stored = state.stored.max(lookup);
                 return Resolved {
                     previous,
                     holder: user,
-                    prover: prover.clone(),
+                    prover,
+                    unreadable: false,
                 };
             }
             // A newer lookup already installed its user: present for that user, so a
             // slow lookup never presents for a user the cache no longer belongs to.
             if lookup < state.stored {
                 return Resolved {
-                    holder: current.clone(),
-                    prover: prover.clone(),
+                    holder: current,
+                    prover,
                     previous,
+                    unreadable: false,
                 };
             }
         }
@@ -709,7 +740,22 @@ impl TempoIdAttestations {
             previous,
             holder: user,
             prover,
+            unreadable: false,
         }
+    }
+
+    /// Whether `request` carries an attestation this prover obtains for
+    /// another user than `user`.
+    fn carries_other(&self, request: &Request, user: Option<&Holder>) -> bool {
+        parse_header(
+            request
+                .headers()
+                .get_all(ATTESTATION_HEADER)
+                .iter()
+                .filter_map(|value| value.to_str().ok()),
+        )
+        .iter()
+        .any(|token| self.ours(token).is_some_and(|holder| Some(&holder) != user))
     }
 
     /// Whether `requirements` ask for an attestation this prover obtains.
@@ -739,6 +785,7 @@ impl Prover for TempoIdAttestations {
             let Resolved {
                 holder: user,
                 prover,
+                unreadable,
                 ..
             } = self.resolve().await;
             // A request already in flight (such as a payment retry) may still
@@ -760,6 +807,16 @@ impl Prover for TempoIdAttestations {
                 .cloned()
                 .collect();
             if kept.len() != sent.len() {
+                // A paid attempt sent without them would carry a Credential to a
+                // route that refuses it: refuse before it leaves, so the
+                // Credential is released unused.
+                if is_paid(request, context) {
+                    return Err(ProverError::new(if unreadable {
+                        "The Tempo ID access token could not be read: send the request again."
+                    } else {
+                        USER_CHANGED
+                    }));
+                }
                 let headers = request.headers_mut();
                 match HeaderValue::from_str(&kept.join(", ")) {
                     Ok(value) if !kept.is_empty() => {
@@ -781,15 +838,17 @@ impl Prover for TempoIdAttestations {
     ) -> BoxFuture<'a, Result<(), ProverError>> {
         Box::pin(async move {
             let resolved = self.resolve().await;
-            // The paid attempt drops the previous user's attestations, and a route that
-            // requires them would refuse it after the payment: refuse before paying.
-            if let Some(Some(previous)) = &resolved.previous {
+            // The paid attempt cannot carry the previous user's attestations, and a
+            // route that requires them would refuse it after the payment: refuse
+            // before paying when the 402 lists one, or (for a route that asks
+            // only with Identity-Attestation-Required) when the previous user
+            // held one for this origin.
+            if let Some((Some(previous), previous_prover)) = &resolved.previous {
                 if resolved.holder.as_ref() != Some(previous)
-                    && self.required(&context.requirements)
+                    && (self.required(&context.requirements)
+                        || holds_for(previous_prover, &response.url))
                 {
-                    return Err(ProverError::new(
-                        "The signed-in Tempo ID user changed: send the request again.",
-                    ));
+                    return Err(ProverError::new(USER_CHANGED));
                 }
             }
             resolved.prover.prepare(response, context).await
@@ -801,8 +860,50 @@ impl Prover for TempoIdAttestations {
         response: &'a ResponseParts,
         context: RetryContext<'a>,
     ) -> BoxFuture<'a, Option<HeaderMap>> {
-        Box::pin(async move { self.resolve().await.prover.retry(response, context).await })
+        Box::pin(async move {
+            // Only a 401 or 403 asking for an attestation can be answered: never
+            // read the access token for any other rejection.
+            let answerable = matches!(
+                response.status,
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) && !requirements(&response.headers).is_empty();
+            if !answerable {
+                return None;
+            }
+            let resolved = self.resolve().await;
+            // A request proved for another user is not resent under this one.
+            if self.carries_other(context.request, resolved.holder.as_ref()) {
+                return None;
+            }
+            resolved.prover.retry(response, context).await
+        })
     }
+}
+
+#[cfg(feature = "identity-attestation")]
+const USER_CHANGED: &str = "The signed-in Tempo ID user changed: send the request again.";
+
+/// Whether a request is a paid attempt, as [`AttestationProver`] decides.
+#[cfg(feature = "identity-attestation")]
+fn is_paid(request: &Request, context: &ProveContext) -> bool {
+    context.challenge.is_some()
+        || ["payment-signature", "x-payment"]
+            .iter()
+            .any(|name| request.headers().contains_key(*name))
+        || request
+            .headers()
+            .values()
+            .filter_map(|value| value.to_str().ok())
+            .any(|value| extract_payment_scheme(value).is_some())
+}
+
+/// Whether `prover` holds an attestation it would present on a paid
+/// request to `url`'s origin.
+#[cfg(feature = "identity-attestation")]
+fn holds_for(prover: &AttestationProver, url: &reqwest::Url) -> bool {
+    let mut probe = Request::new(reqwest::Method::GET, url.clone());
+    prover.present(&mut probe, true);
+    probe.headers().contains_key(ATTESTATION_HEADER)
 }
 
 /// Signs a DPoP proof (RFC 9449) of `access_token` for one request.

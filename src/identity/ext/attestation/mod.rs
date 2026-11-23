@@ -116,10 +116,11 @@ pub(crate) fn trim_issuer(value: &str) -> &str {
 /// The canonical form of an issuer URL, or `None` when it is not one.
 ///
 /// It must be an `https` URL (`http` only on localhost) without userinfo,
-/// a query, a fragment, whitespace or a backslash. The URL parser's
-/// serialization, without trailing slashes, is returned, so the `iss` an
-/// issuer signs, the key set path it serves and the paths clients build from
-/// it all name the same URL.
+/// a query, a fragment, whitespace or a backslash, already in the form the
+/// URL parser serializes (such as a lowercase host and no default port), so
+/// the `iss` an issuer signs, the key set path it serves, the paths clients
+/// build from it and the issuer a verifier configured with the same string
+/// trims all name the same URL. It is returned without trailing slashes.
 pub(crate) fn canonical_issuer(value: &str) -> Option<String> {
     if value
         .chars()
@@ -131,12 +132,17 @@ pub(crate) fn canonical_issuer(value: &str) -> Option<String> {
     if !url.username().is_empty() || url.password().is_some() {
         return None;
     }
-    let canonical = trim_issuer(url.as_str()).to_owned();
-    token::is_issuer(&canonical).then_some(canonical)
+    let canonical = trim_issuer(url.as_str());
+    // Verifiers, provers and requirements compare issuers as trimmed strings:
+    // a form the parser rewrites would sign an `iss` none of them trusts.
+    if canonical != trim_issuer(value) {
+        return None;
+    }
+    token::is_issuer(canonical).then(|| canonical.to_owned())
 }
 
 /// Whether `url` names this host (`localhost` or `127.0.0.1`).
-#[cfg(feature = "client")]
+#[cfg(feature = "identity-tempo-id")]
 pub(crate) fn is_loopback(url: &str) -> bool {
     reqwest::Url::parse(url)
         .is_ok_and(|url| matches!(url.host_str(), Some("localhost" | "127.0.0.1")))

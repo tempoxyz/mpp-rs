@@ -14,7 +14,7 @@ use super::server::{self, AllowFn, Config, TempoId};
 use super::Payer;
 use crate::identity::ext::attestation::issuer::json_response;
 use crate::identity::ext::attestation::{
-    canonical_issuer, decode, is_issuer, origin_of, AttestationIssuer, IdentityError,
+    canonical_issuer, decode, is_issuer, is_loopback, origin_of, AttestationIssuer, IdentityError,
     SignParameters, SigningKey,
 };
 use crate::identity::{IdentityRequest, RejectionStatus, Verification, Verifier};
@@ -154,7 +154,9 @@ impl IssuerConfig {
     /// The HTTP client that fetches Tempo ID's keys. It should not follow
     /// redirects, since the keys it fetches decide whom the issuer signs
     /// for. Default: a client that follows no redirects (and, for a
-    /// localhost Tempo ID, uses no proxy).
+    /// localhost Tempo ID, uses no proxy). [`create`] refuses one with an
+    /// `http` (localhost) Tempo ID origin, whose plaintext key discovery
+    /// must never go through a proxy.
     pub fn http_client(mut self, http: reqwest::Client) -> Self {
         self.http = Some(http);
         self
@@ -276,14 +278,22 @@ pub fn create(config: IssuerConfig) -> Result<TempoIdIssuer, IdentityError> {
     if let Some(issuer) = &config.issuer {
         server_config = server_config.issuer(issuer.clone());
     }
+    let tempo_id = config.issuer.as_deref().unwrap_or(super::constants::ISSUER);
+    // Plaintext key discovery is safe only on this host, through a client that
+    // never sends it to a proxy; an injected client may have one.
+    let plaintext = tempo_id
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
     let http = match &config.http {
+        Some(_) if plaintext => {
+            return Err(IdentityError::InvalidConfig(
+                "an http Tempo ID origin fetches its keys with the issuer's own client, which uses no proxy: leave http_client unset".into(),
+            ))
+        }
         Some(http) => http.clone(),
         None => {
             let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-            let tempo_id = config.issuer.as_deref().unwrap_or(super::constants::ISSUER);
-            let loopback = reqwest::Url::parse(tempo_id)
-                .is_ok_and(|url| matches!(url.host_str(), Some("localhost" | "127.0.0.1")));
-            let builder = if loopback {
+            let builder = if is_loopback(tempo_id) {
                 builder.no_proxy()
             } else {
                 builder
