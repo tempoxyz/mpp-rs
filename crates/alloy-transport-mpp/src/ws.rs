@@ -1000,8 +1000,22 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                 ));
                 return Err(TerminationReason::Fatal);
             }
-            // A Receipt frame means the server accepted the Credential, so the
-            // payment is committed before the Receipt body is read.
+            // A success Receipt for the pending Challenge's method means the
+            // server accepted the Credential, so the payment is committed
+            // before the rest of the Receipt body is read. Any other object
+            // (an empty one, a failed status, another method) acknowledges
+            // nothing: it is reported and skipped, and the payment stays
+            // pending until a Receipt or an error frame settles it.
+            if let Some(payment) = payment_awaiting_receipt.as_ref() {
+                if !acknowledges_payment(&receipt, payment.challenge()) {
+                    error!("Receipt frame does not acknowledge the pending payment");
+                    let _ = events_tx.send(MppEvent::Error(
+                        "Receipt does not acknowledge the pending payment; payment not committed"
+                            .to_owned(),
+                    ));
+                    return Ok(());
+                }
+            }
             if let Some(payment) = payment_awaiting_receipt.take() {
                 if let Err(err) = payment.commit().await {
                     error!(%err, "failed to commit accepted MPP payment");
@@ -1043,6 +1057,20 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             Err(TerminationReason::Fatal)
         }
     }
+}
+
+/// Whether a Receipt frame's body identifies the server's acceptance of the
+/// pending payment: a `success` status, a `reference` string and the
+/// Challenge's method. The rest of the body may still be unreadable.
+fn acknowledges_payment(receipt: &serde_json::Value, challenge: &PaymentChallenge) -> bool {
+    receipt.get("status").and_then(serde_json::Value::as_str) == Some("success")
+        && receipt
+            .get("reference")
+            .is_some_and(serde_json::Value::is_string)
+        && receipt
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|m| m.eq_ignore_ascii_case(challenge.method.as_str()))
 }
 
 fn proof_http_origin(url: &Url) -> Result<Url, ()> {
