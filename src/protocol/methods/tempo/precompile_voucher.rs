@@ -460,6 +460,50 @@ mod tests {
 
     #[cfg(feature = "tempo")]
     #[test]
+    fn rejects_high_s_vouchers() {
+        use alloy::primitives::{Signature, U256};
+        use alloy::signers::{local::PrivateKeySigner, SignerSync};
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        let signer = PrivateKeySigner::random();
+        let channel_id = B256::repeat_byte(0xab);
+        let hash = precompile_voucher_signing_hash_with_escrow(
+            channel_id,
+            1_000,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            42431,
+        )
+        .unwrap();
+        let low_s = signer.sign_hash_sync(&hash).unwrap();
+        let order = U256::from_str_radix(
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141",
+            16,
+        )
+        .unwrap();
+        let high_s = Signature::new(low_s.r(), order - low_s.s(), !low_s.v());
+        // The high-s twin still recovers the signer; Tempo settlement rejects it.
+        assert_eq!(
+            high_s.recover_address_from_prehash(&hash).unwrap(),
+            signer.address()
+        );
+        let verify = |signature: Signature| {
+            verify_precompile_voucher_signature_with(
+                &signature.as_bytes(),
+                signer.address(),
+                channel_id,
+                1_000,
+                TIP20_CHANNEL_RESERVE_ADDRESS,
+                42431,
+                &VoucherVerifyOptions::default(),
+            )
+            .unwrap()
+        };
+        assert!(verify(low_s));
+        assert!(!verify(high_s));
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
     fn compute_precompile_channel_id_matches_precompile_formula() {
         use alloy::primitives::{Address, B256};
 
