@@ -498,6 +498,31 @@ async fn caches_approvals_only() {
 }
 
 #[tokio::test]
+async fn does_not_share_cached_approvals_between_reference_ids_a_store_files_together() {
+    // FileStore maps `.` and `_` in keys to the same file name.
+    let dir = std::env::temp_dir().join(format!(
+        "mpp-persona-cache-{}-{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    let cache: Arc<dyn Store> = Arc::new(crate::store::FileStore::new(&dir).unwrap());
+    let api = fake(
+        vec![approved("inq_1", "alice.smith", &now_iso())],
+        None,
+        None,
+    )
+    .await;
+    let kyc = Persona::new(api.persona("k")).unwrap().payment_check(
+        |input: &PaymentCheckInput<'_>| input.credential.and_then(|c| c.source.clone()),
+        LookupOptions::new().cache(cache),
+    );
+    valid(pay(&kyc, Some("alice.smith")).await);
+    rejected(pay(&kyc, Some("alice_smith")).await);
+    assert_eq!(api.calls().len(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn does_not_share_cached_approvals_across_persona_organizations() {
     let cache: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let approved_api = fake(vec![approved("inq_1", &payer(), &now_iso())], None, None).await;

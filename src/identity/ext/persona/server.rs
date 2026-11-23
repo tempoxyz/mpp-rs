@@ -696,9 +696,13 @@ impl Persona {
         };
         // Only approvals are cached, so a person who just passed KYC is never kept waiting.
         if let Some(cache) = &options.cache {
+            // The reference ID is stored and rechecked on read: a backend
+            // that rewrites keys (FileStore maps punctuation to `_`) could
+            // otherwise hand one payer another's approval.
             let mut entry = json!({
                 "cachedAt": unix_millis(now),
                 "inquiryId": inquiry.inquiry_id,
+                "referenceId": reference_id,
                 "status": inquiry.status.as_str(),
             });
             if let Some(verified_at) = inquiry.verified_at.and_then(|at| at.format(&Rfc3339).ok()) {
@@ -718,6 +722,11 @@ fn cached(
     options: &LookupOptions,
     now: OffsetDateTime,
 ) -> Option<VerifiedInquiry> {
+    // An entry written for another reference ID (or without one, as mppx's
+    // entries are) is a miss, whatever key the store filed it under.
+    if entry.get("referenceId").and_then(Value::as_str) != Some(reference_id) {
+        return None;
+    }
     let cached_at = entry.get("cachedAt").and_then(Value::as_f64)?;
     let ttl = options.cache_ttl.as_millis() as f64;
     // Each check applies its own lifetime, so a longer-lived check sharing the
