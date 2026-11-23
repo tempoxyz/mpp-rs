@@ -212,7 +212,7 @@ libc = { version = "0.2.180", optional = true }
 
 [dev-dependencies]
 alloy-json-rpc = "2.0.5"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "test-util"] }
 axum = { version = "0.8", features = ["ws"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 hex = "0.4"

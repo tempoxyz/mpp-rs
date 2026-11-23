@@ -362,6 +362,57 @@ mod signed {
     }
 
     #[tokio::test]
+    async fn answers_unavailable_when_the_erc1271_call_fails_to_reach_the_chain() {
+        let asserter = registry();
+        let agents = setup(&asserter, |config| config);
+        wallet(&asserter, CONTRACT_WALLET);
+        // Nothing queued for `isValidSignature`: the mock fails as a transport error.
+        let rejection = rejected(agents.verifier.verify(&signed(agent_key(), 3).await).await);
+        assert_eq!(rejection.status, RejectionStatus::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn rejects_when_the_erc1271_call_reverts() {
+        let asserter = registry();
+        let agents = setup(&asserter, |config| config);
+        wallet(&asserter, CONTRACT_WALLET);
+        asserter.push_failure_msg("execution reverted");
+        let rejection = rejected(agents.verifier.verify(&signed(agent_key(), 3).await).await);
+        assert_eq!(rejection.status, RejectionStatus::Invalid);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answers_unavailable_when_the_registry_stalls() {
+        let provider = ProviderBuilder::new()
+            .connect_client(alloy::rpc::client::RpcClient::new(Stalled, true))
+            .erased();
+        let agents = create(Config::new(ORIGIN).provider(provider)).unwrap();
+        let rejection = rejected(agents.verifier.verify(&signed(agent_key(), 1).await).await);
+        assert_eq!(rejection.status, RejectionStatus::Unavailable);
+    }
+
+    /// A transport whose calls never answer.
+    #[derive(Clone)]
+    struct Stalled;
+
+    impl tower::Service<alloy_json_rpc::RequestPacket> for Stalled {
+        type Response = alloy_json_rpc::ResponsePacket;
+        type Error = alloy::transports::TransportError;
+        type Future = alloy::transports::TransportFut<'static>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _: alloy_json_rpc::RequestPacket) -> Self::Future {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
     async fn allow_decides_by_agent() {
         let asserter = registry();
         let agents = setup(&asserter, |config| {

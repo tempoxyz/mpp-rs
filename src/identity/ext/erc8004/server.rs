@@ -35,6 +35,17 @@ alloy::sol! {
 /// The ERC-1271 magic value a contract returns for a valid signature.
 const ERC1271_MAGIC: [u8; 4] = [0x16, 0x26, 0xba, 0x7e];
 
+/// How long a registry or ERC-1271 call may take before the chain counts as unavailable.
+const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Whether the agent's wallet signed a request.
+enum Signed {
+    Yes,
+    No,
+    /// The chain could not answer the ERC-1271 call.
+    Unavailable,
+}
+
 /// Decides whether a verified agent may call the API.
 pub type AllowFn = Arc<dyn Fn(&Agent) -> BoxFuture<'static, bool> + Send + Sync>;
 
@@ -327,13 +338,11 @@ impl Core {
             ))
             .into();
         };
-        let wallet = match IIdentityRegistry::new(registry, &self.provider)
-            .getAgentWallet(agent.agent_id)
-            .call()
-            .await
-        {
-            Ok(wallet) => wallet,
-            Err(_) => {
+        let contract = IIdentityRegistry::new(registry, &self.provider);
+        let call = contract.getAgentWallet(agent.agent_id);
+        let wallet = match tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
+            Ok(Ok(wallet)) => wallet,
+            Ok(Err(_)) | Err(_) => {
                 return Rejection::unavailable("The Identity Registry is unavailable.").into()
             }
         };
@@ -388,8 +397,14 @@ impl Core {
             created,
             nonce,
         );
-        if !self.signed_by(agent.wallet, &message, signature).await {
-            return Rejection::invalid("The agent's wallet did not sign the request.").into();
+        match self.signed_by(agent.wallet, &message, signature).await {
+            Signed::Yes => {}
+            Signed::No => {
+                return Rejection::invalid("The agent's wallet did not sign the request.").into()
+            }
+            Signed::Unavailable => {
+                return Rejection::unavailable("The agent's wallet could not be checked.").into()
+            }
         }
         if let Some(store) = &self.config.store {
             let key = format!(
@@ -414,21 +429,32 @@ impl Core {
     }
 
     /// Returns whether `wallet` signed `message`: by EOA recovery, else by ERC-1271.
-    async fn signed_by(&self, wallet: Address, message: &str, signature: &str) -> bool {
+    ///
+    /// A revert, an error response or empty return data (a plain EOA) is
+    /// [`Signed::No`]; a transport failure or timeout is [`Signed::Unavailable`],
+    /// so a contract wallet is told to retry rather than that it didn't sign.
+    async fn signed_by(&self, wallet: Address, message: &str, signature: &str) -> Signed {
         let Ok(bytes) = alloy::hex::decode(signature) else {
-            return false;
+            return Signed::No;
         };
         let recovered = Signature::try_from(bytes.as_slice())
             .ok()
             .and_then(|signature| signature.recover_address_from_msg(message).ok());
         if recovered == Some(wallet) {
-            return true;
+            return Signed::Yes;
         }
-        IERC1271::new(wallet, &self.provider)
-            .isValidSignature(eip191_hash_message(message), Bytes::from(bytes))
-            .call()
-            .await
-            .is_ok_and(|magic| magic == FixedBytes(ERC1271_MAGIC))
+        let contract = IERC1271::new(wallet, &self.provider);
+        let call = contract.isValidSignature(eip191_hash_message(message), Bytes::from(bytes));
+        match tokio::time::timeout(RPC_TIMEOUT, call.call()).await {
+            Ok(Ok(magic)) if magic == FixedBytes(ERC1271_MAGIC) => Signed::Yes,
+            Ok(Err(alloy::contract::Error::TransportError(error)))
+                if error.as_error_resp().is_none() =>
+            {
+                Signed::Unavailable
+            }
+            Ok(_) => Signed::No,
+            Err(_) => Signed::Unavailable,
+        }
     }
 
     /// The origin, path and query the agent signed, on the configured origin.
