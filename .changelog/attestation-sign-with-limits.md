@@ -2,4 +2,4 @@
 mpp: patch
 ---
 
-Fixed `sign_with` to refuse, before calling the remote signer, an attestation longer than the 8,192-character limit, an empty key ID, or claims that are not a JSON object, and stopped `IdentityError::Signer` from repeating its cause in its message.
+Fixed `sign_with` to refuse, before calling the remote signer, an attestation the SDK could not decode (longer than 8,192 characters, with an empty key ID, or with claims that are not a JSON object or are nested too deeply), and stopped `IdentityError::Signer` from repeating its cause in its message.

@@ -187,6 +187,13 @@ fn signing_input<C: Serialize>(claims: &C, key_id: &str) -> Result<String, Ident
             "claims must serialize to a JSON object".into(),
         ));
     }
+    // `decode` parses the payload with serde_json's nesting limit, so parse it back
+    // the same way and refuse claims it would reject (such as too deeply nested ones).
+    if serde_json::from_str::<Value>(&claims.to_string()).is_err() {
+        return Err(IdentityError::InvalidConfig(
+            "claims are nested too deeply to decode".into(),
+        ));
+    }
     Ok(format!("{}.{}", encode(&header), encode(&claims)))
 }
 
@@ -694,6 +701,30 @@ pub(crate) mod tests {
             assert!(matches!(err, IdentityError::InvalidConfig(_)), "{err}");
         }
         assert!(signer.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn refuses_claims_too_deeply_nested_to_decode_before_calling_the_signer() {
+        let signer = TestSigner::new(signing_key());
+        let mut nested = Value::Null;
+        for _ in 0..140 {
+            nested = Value::Array(vec![nested]);
+        }
+        let mut deep = claims(1);
+        deep["nested"] = nested;
+        let err = sign_with(&deep, &signer, None).await.unwrap_err();
+        assert!(matches!(err, IdentityError::InvalidConfig(_)), "{err}");
+        assert!(signer.calls.lock().unwrap().is_empty());
+
+        // Nesting the decoder accepts still signs and decodes.
+        let mut shallow = Value::Null;
+        for _ in 0..100 {
+            shallow = Value::Array(vec![shallow]);
+        }
+        let mut ok = claims(1);
+        ok["nested"] = shallow;
+        let token = sign_with(&ok, &signer, None).await.unwrap();
+        assert!(decode(&token).is_some());
     }
 
     #[tokio::test]
