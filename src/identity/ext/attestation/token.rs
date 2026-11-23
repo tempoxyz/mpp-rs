@@ -39,6 +39,48 @@ pub struct AttestationClaims {
     pub extra: Map<String, Value>,
 }
 
+impl AttestationClaims {
+    /// The issuer's identifier for the user behind the subject (`uid`), the
+    /// same across that issuer's attestations of every type, so a server can
+    /// tell that an `email` and a `github` attestation from one issuer name
+    /// the same user.
+    pub fn uid(&self) -> Option<&str> {
+        self.extra.get("uid").and_then(Value::as_str)
+    }
+
+    /// What the attestation is bound to (RFC 7800 `cnf`), such as a
+    /// request-signing key or the paying account. Servers enforce it
+    /// themselves; [`verify`] only checks its shape.
+    pub fn cnf(&self) -> Option<Confirmation> {
+        serde_json::from_value(self.extra.get("cnf")?.clone()).ok()
+    }
+}
+
+/// What an attestation is bound to (RFC 7800 `cnf`). Issuers may add other
+/// members; a server enforces the ones it understands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confirmation {
+    /// RFC 7638 thumbprint of the key that must sign each request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jkt: Option<String>,
+    /// Address of the account that must pay, such as a Tempo Account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
+    /// Any other members.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+/// Whether `value` is a `cnf` object whose `jkt` and `addr`, when present, are strings.
+pub(crate) fn is_confirmation(value: &Value) -> bool {
+    let Some(cnf) = value.as_object() else {
+        return false;
+    };
+    ["jkt", "addr"]
+        .iter()
+        .all(|key| cnf.get(*key).is_none_or(Value::is_string))
+}
+
 /// An attestation decoded without verification.
 #[derive(Debug, Clone)]
 pub struct DecodedAttestation {
@@ -191,6 +233,15 @@ pub async fn verify(
     }
     if claims.get("jti").is_some_and(|jti| !jti.is_string()) {
         return Err(invalid("The attestation ID is malformed."));
+    }
+    if claims
+        .get("uid")
+        .is_some_and(|uid| uid.as_str().is_none_or(str::is_empty))
+    {
+        return Err(invalid("The attestation user ID is malformed."));
+    }
+    if claims.get("cnf").is_some_and(|cnf| !is_confirmation(cnf)) {
+        return Err(invalid("The attestation confirmation is malformed."));
     }
     let time = |key: &str| {
         claims
@@ -346,11 +397,54 @@ pub(crate) mod tests {
                 token_with(now, |c| c["iat"] = (now + 61).into()),
                 "The attestation was issued in the future.",
             ),
+            (
+                token_with(now, |c| c["uid"] = "".into()),
+                "The attestation user ID is malformed.",
+            ),
+            (
+                token_with(now, |c| c["uid"] = 7.into()),
+                "The attestation user ID is malformed.",
+            ),
+            (
+                token_with(now, |c| c["cnf"] = "key".into()),
+                "The attestation confirmation is malformed.",
+            ),
+            (
+                token_with(now, |c| c["cnf"] = serde_json::json!({ "jkt": 1 })),
+                "The attestation confirmation is malformed.",
+            ),
+            (
+                token_with(now, |c| c["cnf"] = serde_json::json!({ "addr": [] })),
+                "The attestation confirmation is malformed.",
+            ),
             ("a.b".into(), "The attestation is malformed."),
         ];
         for (token, expected) in cases {
             assert_eq!(reason(&token, &options(now)).await, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn carries_uid_cnf_and_other_claims() {
+        let now = 1_800_000_000;
+        let token = token_with(now, |c| {
+            c["uid"] = "user_1".into();
+            c["cnf"] = serde_json::json!({ "jkt": "thumb", "addr": "0xabc", "x5t": "t" });
+            c["azp"] = "app_1".into();
+        });
+        let claims = verify(&token, &options(now), &keys()).await.unwrap();
+        assert_eq!(claims.uid(), Some("user_1"));
+        let cnf = claims.cnf().unwrap();
+        assert_eq!(cnf.jkt.as_deref(), Some("thumb"));
+        assert_eq!(cnf.addr.as_deref(), Some("0xabc"));
+        assert_eq!(cnf.extra["x5t"], "t");
+        assert_eq!(claims.extra["azp"], "app_1");
+
+        let plain = verify(&token_with(now, |_| {}), &options(now), &keys())
+            .await
+            .unwrap();
+        assert_eq!(plain.uid(), None);
+        assert_eq!(plain.cnf(), None);
     }
 
     #[tokio::test]

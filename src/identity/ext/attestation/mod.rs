@@ -11,7 +11,8 @@
 //! - **Client:** [`AttestationProver`] is a [`Prover`](crate::identity::client::Prover)
 //!   that presents cached attestations and, when a server answers with
 //!   `Identity-Attestation-Required`, obtains one and resends the request.
-//! - **Issuers** sign attestations with [`sign`].
+//! - **Issuers** sign attestations and serve their key with an
+//!   [`AttestationIssuer`], or sign them directly with [`sign`].
 //!
 //! [`email_otp`](super::email_otp) builds on it.
 //!
@@ -30,6 +31,7 @@
 //! ```
 
 mod error;
+pub(crate) mod issuer;
 pub(crate) mod jwks;
 mod server;
 pub(crate) mod token;
@@ -39,11 +41,12 @@ mod client;
 
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
 pub use error::IdentityError;
+pub use issuer::{AttestationIssuer, SignParameters, DEFAULT_TTL};
 pub use jwks::{JwksResolver, KeyResolveError, KeyResolver, KeyResolverFuture};
 pub use server::AttestationVerifier;
 pub use token::{
-    decode, is_issuer, parse_header, sign, verify, AttestationClaims, DecodedAttestation,
-    VerifyOptions,
+    decode, is_issuer, parse_header, sign, verify, AttestationClaims, Confirmation,
+    DecodedAttestation, VerifyOptions,
 };
 
 #[cfg(feature = "client")]
