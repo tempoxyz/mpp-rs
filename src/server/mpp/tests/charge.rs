@@ -164,6 +164,70 @@ fn test_mpp_create_rejects_fee_payer_without_sponsor() {
 
 #[cfg(feature = "tempo")]
 #[test]
+fn test_shared_runtime_detection() {
+    let env = |vars: &'static [(&'static str, &'static str)]| {
+        move |name: &str| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+        }
+    };
+    assert_eq!(shared_runtime(env(&[])), None);
+    assert_eq!(
+        shared_runtime(env(&[("NODE_ENV", "production")])).as_deref(),
+        Some("NODE_ENV is \"production\"")
+    );
+    assert_eq!(
+        shared_runtime(env(&[("MPP_ENV", "Production")])).as_deref(),
+        Some("MPP_ENV is \"production\"")
+    );
+    assert_eq!(shared_runtime(env(&[("NODE_ENV", "development")])), None);
+    for name in SHARED_PLATFORM_ENV_VARS {
+        let lookup = |key: &str| (key == *name).then(|| "1".to_string());
+        assert_eq!(shared_runtime(lookup), Some(format!("{name} is set")));
+    }
+    // An empty platform variable is ignored.
+    assert_eq!(shared_runtime(env(&[("VERCEL", "")])), None);
+}
+
+#[cfg(feature = "tempo")]
+#[test]
+fn test_mpp_create_refuses_the_default_store_in_production() {
+    let builder = || {
+        tempo(TempoConfig {
+            recipient: TEST_RECIPIENT,
+        })
+        .secret_key("store-test-secret-key-of-32-bytes!")
+    };
+    let vercel = |name: &str| (name == "VERCEL").then(|| "1".to_string());
+    let production = |name: &str| (name == "NODE_ENV").then(|| "production".to_string());
+
+    // Development and tests keep the in-memory fallback.
+    assert!(check_default_store(&builder(), |_| None).is_ok());
+
+    for lookup in [&vercel as &dyn Fn(&str) -> Option<String>, &production] {
+        let err = check_default_store(&builder(), lookup).expect_err("default store");
+        assert!(
+            matches!(&err, crate::error::MppError::InvalidConfig(msg)
+                if msg.starts_with("tempo has no store configured")
+                    && msg.contains("MemoryStore::new()")),
+            "{err}"
+        );
+    }
+    let err = check_default_store(&builder(), vercel).unwrap_err();
+    assert!(err.to_string().contains("VERCEL is set"), "{err}");
+
+    // An explicit store, an explicit MemoryStore included, opts out.
+    let memory: Arc<dyn crate::store::Store> = Arc::new(crate::store::MemoryStore::new());
+    assert!(check_default_store(&builder().store(memory), vercel).is_ok());
+    assert!(check_default_store(&builder().without_store(), vercel).is_ok());
+    // A relay enforces single use itself, so it needs no local store.
+    let relay = crate::server::TempoRelayConfig::new("test-api-key");
+    assert!(check_default_store(&builder().relay(relay), vercel).is_ok());
+}
+
+#[cfg(feature = "tempo")]
+#[test]
 fn test_mpp_create_requires_secret_key() {
     struct EnvGuard(Option<String>);
     impl Drop for EnvGuard {

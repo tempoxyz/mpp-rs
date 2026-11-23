@@ -67,6 +67,66 @@ pub(crate) fn detect_realm() -> String {
     realm_from_env(|name| std::env::var(name).ok())
 }
 
+/// Environment variables that mark a platform which may run several instances
+/// of one server, as in mppx.
+#[cfg(feature = "tempo")]
+const SHARED_PLATFORM_ENV_VARS: &[&str] = &[
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "DENO_DEPLOYMENT_ID",
+    "DYNO",
+    "FLY_APP_NAME",
+    "K_SERVICE",
+    "NETLIFY",
+    "RAILWAY_ENVIRONMENT",
+    "RENDER",
+    "VERCEL",
+];
+
+/// Describes why the runtime looks like production or a multi-instance
+/// platform, or returns `None` for local development and tests.
+///
+/// Checks `MPP_ENV=production` and `NODE_ENV=production` (as mppx and pympp
+/// do), then the variables serverless and multi-replica hosts set (AWS Lambda,
+/// Deno Deploy, Heroku, Fly.io, Cloud Run, Netlify, Railway, Render, Vercel).
+/// Instance-local replay protection is unsafe in all of them.
+#[cfg(feature = "tempo")]
+fn shared_runtime(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    for name in ["MPP_ENV", "NODE_ENV"] {
+        if lookup(name).is_some_and(|value| value.trim().eq_ignore_ascii_case("production")) {
+            return Some(format!("{name} is \"production\""));
+        }
+    }
+    SHARED_PLATFORM_ENV_VARS
+        .iter()
+        .find(|name| lookup(name).is_some_and(|value| !value.is_empty()))
+        .map(|name| format!("{name} is set"))
+}
+
+/// Refuses the default in-memory replay store in production or on a
+/// multi-instance platform, where a credential accepted by one instance could
+/// be accepted again by another. An explicit store (an explicit
+/// `MemoryStore` included), `without_store()` or a relay, which enforces
+/// single use itself, opts out.
+#[cfg(feature = "tempo")]
+fn check_default_store(
+    builder: &super::TempoBuilder,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<()> {
+    if builder.store_configured || builder.relay.is_some() {
+        return Ok(());
+    }
+    match shared_runtime(lookup) {
+        None => Ok(()),
+        Some(runtime) => Err(crate::error::MppError::InvalidConfig(format!(
+            "tempo has no store configured, and {runtime}, so this server may run as several \
+             instances. An in-memory store would let a credential accepted by one instance be \
+             accepted again by another. Pass a shared store with .store(...), such as a Redis \
+             or SQL-backed one, or pass .store(Arc::new(MemoryStore::new())) to accept replay \
+             protection scoped to this instance."
+        ))),
+    }
+}
+
 pub(crate) fn request_realm_default() -> bool {
     std::env::var("MPP_REALM")
         .ok()
@@ -424,6 +484,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
     /// let challenges = mpp.charge("1.00")?;
     /// ```
     pub fn create(mut builder: super::TempoBuilder) -> Result<Self> {
+        check_default_store(&builder, |name| std::env::var(name).ok())?;
         builder
             .chain_id
             .get_or_insert_with(|| super::tempo::chain_id_from_rpc_url(&builder.rpc_url));
