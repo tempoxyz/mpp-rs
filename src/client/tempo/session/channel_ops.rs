@@ -166,17 +166,7 @@ pub fn resolve_escrow_with_policy(
     allow_custom_escrow: bool,
 ) -> Result<Address, MppError> {
     let request = challenge.request.decode::<SessionRequest>().ok();
-    let advertised = request
-        .as_ref()
-        .and_then(|req| req.method_details.as_ref())
-        .and_then(|details| {
-            ["escrowContract", "escrow"].into_iter().find_map(|key| {
-                details
-                    .get(key)
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|value| value.parse::<Address>().ok())
-            })
-        });
+    let advertised = request.as_ref().and_then(advertised_escrow);
     let protocol = request.as_ref().and_then(|req| req.session_protocol());
     let tip1034 = match protocol.as_deref() {
         Some(SESSION_PROTOCOL_TIP1034) => true,
@@ -224,7 +214,36 @@ pub fn resolve_escrow_with_policy(
     Ok(escrow)
 }
 
+/// The escrow address a session request advertises in its method details, if any.
+fn advertised_escrow(request: &SessionRequest) -> Option<Address> {
+    let details = request.method_details.as_ref()?;
+    ["escrowContract", "escrow"].into_iter().find_map(|key| {
+        details
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<Address>().ok())
+    })
+}
+
+/// Whether a session challenge selects the TIP-1034 channel reserve, by its
+/// `sessionProtocol` marker or, without one, by advertising the reserve.
+fn is_tip1034_challenge(challenge: &PaymentChallenge) -> bool {
+    let Ok(request) = challenge.request.decode::<SessionRequest>() else {
+        return false;
+    };
+    match request.session_protocol().as_deref() {
+        Some(protocol) => protocol == SESSION_PROTOCOL_TIP1034,
+        None => advertised_escrow(&request) == Some(TIP20_CHANNEL_RESERVE_ADDRESS),
+    }
+}
+
 /// Build a `PaymentCredential` from a challenge and session payload.
+///
+/// For a TIP-1034 session, the credential's `source` names the channel's
+/// funding payer from the payload's descriptor, falling back to
+/// `signer_address`, so a delegated voucher signer still identifies the
+/// funding account, as mppx does. Legacy escrow sessions always name
+/// `signer_address`, as mppx's legacy client does.
 pub fn build_credential(
     challenge: &PaymentChallenge,
     payload: SessionCredentialPayload,
@@ -232,8 +251,23 @@ pub fn build_credential(
     signer_address: Address,
 ) -> PaymentCredential {
     let echo = challenge.to_echo();
-    let source = PaymentCredential::evm_did(chain_id, &signer_address.to_string());
+    let payer = is_tip1034_challenge(challenge)
+        .then(|| descriptor_payer(&payload))
+        .flatten()
+        .unwrap_or(signer_address);
+    let source = PaymentCredential::evm_did(chain_id, &payer.to_string());
     PaymentCredential::with_source(echo, source, payload)
+}
+
+/// The funding payer named by a session payload's channel descriptor, if any.
+pub(crate) fn descriptor_payer(payload: &SessionCredentialPayload) -> Option<Address> {
+    let descriptor = match payload {
+        SessionCredentialPayload::Open { descriptor, .. }
+        | SessionCredentialPayload::TopUp { descriptor, .. }
+        | SessionCredentialPayload::Voucher { descriptor, .. }
+        | SessionCredentialPayload::Close { descriptor, .. } => descriptor.as_ref(),
+    };
+    descriptor.and_then(|descriptor| descriptor.payer.parse().ok())
 }
 
 /// Create a voucher payload by signing a voucher.
@@ -2746,6 +2780,89 @@ mod tests {
         let did = cred.source.as_ref().unwrap();
         let expected = format!("did:pkh:eip155:4217:{}", addr);
         assert_eq!(did, &expected, "DID should match exact pkh format");
+    }
+
+    #[test]
+    fn test_build_credential_names_the_funding_payer_for_a_delegated_signer() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+        use crate::protocol::methods::tempo::session::ChannelDescriptor;
+
+        let challenge_with = |method_details: serde_json::Value| PaymentChallenge {
+            id: "payer".to_string(),
+            realm: "api.example.com".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1",
+                "currency": "0x3333333333333333333333333333333333333333",
+                "methodDetails": method_details,
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+            opaque: None,
+            header: None,
+        };
+        let payer: Address = "0x0000000000000000000000000000000000000099"
+            .parse()
+            .unwrap();
+        let signer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let descriptor = ChannelDescriptor {
+            payer: payer.to_string(),
+            payee: "0x2222222222222222222222222222222222222222".to_string(),
+            operator: "0x0000000000000000000000000000000000000000".to_string(),
+            token: "0x3333333333333333333333333333333333333333".to_string(),
+            salt: format!("0x{}", "00".repeat(32)),
+            authorized_signer: signer.to_string(),
+            expiring_nonce_hash: format!("0x{}", "00".repeat(32)),
+        };
+        let payload = SessionCredentialPayload::Voucher {
+            channel_id: "0xabc".to_string(),
+            descriptor: Some(descriptor),
+            settlement_route: None,
+            cumulative_amount: "1".to_string(),
+            signature: "0x1234".to_string(),
+        };
+
+        let payer_did = format!("did:pkh:eip155:42431:{payer}");
+        let signer_did = format!("did:pkh:eip155:42431:{signer}");
+        for (method_details, expected) in [
+            (
+                serde_json::json!({ "sessionProtocol": SESSION_PROTOCOL_TIP1034 }),
+                &payer_did,
+            ),
+            (
+                serde_json::json!({ "escrowContract": TIP20_CHANNEL_RESERVE_ADDRESS.to_string() }),
+                &payer_did,
+            ),
+            // A legacy session names the transaction signer, whatever the descriptor says.
+            (
+                serde_json::json!({ "sessionProtocol": SESSION_PROTOCOL_LEGACY }),
+                &signer_did,
+            ),
+            (
+                serde_json::json!({
+                    "escrowContract": "0x4444444444444444444444444444444444444444",
+                }),
+                &signer_did,
+            ),
+            (serde_json::json!({}), &signer_did),
+        ] {
+            let cred = build_credential(
+                &challenge_with(method_details.clone()),
+                payload.clone(),
+                42431,
+                signer,
+            );
+            assert_eq!(
+                cred.source.as_deref(),
+                Some(expected.as_str()),
+                "{method_details}"
+            );
+        }
     }
 
     #[cfg(feature = "evm")]
