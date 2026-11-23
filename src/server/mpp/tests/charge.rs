@@ -165,11 +165,12 @@ fn test_mpp_create_rejects_fee_payer_without_sponsor() {
 #[cfg(feature = "tempo")]
 #[test]
 fn test_shared_runtime_detection() {
+    use std::ffi::OsString;
     let env = |vars: &'static [(&'static str, &'static str)]| {
         move |name: &str| {
             vars.iter()
                 .find(|(key, _)| *key == name)
-                .map(|(_, value)| value.to_string())
+                .map(|(_, value)| OsString::from(value))
         }
     };
     assert_eq!(shared_runtime(env(&[])), None);
@@ -183,47 +184,129 @@ fn test_shared_runtime_detection() {
     );
     assert_eq!(shared_runtime(env(&[("NODE_ENV", "development")])), None);
     for name in SHARED_PLATFORM_ENV_VARS {
-        let lookup = |key: &str| (key == *name).then(|| "1".to_string());
+        let lookup = |key: &str| (key == *name).then(|| OsString::from("1"));
         assert_eq!(shared_runtime(lookup), Some(format!("{name} is set")));
     }
     // An empty platform variable is ignored.
     assert_eq!(shared_runtime(env(&[("VERCEL", "")])), None);
 }
 
+/// A platform variable set to a value that is not valid Unicode still counts
+/// as set.
+#[cfg(all(feature = "tempo", unix))]
+#[test]
+fn test_shared_runtime_detects_non_unicode_values() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let invalid = || OsString::from_vec(vec![0x66, 0x6f, 0x80]);
+    assert!(invalid().to_str().is_none());
+    let vercel = |name: &str| (name == "VERCEL").then(invalid);
+    assert_eq!(shared_runtime(vercel).as_deref(), Some("VERCEL is set"));
+    let node_env = |name: &str| (name == "NODE_ENV").then(invalid);
+    assert_eq!(shared_runtime(node_env), None);
+}
+
+#[cfg(feature = "tempo")]
+fn store_test_builder() -> crate::server::TempoBuilder {
+    tempo(TempoConfig {
+        recipient: TEST_RECIPIENT,
+    })
+    .secret_key(TEST_SECRET)
+}
+
+#[cfg(feature = "tempo")]
+fn vercel(name: &str) -> Option<std::ffi::OsString> {
+    (name == "VERCEL").then(|| "1".into())
+}
+
 #[cfg(feature = "tempo")]
 #[test]
-fn test_mpp_create_refuses_the_default_store_in_production() {
-    let builder = || {
-        tempo(TempoConfig {
-            recipient: TEST_RECIPIENT,
-        })
-        .secret_key("store-test-secret-key-of-32-bytes!")
-    };
-    let vercel = |name: &str| (name == "VERCEL").then(|| "1".to_string());
-    let production = |name: &str| (name == "NODE_ENV").then(|| "production".to_string());
+fn test_default_store_refused_in_production() {
+    let builder = store_test_builder;
+    let production = |name: &str| (name == "NODE_ENV").then(|| "production".into());
 
     // Development and tests keep the in-memory fallback.
-    assert!(check_default_store(&builder(), |_| None).is_ok());
+    assert_eq!(default_store_refusal(&builder(), |_| None), None);
 
-    for lookup in [&vercel as &dyn Fn(&str) -> Option<String>, &production] {
-        let err = check_default_store(&builder(), lookup).expect_err("default store");
+    for lookup in [
+        &vercel as &dyn Fn(&str) -> Option<std::ffi::OsString>,
+        &production,
+    ] {
+        let refusal = default_store_refusal(&builder(), lookup).expect("default store");
         assert!(
-            matches!(&err, crate::error::MppError::InvalidConfig(msg)
-                if msg.starts_with("tempo has no store configured")
-                    && msg.contains("MemoryStore::new()")),
-            "{err}"
+            refusal.starts_with("tempo has no store configured")
+                && refusal.contains("MemoryStore::new()"),
+            "{refusal}"
         );
     }
-    let err = check_default_store(&builder(), vercel).unwrap_err();
-    assert!(err.to_string().contains("VERCEL is set"), "{err}");
+    let refusal = default_store_refusal(&builder(), vercel).unwrap();
+    assert!(refusal.contains("VERCEL is set"), "{refusal}");
 
     // An explicit store, an explicit MemoryStore included, opts out.
     let memory: Arc<dyn crate::store::Store> = Arc::new(crate::store::MemoryStore::new());
-    assert!(check_default_store(&builder().store(memory), vercel).is_ok());
-    assert!(check_default_store(&builder().without_store(), vercel).is_ok());
+    assert_eq!(
+        default_store_refusal(&builder().store(memory), vercel),
+        None
+    );
+    assert_eq!(
+        default_store_refusal(&builder().without_store(), vercel),
+        None
+    );
     // A relay enforces single use itself, so it needs no local store.
     let relay = crate::server::TempoRelayConfig::new("test-api-key");
-    assert!(check_default_store(&builder().relay(relay), vercel).is_ok());
+    assert_eq!(default_store_refusal(&builder().relay(relay), vercel), None);
+}
+
+/// `Mpp::create` still builds the handler, so it can serve sessions, but
+/// refuses to issue or verify a charge with the default store in production.
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_mpp_create_refuses_charges_with_the_default_store_in_production() {
+    let refused = Mpp::create_with_env(store_test_builder(), vercel).expect("handler");
+    let is_refusal = |err: &crate::error::MppError| {
+        matches!(err, crate::error::MppError::InvalidConfig(msg)
+            if msg.starts_with("tempo has no store configured") && msg.contains("VERCEL is set"))
+    };
+    let err = refused.charge("1.00").unwrap_err();
+    assert!(is_refusal(&err), "{err}");
+    let err = refused
+        .charge_challenge("1000000", DEFAULT_CURRENCY_TESTNET, TEST_RECIPIENT)
+        .unwrap_err();
+    assert!(is_refusal(&err), "{err}");
+    let err = refused
+        .expected_charge_request("1.00", ChargeOptions::default())
+        .unwrap_err();
+    assert!(is_refusal(&err), "{err}");
+
+    // A credential another instance issued is not settled here either.
+    let issuer = Mpp::create_with_env(store_test_builder(), |_| None).unwrap();
+    let challenges = issuer.charge("1.00").unwrap();
+    let credential =
+        PaymentCredential::new(challenges[0].to_echo(), PaymentPayload::hash("0xdeadbeef"));
+    let refused: Mpp<TempoSuccessMethod> = Mpp {
+        method: Arc::new(TempoSuccessMethod),
+        session_method: None,
+        config: refused.config,
+        events: refused.events,
+    };
+    let err = refused.verify_credential(&credential).await.unwrap_err();
+    assert!(
+        err.message.starts_with("tempo has no store configured"),
+        "{}",
+        err.message
+    );
+    let request = credential.challenge.request.decode().unwrap();
+    let err = refused.validate(&credential, &request).await.unwrap_err();
+    assert!(
+        err.message.starts_with("tempo has no store configured"),
+        "{}",
+        err.message
+    );
+
+    // An explicit store opts out.
+    let memory: Arc<dyn crate::store::Store> = Arc::new(crate::store::MemoryStore::new());
+    let stored = Mpp::create_with_env(store_test_builder().store(memory), vercel).unwrap();
+    assert!(stored.charge("1.00").is_ok());
 }
 
 #[cfg(feature = "tempo")]

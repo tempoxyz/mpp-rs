@@ -74,6 +74,16 @@ where
         challenge
     }
 
+    /// Refuse a charge when [`Mpp::create()`] found the default in-memory
+    /// replay store in production or on a multi-instance platform.
+    #[cfg(feature = "tempo")]
+    fn ensure_charge_store(&self) -> Result<()> {
+        match &self.config.charge_store_refusal {
+            Some(refusal) => Err(crate::error::MppError::InvalidConfig(refusal.clone())),
+            None => Ok(()),
+        }
+    }
+
     #[cfg(feature = "tempo")]
     fn require_bound_config(&self) -> Result<(&str, &str)> {
         let currency = self.currency().ok_or_else(|| {
@@ -125,6 +135,7 @@ where
         amount: &str,
         options: crate::server::ChargeOptions<'_>,
     ) -> Result<Vec<PaymentChallenge>> {
+        self.ensure_charge_store()?;
         self.require_bound_config()?;
         self.config
             .currencies
@@ -158,6 +169,7 @@ where
         currency: &str,
         options: &crate::server::ChargeOptions<'_>,
     ) -> Result<PaymentChallenge> {
+        self.ensure_charge_store()?;
         let (_, recipient) = self.require_bound_config()?;
         let base_units = crate::server::parse_dollar_amount(amount, self.config.decimals)?;
         let mut request = ChargeRequest {
@@ -235,6 +247,7 @@ where
         expires: Option<&str>,
         description: Option<&str>,
     ) -> Result<PaymentChallenge> {
+        self.ensure_charge_store()?;
         // Verification fails closed on a missing `chainId` when one is pinned,
         // so a caller-built request must carry it like `charge()` requests do.
         // Configured Zones bind credentials to the route the same way, so

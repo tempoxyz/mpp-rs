@@ -46,6 +46,17 @@ where
         Ok(())
     }
 
+    /// Refuse to settle a charge when [`Mpp::create()`](super::Mpp::create)
+    /// found the default in-memory replay store in production or on a
+    /// multi-instance platform.
+    fn verify_charge_store(&self) -> std::result::Result<(), VerificationError> {
+        #[cfg(feature = "tempo")]
+        if let Some(refusal) = &self.config.charge_store_refusal {
+            return Err(VerificationError::new(refusal.clone()));
+        }
+        Ok(())
+    }
+
     /// Tier-2 pinned field verification.
     ///
     /// After the HMAC check (Tier 1) confirms the echoed challenge was issued
@@ -667,6 +678,7 @@ where
         body: Option<&[u8]>,
         bound: bool,
     ) -> std::result::Result<ChargeValidation, VerificationError> {
+        self.verify_charge_store()?;
         self.verify_hmac_and_expiry(credential)?;
         self.verify_body_digest(credential, body)?;
         self.verify_pinned_fields(credential, request, bound)?;
@@ -733,6 +745,7 @@ where
         gate: Option<&dyn CredentialGate>,
         bound: bool,
     ) -> std::result::Result<Option<Receipt>, VerificationError> {
+        self.verify_charge_store()?;
         // Tier 1: HMAC provenance + expiry
         self.verify_hmac_and_expiry(credential)?;
         self.verify_body_digest(credential, body)?;

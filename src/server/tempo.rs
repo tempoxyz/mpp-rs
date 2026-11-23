@@ -229,12 +229,14 @@ impl TempoBuilder {
     /// included, also makes zero-amount proof credentials single-use per
     /// challenge.
     ///
-    /// If omitted, [`Mpp::create()`](super::Mpp::create) returns an error in
-    /// production (`MPP_ENV` or `NODE_ENV` is `production`) and on
-    /// multi-instance platforms (such as AWS Lambda, Cloud Run, Fly.io, Heroku,
-    /// Railway, Render or Vercel), as mppx does, unless a relay is configured.
-    /// Elsewhere, such as local development and tests, it falls back to an
-    /// in-memory store. Pass `Arc::new(MemoryStore::new())` explicitly to accept
+    /// If omitted, in production (`MPP_ENV` or `NODE_ENV` is `production`)
+    /// and on multi-instance platforms (such as AWS Lambda, Cloud Run, Fly.io,
+    /// Heroku, Railway, Render or Vercel), a handler from
+    /// [`Mpp::create()`](super::Mpp::create) refuses to issue or verify
+    /// charges (mppx refuses to start), unless a relay is configured.
+    /// Sessions, whose method has its own store, are unaffected. Elsewhere,
+    /// such as local development and tests, it falls back to an in-memory
+    /// store. Pass `Arc::new(MemoryStore::new())` explicitly to accept
     /// replay protection scoped to one instance.
     pub fn store(mut self, store: std::sync::Arc<dyn crate::store::Store>) -> Self {
         self.store = Some(store);
@@ -375,7 +377,7 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         fee_payer_fee_token: None,
         remote_fee_payer: None,
         // Default in-memory store; replay protection on by default.
-        // `Mpp::create` refuses it in production (see `shared_runtime`).
+        // Charges refuse it in production (see `default_store_refusal`).
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
         store_configured: false,
         relay: None,

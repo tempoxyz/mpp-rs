@@ -88,11 +88,18 @@ const SHARED_PLATFORM_ENV_VARS: &[&str] = &[
 /// Checks `MPP_ENV=production` and `NODE_ENV=production` (as mppx and pympp
 /// do), then the variables serverless and multi-replica hosts set (AWS Lambda,
 /// Deno Deploy, Heroku, Fly.io, Cloud Run, Netlify, Railway, Render, Vercel).
-/// Instance-local replay protection is unsafe in all of them.
+/// Instance-local replay protection is unsafe in all of them. `lookup`
+/// returns the raw value, so a set value that is not valid Unicode still
+/// counts as set.
 #[cfg(feature = "tempo")]
-fn shared_runtime(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+fn shared_runtime(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<String> {
     for name in ["MPP_ENV", "NODE_ENV"] {
-        if lookup(name).is_some_and(|value| value.trim().eq_ignore_ascii_case("production")) {
+        if lookup(name).is_some_and(|value| {
+            value
+                .to_string_lossy()
+                .trim()
+                .eq_ignore_ascii_case("production")
+        }) {
             return Some(format!("{name} is \"production\""));
         }
     }
@@ -102,29 +109,32 @@ fn shared_runtime(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
         .map(|name| format!("{name} is set"))
 }
 
-/// Refuses the default in-memory replay store in production or on a
-/// multi-instance platform, where a credential accepted by one instance could
-/// be accepted again by another. An explicit store (an explicit
-/// `MemoryStore` included), `without_store()` or a relay, which enforces
-/// single use itself, opts out.
+/// Why the charge method must not use the default in-memory replay store in
+/// production or on a multi-instance platform, where a credential accepted by
+/// one instance could be accepted again by another, or `None` when it may.
+///
+/// An explicit store (an explicit `MemoryStore` included), `without_store()`
+/// or a relay, which enforces single use itself, opts out. Only charges read
+/// this store, so [`Mpp::create`] keeps the refusal and returns it when a
+/// charge is issued or verified: a handler that serves only sessions, whose
+/// method has its own store, is unaffected.
 #[cfg(feature = "tempo")]
-fn check_default_store(
+fn default_store_refusal(
     builder: &super::TempoBuilder,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Result<()> {
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
     if builder.store_configured || builder.relay.is_some() {
-        return Ok(());
+        return None;
     }
-    match shared_runtime(lookup) {
-        None => Ok(()),
-        Some(runtime) => Err(crate::error::MppError::InvalidConfig(format!(
+    shared_runtime(lookup).map(|runtime| {
+        format!(
             "tempo has no store configured, and {runtime}, so this server may run as several \
              instances. An in-memory store would let a credential accepted by one instance be \
              accepted again by another. Pass a shared store with .store(...), such as a Redis \
              or SQL-backed one, or pass .store(Arc::new(MemoryStore::new())) to accept replay \
              protection scoped to this instance."
-        ))),
-    }
+        )
+    })
 }
 
 pub(crate) fn request_realm_default() -> bool {
@@ -212,6 +222,10 @@ struct Config {
     /// How long after expiry a `zone` Credential is still accepted.
     #[cfg(feature = "tempo")]
     zone_credential_grace: std::time::Duration,
+    /// Why charges are refused: the default in-memory replay store in
+    /// production or on a multi-instance platform. Sessions are unaffected.
+    #[cfg(feature = "tempo")]
+    charge_store_refusal: Option<String>,
     opaque: Option<Base64UrlJson>,
     credential_header: Option<String>,
 }
@@ -236,6 +250,8 @@ impl Config {
             relay: false,
             #[cfg(feature = "tempo")]
             zone_credential_grace: std::time::Duration::ZERO,
+            #[cfg(feature = "tempo")]
+            charge_store_refusal: None,
             opaque: None,
             credential_header: None,
         }
@@ -483,8 +499,22 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
     ///
     /// let challenges = mpp.charge("1.00")?;
     /// ```
-    pub fn create(mut builder: super::TempoBuilder) -> Result<Self> {
-        check_default_store(&builder, |name| std::env::var(name).ok())?;
+    ///
+    /// Without a `store` in production or on a multi-instance platform (see
+    /// [`TempoBuilder::store`](super::TempoBuilder::store)), the handler is
+    /// still created, so it can serve sessions, but issuing or verifying a
+    /// charge returns an error.
+    pub fn create(builder: super::TempoBuilder) -> Result<Self> {
+        Self::create_with_env(builder, |name| std::env::var_os(name))
+    }
+
+    /// [`create()`](Self::create), reading production and platform markers
+    /// with `lookup`.
+    pub(crate) fn create_with_env(
+        mut builder: super::TempoBuilder,
+        lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<Self> {
+        let charge_store_refusal = default_store_refusal(&builder, lookup);
         builder
             .chain_id
             .get_or_insert_with(|| super::tempo::chain_id_from_rpc_url(&builder.rpc_url));
@@ -616,6 +646,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 zones,
                 relay,
                 zone_credential_grace: builder.zone_credential_grace,
+                charge_store_refusal,
                 credential_header: advertised_builder_credential_header(builder.requires_auth),
                 ..Config::new(builder.realm, secret_key)
             },
