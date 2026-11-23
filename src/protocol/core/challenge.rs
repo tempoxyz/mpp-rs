@@ -92,7 +92,26 @@ pub struct PaymentChallenge {
         serialize_with = "serialize_credential_header"
     )]
     pub header: Option<String>,
+
+    /// Whether the `WWW-Authenticate` parser found a legacy `\uXXXX` escape
+    /// in an auth-param the Challenge binds or echoes (any but
+    /// `description`).
+    ///
+    /// Servers that wrote characters above U+00FF that way (mppx 0.8.18 to
+    /// 0.21.1, pympp 0.15 to 0.26, mpp-go 0.4 to 0.9.1) bound the decoded
+    /// character in the Challenge ID, while a quoted-pair reads `\u00e9` as
+    /// `u00e9`, so no Credential for such a Challenge verifies. Payment
+    /// providers and [`format_www_authenticate`](super::format_www_authenticate)
+    /// refuse it (see [`PaymentChallenge::ensure_payable`]). Never serialized;
+    /// `false` for Challenges built in code or read from JSON.
+    #[serde(skip)]
+    pub legacy_unicode_escape: bool,
 }
+
+/// Bytes [`PaymentChallenge::ensure_payable`] allows for a Credential's
+/// payload and source beside the echoed Challenge: enough for a transaction
+/// hash, which a pushed payment sends after its funds moved.
+const CREDENTIAL_PAYLOAD_ALLOWANCE: usize = 1024;
 
 /// Serde shape of [`PaymentChallenge`]. Deserialized challenges get the same
 /// validation as ones parsed from a `WWW-Authenticate` header.
@@ -133,6 +152,7 @@ impl TryFrom<WireChallenge> for PaymentChallenge {
             digest: wire.digest,
             opaque: wire.opaque,
             header: parse_advertised_credential_header(wire.header.as_deref())?,
+            legacy_unicode_escape: false,
         })
     }
 }
@@ -176,6 +196,7 @@ impl PaymentChallenge {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         }
     }
 
@@ -238,6 +259,7 @@ impl PaymentChallenge {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         }
     }
 
@@ -291,6 +313,7 @@ impl PaymentChallenge {
             digest: digest.map(String::from),
             opaque,
             header,
+            legacy_unicode_escape: false,
         }
     }
 
@@ -478,13 +501,52 @@ impl PaymentChallenge {
         })
     }
 
+    /// Refuse a Challenge whose server escaped an auth-param it binds or
+    /// echoes as a legacy `\uXXXX` escape
+    /// ([`legacy_unicode_escape`](Self::legacy_unicode_escape)): no Credential
+    /// for it verifies, so payment providers call this before signing or
+    /// broadcasting anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`MppError::is_legacy_unicode_escape`] identifies, or
+    /// an invalid-Challenge error when a Credential echoing the Challenge
+    /// would exceed the 64 KiB Authorization size servers read.
+    ///
+    /// [`MppError::is_legacy_unicode_escape`]: crate::MppError::is_legacy_unicode_escape
+    pub fn ensure_payable(&self) -> crate::error::Result<()> {
+        if self.legacy_unicode_escape {
+            return Err(crate::error::MppError::invalid_challenge(
+                self.id.clone(),
+                super::headers::LEGACY_UNICODE_ESCAPE_REASON,
+            ));
+        }
+        // A Credential carries the echoed Challenge base64url-encoded. One
+        // that can't fit the Authorization size servers read would be refused
+        // after a pushed payment already moved funds.
+        if let Ok(echo) = serde_json::to_vec(&self.to_echo()) {
+            let credential =
+                "Payment ".len() + (echo.len() + CREDENTIAL_PAYLOAD_ALLOWANCE).div_ceil(3) * 4;
+            if credential > super::headers::MAX_AUTHORIZATION_LEN {
+                return Err(crate::error::MppError::invalid_challenge(
+                    self.id.clone(),
+                    "Challenge too large: a Credential echoing it would exceed the Authorization size limit",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate that this challenge can be used for a charge payment with the given method.
     ///
     /// Checks that:
+    /// - The server did not escape a bound auth-param as a legacy `\uXXXX`
+    ///   escape (see [`ensure_payable`](Self::ensure_payable))
     /// - The payment method matches (case-insensitive)
     /// - The intent is "charge"
     /// - The challenge has not expired
     pub fn validate_for_charge(&self, method: &str) -> crate::error::Result<()> {
+        self.ensure_payable()?;
         if !self.method.eq_ignore_ascii_case(method) {
             return Err(crate::error::MppError::UnsupportedPaymentMethod(format!(
                 "Payment method '{}' is not supported. Supported methods: {}",
@@ -512,10 +574,13 @@ impl PaymentChallenge {
     /// Validate that this challenge can be used for a session with the given method.
     ///
     /// Checks that:
+    /// - The server did not escape a bound auth-param as a legacy `\uXXXX`
+    ///   escape (see [`ensure_payable`](Self::ensure_payable))
     /// - The payment method matches (case-insensitive)
     /// - The intent is "session"
     /// - The challenge has not expired
     pub fn validate_for_session(&self, method: &str) -> crate::error::Result<()> {
+        self.ensure_payable()?;
         if !self.method.eq_ignore_ascii_case(method) {
             return Err(crate::error::MppError::UnsupportedPaymentMethod(format!(
                 "Payment method '{}' is not supported. Supported methods: {}",
@@ -635,7 +700,24 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         }
+    }
+
+    #[test]
+    fn test_ensure_payable_refuses_challenge_too_large_to_echo() {
+        // A Credential echoes the description, so one past the Authorization
+        // limit is refused before paying instead of after.
+        let mut challenge = test_challenge();
+        challenge.description = Some("d".repeat(40 * 1024));
+        challenge.ensure_payable().unwrap();
+        challenge.description = Some("d".repeat(48 * 1024));
+        let error = challenge.ensure_payable().unwrap_err();
+        assert!(error.to_string().contains("Challenge too large"), "{error}");
+        assert!(!error.is_legacy_unicode_escape());
+        assert!(challenge.validate_for_charge("tempo").is_err());
+        // Servers still send it: the limit is the client's to enforce.
+        super::super::format_www_authenticate(&challenge).unwrap();
     }
 
     #[test]
@@ -700,6 +782,7 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(challenge.verify(secret));
@@ -730,6 +813,7 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(!challenge.verify("wrong-secret"));
@@ -750,6 +834,7 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(!challenge.verify("any-secret"));
@@ -784,6 +869,7 @@ pub(super) mod tests {
             digest: digest.map(String::from),
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(challenge.verify(secret));
@@ -862,6 +948,7 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(!challenge.verify(secret));

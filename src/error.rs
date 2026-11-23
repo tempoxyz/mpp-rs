@@ -628,6 +628,19 @@ impl MppError {
         }
     }
 
+    /// Whether this is the error [`parse_payable_challenges`] returns for a
+    /// challenge whose server escaped a bound auth-param as `\uXXXX`, which
+    /// no Credential can answer.
+    ///
+    /// [`parse_payable_challenges`]: crate::protocol::core::parse_payable_challenges
+    pub fn is_legacy_unicode_escape(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidChallenge { reason: Some(reason), .. }
+                if reason == crate::protocol::core::headers::LEGACY_UNICODE_ESCAPE_REASON
+        )
+    }
+
     /// Create an invalid challenge error without details.
     pub fn invalid_challenge_default() -> Self {
         Self::InvalidChallenge {

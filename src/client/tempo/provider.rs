@@ -663,6 +663,7 @@ impl TempoProvider {
         challenge: &PaymentChallenge,
         origin: Option<String>,
     ) -> Result<PaymentCredential, MppError> {
+        challenge.ensure_payable()?;
         self.check_policy(challenge)?;
         let from = self
             .signing_mode
