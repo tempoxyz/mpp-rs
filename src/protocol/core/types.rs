@@ -287,7 +287,8 @@ pub fn base64url_decode(input: &str) -> Result<Vec<u8>> {
         .strip_suffix("==")
         .or_else(|| input.strip_suffix('='))
         .unwrap_or(input);
-    if unpadded.contains('=') || (unpadded.len() < input.len() && unpadded.len() % 4 == 0) {
+    if unpadded.contains('=') || (unpadded.len() < input.len() && unpadded.len().is_multiple_of(4))
+    {
         return Err(MppError::InvalidBase64Url(
             "Invalid base64url: '=' is only allowed as trailing padding".to_string(),
         ));
