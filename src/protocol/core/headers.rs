@@ -282,24 +282,22 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
     while let Some((name, value)) = tokens.param()? {
         // auth-params = auth-param *( OWS "," OWS auth-param )
         if !params.is_empty() && !tokens.after_comma() {
-            return Err(MppError::invalid_challenge_reason(format!(
-                "Expected ',' before parameter: {}",
-                name
-            )));
+            return Err(MppError::invalid_challenge_reason(
+                "Expected ',' between auth-params",
+            ));
         }
         // auth-param = token BWS "=" BWS ( token / quoted-string )
         if !is_token(name) {
-            return Err(MppError::invalid_challenge_reason(format!(
-                "Invalid parameter name: {:?}",
-                name
-            )));
+            // The name is server-supplied and unbounded: leave it out.
+            return Err(MppError::invalid_challenge_reason(
+                "Invalid auth-param name: expected a token",
+            ));
         }
         // An empty unquoted value is still read as "", as mppx reads it.
         if !tokens.quoted() && !value.is_empty() && !is_token(&value) {
-            return Err(MppError::invalid_challenge_reason(format!(
-                "Invalid value for parameter {}: expected a token or quoted-string",
-                name
-            )));
+            return Err(MppError::invalid_challenge_reason(
+                "Invalid auth-param value: expected a token or quoted-string",
+            ));
         }
         // Auth-param names are case-insensitive (RFC 9110 §11.2).
         let key = name.to_ascii_lowercase();
