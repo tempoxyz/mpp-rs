@@ -26,7 +26,7 @@ const MAX_TOKEN_LEN: usize = 16 * 1024;
 /// A credential echoes its challenge, whose `request` alone may reach
 /// [`MAX_TOKEN_LEN`], so credentials need room to expand during JSON and
 /// base64url encoding.
-pub(crate) const MAX_AUTHORIZATION_LEN: usize = 64 * 1024;
+const MAX_AUTHORIZATION_LEN: usize = 64 * 1024;
 
 /// Macro to extract a required parameter from the params map.
 macro_rules! require_param {

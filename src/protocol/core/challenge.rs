@@ -108,11 +108,6 @@ pub struct PaymentChallenge {
     pub legacy_unicode_escape: bool,
 }
 
-/// Bytes [`PaymentChallenge::ensure_payable`] allows for a Credential's
-/// payload and source beside the echoed Challenge: enough for a transaction
-/// hash, which a pushed payment sends after its funds moved.
-const CREDENTIAL_PAYLOAD_ALLOWANCE: usize = 1024;
-
 /// Serde shape of [`PaymentChallenge`]. Deserialized challenges get the same
 /// validation as ones parsed from a `WWW-Authenticate` header.
 #[derive(Deserialize)]
@@ -502,9 +497,8 @@ impl PaymentChallenge {
     }
 
     /// Refuse a Challenge flagged as carrying a legacy `\uXXXX` escape
-    /// ([`legacy_unicode_escape`](Self::legacy_unicode_escape)), without the
-    /// Credential size check [`ensure_payable`](Self::ensure_payable) adds.
-    /// Session voucher, top-up and close paths call it before signing.
+    /// ([`legacy_unicode_escape`](Self::legacy_unicode_escape)). Session
+    /// voucher, top-up and close paths call it before signing.
     pub(crate) fn ensure_not_legacy_escaped(&self) -> crate::error::Result<()> {
         if self.legacy_unicode_escape {
             return Err(crate::error::MppError::invalid_challenge(
@@ -523,27 +517,11 @@ impl PaymentChallenge {
     ///
     /// # Errors
     ///
-    /// Returns the error [`MppError::is_legacy_unicode_escape`] identifies, or
-    /// an invalid-Challenge error when a Credential echoing the Challenge
-    /// would exceed the 64 KiB Authorization size servers read.
+    /// Returns the error [`MppError::is_legacy_unicode_escape`] identifies.
     ///
     /// [`MppError::is_legacy_unicode_escape`]: crate::MppError::is_legacy_unicode_escape
     pub fn ensure_payable(&self) -> crate::error::Result<()> {
-        self.ensure_not_legacy_escaped()?;
-        // A Credential carries the echoed Challenge base64url-encoded. One
-        // that can't fit the Authorization size servers read would be refused
-        // after a pushed payment already moved funds.
-        if let Ok(echo) = serde_json::to_vec(&self.to_echo()) {
-            let credential =
-                "Payment ".len() + (echo.len() + CREDENTIAL_PAYLOAD_ALLOWANCE).div_ceil(3) * 4;
-            if credential > super::headers::MAX_AUTHORIZATION_LEN {
-                return Err(crate::error::MppError::invalid_challenge(
-                    self.id.clone(),
-                    "Challenge too large: a Credential echoing it would exceed the Authorization size limit",
-                ));
-            }
-        }
-        Ok(())
+        self.ensure_not_legacy_escaped()
     }
 
     /// Validate that this challenge can be used for a charge payment with the given method.
@@ -711,22 +689,6 @@ pub(super) mod tests {
             header: None,
             legacy_unicode_escape: false,
         }
-    }
-
-    #[test]
-    fn test_ensure_payable_refuses_challenge_too_large_to_echo() {
-        // A Credential echoes the description, so one past the Authorization
-        // limit is refused before paying instead of after.
-        let mut challenge = test_challenge();
-        challenge.description = Some("d".repeat(40 * 1024));
-        challenge.ensure_payable().unwrap();
-        challenge.description = Some("d".repeat(48 * 1024));
-        let error = challenge.ensure_payable().unwrap_err();
-        assert!(error.to_string().contains("Challenge too large"), "{error}");
-        assert!(!error.is_legacy_unicode_escape());
-        assert!(challenge.validate_for_charge("tempo").is_err());
-        // Servers still send it: the limit is the client's to enforce.
-        super::super::format_www_authenticate(&challenge).unwrap();
     }
 
     #[test]
