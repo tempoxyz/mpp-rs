@@ -414,11 +414,14 @@ fn has_unsupported_credential_header(challenge: &serde_json::Value) -> bool {
 
 /// Returns whether a wire challenge names a method outside the method-id
 /// grammar (`1*LOWERALPHA`): an offer this client can never answer.
+///
+/// Checks the raw string, as the parser does: `MethodName::new` lowercases,
+/// so `Tempo` would otherwise pass here while the parser rejects it.
 fn has_invalid_method(challenge: &serde_json::Value) -> bool {
     challenge
         .get("method")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|method| !crate::protocol::core::MethodName::new(method).is_valid())
+        .is_some_and(|method| !crate::protocol::core::types::is_valid_method_id(method))
 }
 
 fn parse_wire_challenge(mut challenge: serde_json::Value) -> Option<PaymentChallenge> {
@@ -736,7 +739,7 @@ mod tests {
         assert_eq!(extract_result_challenges(&meta).unwrap().len(), 1);
 
         // Offers only in methods outside the grammar still require payment.
-        for method in ["tempo-v2", "x402"] {
+        for method in ["tempo-v2", "x402", "Tempo", "TEMPO"] {
             let mut offer = serde_json::to_value(test_challenge()).unwrap();
             offer["method"] = method.into();
             let meta =
