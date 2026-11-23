@@ -1464,6 +1464,24 @@ mod tests {
     }
 
     #[test]
+    fn test_parsers_reject_leading_padding() {
+        let receipt = base64url_encode(
+            br#"{"method":"tempo","reference":"0xabc","status":"success","timestamp":"2026-01-29T12:00:00Z"}"#,
+        );
+        assert!(parse_receipt(&receipt).is_ok());
+        assert!(parse_receipt(&format!("={receipt}")).is_err());
+
+        let credential = format_authorization(&PaymentCredential::new(
+            test_challenge().to_echo(),
+            PaymentPayload::transaction("0xabc"),
+        ))
+        .unwrap();
+        let token = &credential["Payment ".len()..];
+        assert!(parse_authorization(&credential).is_ok());
+        assert!(parse_authorization(&format!("Payment ={token}")).is_err());
+    }
+
+    #[test]
     fn test_parse_receipt_rejects_non_iso8601_timestamp() {
         // {"method":"tempo","reference":"0xabc","status":"success","timestamp":"Jan 29 2026 12:00"}
         // base64url encoded
