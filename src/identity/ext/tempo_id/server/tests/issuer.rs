@@ -491,6 +491,91 @@ mod client {
     }
 
     #[tokio::test]
+    async fn overlapping_lookups_keep_the_users_cache() {
+        let tempo = issuer().await;
+        let (url, _issuer) = serve(|url| create_issuer(config(&tempo, url)).unwrap()).await;
+        let token = token_as(&tempo, &url, "user_1");
+        // The first two access token reads wait for their gate, so two
+        // lookups overlap and the earlier one finishes first.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gates = Arc::new([tokio::sync::Notify::new(), tokio::sync::Notify::new()]);
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let attest_config = {
+            let (calls, gates) = (calls.clone(), gates.clone());
+            AttestConfig::new(&url, move || {
+                let (token, calls, gates, entered) =
+                    (token.clone(), calls.clone(), gates.clone(), entered.clone());
+                async move {
+                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = entered.send(call);
+                    if let Some(gate) = gates.get(call) {
+                        gate.notified().await;
+                    }
+                    Ok(token)
+                }
+            })
+            .unwrap()
+        };
+        let prover = attestations(
+            attest_config,
+            [AUDIENCE],
+            Some(["tempo-id"]),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        let get = || {
+            reqwest::Request::new(
+                reqwest::Method::GET,
+                format!("{AUDIENCE}/paid").parse().unwrap(),
+            )
+        };
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "identity-attestation-required",
+            format!("tempo-id;issuer=\"{url}\"").parse().unwrap(),
+        );
+        let response = ResponseParts {
+            status: reqwest::StatusCode::UNAUTHORIZED,
+            headers,
+            url: get().url().clone(),
+        };
+
+        // A retry starts a lookup, then a request starts another before it ends.
+        let retry = tokio::spawn({
+            let prover = prover.clone();
+            async move {
+                let request = get();
+                prover
+                    .retry(&response, RetryContext { request: &request })
+                    .await
+            }
+        });
+        assert_eq!(entries.recv().await, Some(0));
+        let request = tokio::spawn({
+            let prover = prover.clone();
+            async move {
+                let mut request = get();
+                prover.prove(&mut request, &context()).await.unwrap();
+            }
+        });
+        assert_eq!(entries.recv().await, Some(1));
+
+        // The earlier lookup ends first and acquires an attestation.
+        gates[0].notify_one();
+        let attested = retry.await.unwrap().unwrap()["identity-attestation"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        gates[1].notify_one();
+        request.await.unwrap();
+
+        // The attestation stays cached for later requests.
+        let mut next = get();
+        prover.prove(&mut next, &context()).await.unwrap();
+        assert_eq!(next.headers()["identity-attestation"], attested.as_str());
+    }
+
+    #[tokio::test]
     async fn restores_only_the_signed_in_users_attestations() {
         let tempo = issuer().await;
         let (url, issuer) = serve(|url| create_issuer(config(&tempo, url)).unwrap()).await;

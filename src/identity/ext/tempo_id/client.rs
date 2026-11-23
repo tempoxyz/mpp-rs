@@ -448,8 +448,12 @@ struct AttestationsInner {
 struct AttestationsState {
     /// The signed-in user and their prover.
     current: Option<(Option<String>, AttestationProver)>,
-    /// Only the latest lookup may replace `current`, so a slow lookup cannot roll it back.
+    /// The sequence number the last lookup took.
     latest: u64,
+    /// The sequence number of the lookup that set `current`. A lookup replaces
+    /// `current` only when no newer lookup has, so a slow lookup cannot roll
+    /// it back, while overlapping lookups still keep a prover.
+    stored: u64,
 }
 
 #[cfg(feature = "identity-attestation")]
@@ -545,8 +549,9 @@ impl TempoIdAttestations {
             Ok(prover) => prover,
             Err(_) => return (None, self.inner.unavailable.clone()),
         };
-        if lookup == state.latest {
+        if lookup > state.stored {
             state.current = Some((user.clone(), prover.clone()));
+            state.stored = lookup;
         }
         (user, prover)
     }
