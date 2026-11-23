@@ -11,7 +11,9 @@
 //! - **Client:** [`AttestationProver`] is a [`Prover`](crate::identity::client::Prover)
 //!   that presents cached attestations and, when a server answers with
 //!   `Identity-Attestation-Required`, obtains one and resends the request.
-//! - **Issuers** sign attestations with [`sign`].
+//! - **Issuers** sign attestations with [`sign`], or with [`sign_with`] and a
+//!   [`RemoteSigner`] whose private key stays in a KMS, an HSM or a wallet
+//!   service.
 //!
 //! [`email_otp`](super::email_otp) builds on it.
 //!
@@ -42,8 +44,8 @@ pub use error::IdentityError;
 pub use jwks::{JwksResolver, KeyResolveError, KeyResolver, KeyResolverFuture};
 pub use server::AttestationVerifier;
 pub use token::{
-    decode, is_issuer, parse_header, sign, verify, AttestationClaims, DecodedAttestation,
-    VerifyOptions,
+    decode, is_issuer, parse_header, sign, sign_with, thumbprint, verify, AttestationClaims,
+    DecodedAttestation, RemoteSigner, RemoteSignerError, RemoteSignerFuture, VerifyOptions,
 };
 
 #[cfg(feature = "client")]

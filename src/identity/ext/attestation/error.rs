@@ -25,6 +25,15 @@ pub enum IdentityError {
     #[error("identity request failed")]
     Request(#[source] reqwest::Error),
 
+    /// A [`RemoteSigner`](super::RemoteSigner) failed to sign an attestation.
+    #[error("the attestation signer failed")]
+    Signer(#[source] super::RemoteSignerError),
+
+    /// A [`RemoteSigner`](super::RemoteSigner) returned a signature that does
+    /// not verify with its public key.
+    #[error("The Signer returned a signature that does not verify with its publicKey. Check that it signs the payload itself (not a digest) with that key, and returns raw signature bytes.")]
+    InvalidSignature,
+
     /// An attestation could not be acquired for another reason.
     #[error("{0}")]
     Acquire(String),
