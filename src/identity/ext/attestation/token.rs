@@ -135,6 +135,12 @@ pub async fn sign_with<C: Serialize>(
 ) -> Result<String, IdentityError> {
     let public_key = signer.public_key();
     let key_id = match key_id {
+        // `verify` rejects an empty `kid`, so refuse it before spending a signature.
+        Some("") => {
+            return Err(IdentityError::InvalidConfig(
+                "attestation key ID must not be empty".into(),
+            ))
+        }
         Some(key_id) => key_id.to_string(),
         None => thumbprint(&public_key),
     };
@@ -668,6 +674,14 @@ pub(crate) mod tests {
             IdentityError::Signer(source) => assert_eq!(source.to_string(), "KMS unavailable."),
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_an_empty_key_id_before_calling_the_signer() {
+        let signer = TestSigner::new(signing_key());
+        let err = sign_with(&claims(1), &signer, Some("")).await.unwrap_err();
+        assert!(matches!(err, IdentityError::InvalidConfig(_)), "{err}");
+        assert!(signer.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
