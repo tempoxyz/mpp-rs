@@ -991,6 +991,15 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             Ok(())
         }
         WsServerMessage::Receipt { receipt } => {
+            // A frame without a Receipt object (such as `null`) is malformed,
+            // not an acceptance: end the connection without committing.
+            if !receipt.is_object() {
+                error!("Receipt frame carries no Receipt object");
+                let _ = events_tx.send(MppEvent::Error(
+                    "malformed Receipt: not an object; not reconnecting".to_owned(),
+                ));
+                return Err(TerminationReason::Fatal);
+            }
             // A Receipt frame means the server accepted the Credential, so the
             // payment is committed before the Receipt body is read.
             if let Some(payment) = payment_awaiting_receipt.take() {

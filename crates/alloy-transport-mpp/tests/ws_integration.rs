@@ -230,6 +230,30 @@ async fn receipt_commits_payment_state() {
 }
 
 #[tokio::test]
+async fn receipt_frame_without_object_does_not_commit_payment() {
+    for body in [json!(null), json!("ok"), json!([])] {
+        let url = spawn_server(move |mut ws| {
+            Box::pin(async move {
+                send_text(&mut ws, challenge_frame()).await;
+                let _credential = recv_value(&mut ws).await;
+                send_text(&mut ws, json!({ "type": "receipt", "receipt": body })).await;
+                sleep(Duration::from_millis(100)).await;
+            })
+        })
+        .await;
+
+        let provider = LifecycleProvider::default();
+        let connect = MppWsConnect::new(url, provider.clone());
+        let mut events = connect.mpp_handle().events;
+        let _connection = connect.connect().await.unwrap();
+
+        let error = next_error(&mut events).await;
+        assert!(error.contains("malformed Receipt"), "{error}");
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn unreadable_receipt_keeps_payment_and_connection() {
     let url = spawn_server(|mut ws| {
         Box::pin(async move {
