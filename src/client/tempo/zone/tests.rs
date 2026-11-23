@@ -755,10 +755,86 @@ async fn test_withdrawal_whose_block_added_no_withdrawal_is_never_sent_again() {
     let challenge = challenge_with(json!({}), None);
     for _ in 0..2 {
         let error = provider.pay(&challenge).await.unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("sender tag could not be read"), "{error}");
-        assert!(message.contains("did not request a withdrawal"), "{error}");
+        let hash = tx_hash(sent.lock().unwrap().last().unwrap());
+        match error {
+            MppError::PaymentOutcomeUnknown { transaction_hash } => {
+                assert_eq!(transaction_hash, format!("{hash:#x}"));
+            }
+            error => panic!("expected PaymentOutcomeUnknown, got {error}"),
+        }
     }
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_withdrawal_whose_block_added_too_many_withdrawals_is_outcome_unknown() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let (zone_url, _) =
+        spawn_rpc(redacting_zone_handler(sent.clone(), 0, 100, Arc::default())).await;
+    let (provider, _) =
+        provider_with_zone(TempoZone::new(zone_url, MODERATO_ZONE_3).unwrap()).await;
+    let error = provider
+        .pay(&challenge_with(json!({}), None))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, MppError::PaymentOutcomeUnknown { .. }),
+        "{error}"
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_resumed_wait_reuses_derived_sender_tags_without_reading_the_zone() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let fail_reads = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (zone_url, _) = spawn_rpc(redacting_zone_handler(
+        sent.clone(),
+        6,
+        7,
+        fail_reads.clone(),
+    ))
+    .await;
+    // Tempo shows no settlement until settled is set.
+    let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tempo_url, _) = {
+        let sent = sent.clone();
+        let settled = settled.clone();
+        spawn_rpc(Arc::new(move |method, _| match method {
+            "eth_chainId" => Ok(json!("0xa5bf")),
+            "eth_blockNumber" => Ok(json!("0x10")),
+            "eth_getLogs" if settled.load(Ordering::SeqCst) => Ok(json!([settlement_log(
+                sent_sender_tag(&sent),
+                true,
+                B256::repeat_byte(0x33)
+            )])),
+            "eth_getLogs" => Ok(json!([])),
+            _ => Err((-32000, format!("l1: {method}"))),
+        }))
+        .await
+    };
+    let zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap();
+    let challenge = challenge_with(json!({}), None);
+
+    let error = provider.pay(&challenge).await.unwrap_err();
+    assert!(
+        matches!(error, MppError::ZoneSettlementPending { .. }),
+        "{error}"
+    );
+    // The Zone can no longer be read, but the tags were kept.
+    fail_reads.store(true, Ordering::SeqCst);
+    settled.store(true, Ordering::SeqCst);
+    let credential = provider.pay(&challenge).await.unwrap();
+    assert_eq!(
+        credential.charge_payload().unwrap().zone_sender_tag(),
+        Some(format!("{:#x}", sent_sender_tag(&sent)).as_str())
+    );
     assert_eq!(sent.lock().unwrap().len(), 1);
 }
 
@@ -1668,6 +1744,7 @@ async fn test_withdrawal_past_its_redemption_window_is_never_paid_again() {
             origin: Some("https://api.example.com".into()),
             terms: zone.terms_key(&expired, &signer, &signing_mode),
             request: OnceCell::new(),
+            sender_tags: Mutex::default(),
             redeemed_late: Mutex::default(),
             waiters: Default::default(),
             sending: Default::default(),
@@ -1720,6 +1797,7 @@ fn insert_withdrawal(
             transaction_hash: B256::ZERO,
             sender_tags: Some(vec![sender_tag]),
         }))),
+        sender_tags: Mutex::default(),
         redeemed_late: Mutex::default(),
         waiters: Default::default(),
         sending: Default::default(),
@@ -2038,6 +2116,7 @@ async fn test_payment_under_another_origin_keeps_an_earlier_withdrawal() {
         origin: Some("https://api.example.com".into()),
         terms: zone.terms_key(&earlier, &signer, &signing_mode),
         request: OnceCell::new(),
+        sender_tags: Mutex::default(),
         redeemed_late: Mutex::default(),
         waiters: Default::default(),
         sending: Default::default(),
@@ -2075,6 +2154,7 @@ async fn test_withdrawal_being_sent_is_never_forgotten_as_abandoned() {
         origin: None,
         terms: zone.terms_key(&challenge, &signer, &signing_mode),
         request: OnceCell::new(),
+        sender_tags: Mutex::default(),
         redeemed_late: Mutex::default(),
         waiters: Default::default(),
         sending: std::sync::atomic::AtomicBool::new(true),

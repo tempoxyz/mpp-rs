@@ -155,6 +155,10 @@ struct PendingWithdrawal {
     /// The sent withdrawal, or why it failed. A sender tag that could not be
     /// read is derived again by every payment, never by withdrawing again.
     request: OnceCell<Result<SentWithdrawal, WithdrawalFailure>>,
+    /// The sender tags derived from the outbox's state for a withdrawal whose
+    /// receipt had no event, kept after the first read: they describe fixed
+    /// past blocks, so a resumed wait needs only Tempo.
+    sender_tags: Mutex<Option<Vec<B256>>>,
     /// The sender tag of a withdrawal whose Credential was returned after its
     /// challenge expired, as mppx's `redeemedLate`. Only a retry of that
     /// challenge may get the Credential again; until its redemption window
@@ -643,6 +647,7 @@ impl TempoZone {
                                 origin: origin.map(str::to_owned),
                                 terms: self.terms_key(challenge, signer, signing_mode),
                                 request: OnceCell::new(),
+                                sender_tags: Mutex::default(),
                                 redeemed_late: Mutex::default(),
                                 waiters: Default::default(),
                                 sending: Default::default(),
@@ -805,30 +810,53 @@ impl TempoZone {
                 return Err(own_error.unwrap_or_else(|| failure.to_error()));
             }
         };
-        // Derived on every attempt, so a failed read on the Zone is retried
-        // with the challenge without withdrawing again: the withdrawal stays
-        // pending.
-        let sender_tags = match sent.sender_tags {
+        // Derived until a read succeeds, then kept, so a failed read on the
+        // Zone is retried with the challenge without withdrawing again: the
+        // withdrawal stays pending. A block whose state shows no withdrawal of
+        // this payer's, or too many, never changes, so that outcome is unknown
+        // rather than retryable.
+        let cached = sent.sender_tags.clone().or_else(|| {
+            withdrawal
+                .sender_tags
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        });
+        let sender_tags = match cached {
             Some(sender_tags) => sender_tags,
-            None => self
-                .bounded(sender_tag_candidates(
-                    &self.rpc_provider,
-                    sent.block_number,
-                    sent.sender,
-                    sent.transaction_hash,
-                ))
-                .await
-                .unwrap_or_else(|| {
-                    Err(MppError::Http(
-                        "timed out reading the Zone outbox's lastFallbackNonce".into(),
+            None => {
+                let derived = match self
+                    .bounded(derive_sender_tag_candidates(
+                        &self.rpc_provider,
+                        sent.block_number,
+                        sent.sender,
+                        sent.transaction_hash,
                     ))
-                })
+                    .await
+                {
+                    Some(Ok(tags)) => Ok(tags),
+                    Some(Err(CandidateError::Refused(_))) => {
+                        return Err(MppError::PaymentOutcomeUnknown {
+                            transaction_hash: format!("{:#x}", sent.transaction_hash),
+                        });
+                    }
+                    Some(Err(CandidateError::Read(cause))) => Err(cause),
+                    None => Err(MppError::Http(
+                        "timed out reading the Zone outbox's lastFallbackNonce".into(),
+                    )),
+                }
                 .map_err(|cause| {
                     MppError::Http(format!(
                         "Zone withdrawal transaction {:#x} was sent, but its sender tag could not be read from the Zone. Retry the challenge to resume without withdrawing again. Cause: {cause}",
                         sent.transaction_hash
                     ))
-                })?,
+                })?;
+                *withdrawal
+                    .sender_tags
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(derived.clone());
+                derived
+            }
         };
         let tag_strings = || {
             sender_tags
@@ -1290,10 +1318,30 @@ pub async fn sender_tag_candidates(
     sender: Address,
     transaction_hash: B256,
 ) -> Result<Vec<B256>, MppError> {
+    derive_sender_tag_candidates(zone, block_number, sender, transaction_hash)
+        .await
+        .map_err(|(CandidateError::Read(error) | CandidateError::Refused(error))| error)
+}
+
+/// Why the sender tag candidates could not be derived.
+enum CandidateError {
+    /// A read of the Zone failed: a retry may succeed.
+    Read(MppError),
+    /// The Zone's state at the withdrawal's block refuses every candidate:
+    /// past state doesn't change, so a retry fails the same way.
+    Refused(MppError),
+}
+
+async fn derive_sender_tag_candidates(
+    zone: &impl Provider<TempoNetwork>,
+    block_number: u64,
+    sender: Address,
+    transaction_hash: B256,
+) -> Result<Vec<B256>, CandidateError> {
     let did_not_request = || {
-        MppError::Http(format!(
+        CandidateError::Refused(MppError::Http(format!(
             "Zone withdrawal transaction {transaction_hash:#x} did not request a withdrawal from the outbox."
-        ))
+        )))
     };
     let previous = block_number.checked_sub(1).ok_or_else(did_not_request)?;
     let last_fallback_nonce = |block_number: u64| async move {
@@ -1318,15 +1366,16 @@ pub async fn sender_tag_candidates(
     let (before, after) = tokio::try_join!(
         last_fallback_nonce(previous),
         last_fallback_nonce(block_number)
-    )?;
+    )
+    .map_err(CandidateError::Read)?;
     if after <= before {
         return Err(did_not_request());
     }
     let count = after - before;
     if count > MAX_SENDER_TAG_CANDIDATES {
-        return Err(MppError::Http(format!(
+        return Err(CandidateError::Refused(MppError::Http(format!(
             "Zone withdrawal transaction {transaction_hash:#x} has {count} candidate sender tags, more than {MAX_SENDER_TAG_CANDIDATES}."
-        )));
+        ))));
     }
     Ok((before + 1..=after)
         .map(|fallback_nonce| zone::sender_tag(sender, transaction_hash, fallback_nonce))
