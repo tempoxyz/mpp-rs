@@ -10,6 +10,7 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
+use mpp::protocol::core::extract_payment_scheme;
 use mpp::{format_authorization, parse_authorization, PaymentCredential, PaymentPayload};
 use mpp_fuzz::{
     assert_same, has_formattable_header, has_supported_header, is_well_formed, wire_header,
@@ -77,7 +78,9 @@ fuzz_target!(|input: Input| {
         Some(true) => format!("Bearer dG9rZW4, {formatted}"),
         Some(false) => format!("{formatted}, Bearer dG9rZW4"),
     };
-    let parsed = match parse_authorization(&header) {
+    // A whole Authorization field goes through extract_payment_scheme first.
+    let payment = extract_payment_scheme(&header).unwrap_or(&header);
+    let parsed = match parse_authorization(payment) {
         Ok(parsed) => parsed,
         Err(error) => {
             assert!(
