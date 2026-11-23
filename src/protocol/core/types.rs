@@ -48,15 +48,10 @@ impl MethodName {
         self.0.eq_ignore_ascii_case(other)
     }
 
-    /// Check whether this method name matches the canonical mppx grammar.
+    /// Check whether this method name matches the spec grammar
+    /// `payment-method-id = 1*LOWERALPHA` (one or more of `a`-`z`).
     pub fn is_valid(&self) -> bool {
-        let mut chars = self.0.chars();
-        matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
-            && chars.all(|character| {
-                character.is_ascii_lowercase()
-                    || character.is_ascii_digit()
-                    || matches!(character, ':' | '_' | '-')
-            })
+        is_valid_method_id(&self.0)
     }
 }
 
@@ -96,10 +91,16 @@ impl<'de> Deserialize<'de> for MethodName {
             Ok(method)
         } else {
             Err(serde::de::Error::custom(
-                "invalid method name: must start with a lowercase ASCII letter and contain only lowercase letters, digits, colons, underscores, or hyphens",
+                "invalid method name: must be one or more lowercase ASCII letters (a-z)",
             ))
         }
     }
+}
+
+/// Whether `value` matches the spec grammar `payment-method-id = 1*LOWERALPHA`
+/// (one or more of `a`-`z`; no digits, `:`, `_`, `-` or capitals).
+pub(crate) fn is_valid_method_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_lowercase())
 }
 
 /// Payment intent identifier (newtype over String).
@@ -434,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_method_name_serde() {
-        for value in ["base", "x402", "tempo-v2", "a:b", "a_b", "a1:b_2-c"] {
+        for value in ["base", "tempo", "stripe", "evm"] {
             let method = MethodName::new(value);
             let json = serde_json::to_string(&method).unwrap();
             let parsed: MethodName = serde_json::from_str(&json).unwrap();
@@ -445,7 +446,8 @@ mod tests {
     #[test]
     fn test_method_name_deserialization_rejects_invalid_names() {
         for method in [
-            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "TEMPO",
+            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "TEMPO", "x402", "tempo2",
+            "tempo-v2", "a:b", "a_b", "a1:b_2-c",
         ] {
             let json = serde_json::to_string(method).unwrap();
             let error = serde_json::from_str::<MethodName>(&json).unwrap_err();

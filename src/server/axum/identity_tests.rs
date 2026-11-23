@@ -296,6 +296,34 @@ async fn payment_check_refuses_before_settlement_without_a_fresh_402() {
 }
 
 #[tokio::test]
+async fn unreadable_credential_is_refused_before_settlement() {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    // A Credential whose method an earlier grammar accepted (invoice-v2), which
+    // a custom challenger could still decode and settle.
+    let header = credential("Authorization", None);
+    let encoded = header.strip_prefix("Payment ").unwrap();
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&engine.decode(encoded).unwrap()).unwrap();
+    json["challenge"]["method"] = "invoice-v2".into();
+    let legacy = format!(
+        "Payment {}",
+        engine.encode(serde_json::to_vec(&json).unwrap())
+    );
+
+    let identity = RouteIdentity::new().verifier(api_key());
+    let (result, verified) = extract(
+        Some(identity),
+        "Authorization",
+        &[("x-api-key", "good".into()), ("authorization", legacy)],
+    )
+    .await;
+    let response = result.unwrap_err().into_response();
+    assert_ne!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(verified, 0, "an unreadable credential must not settle");
+}
+
+#[tokio::test]
 async fn authorization_verifiers_need_requires_auth() {
     struct Bearer;
     impl crate::identity::Verifier for Bearer {

@@ -230,6 +230,108 @@ async fn receipt_commits_payment_state() {
 }
 
 #[tokio::test]
+async fn receipt_frame_without_object_does_not_commit_payment() {
+    for body in [json!(null), json!("ok"), json!([])] {
+        let url = spawn_server(move |mut ws| {
+            Box::pin(async move {
+                send_text(&mut ws, challenge_frame()).await;
+                let _credential = recv_value(&mut ws).await;
+                send_text(&mut ws, json!({ "type": "receipt", "receipt": body })).await;
+                sleep(Duration::from_millis(100)).await;
+            })
+        })
+        .await;
+
+        let provider = LifecycleProvider::default();
+        let connect = MppWsConnect::new(url, provider.clone());
+        let mut events = connect.mpp_handle().events;
+        let _connection = connect.connect().await.unwrap();
+
+        let error = next_error(&mut events).await;
+        assert!(error.contains("malformed Receipt"), "{error}");
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn receipt_object_not_acknowledging_payment_does_not_commit() {
+    let mut failed = json_to_value(Receipt::success("tempo", "0xfailed")).unwrap();
+    failed["status"] = json!("failed");
+    let mut other_method = json_to_value(Receipt::success("tempo", "0xother")).unwrap();
+    other_method["method"] = json!("stripe");
+    let mut no_reference = json_to_value(Receipt::success("tempo", "0xnone")).unwrap();
+    no_reference.as_object_mut().unwrap().remove("reference");
+    for body in [json!({}), failed, other_method, no_reference] {
+        let url = spawn_server(move |mut ws| {
+            Box::pin(async move {
+                send_text(&mut ws, challenge_frame()).await;
+                let _credential = recv_value(&mut ws).await;
+                send_text(&mut ws, json!({ "type": "receipt", "receipt": body })).await;
+                // The connection stays open and the payment pending, so a
+                // later Receipt still commits it.
+                send_text(&mut ws, receipt_frame()).await;
+                sleep(Duration::from_millis(100)).await;
+            })
+        })
+        .await;
+
+        let provider = LifecycleProvider::default();
+        let connect = MppWsConnect::new(url, provider.clone());
+        let mut events = connect.mpp_handle().events;
+        let _connection = connect.connect().await.unwrap();
+
+        let error = next_error(&mut events).await;
+        assert!(error.contains("does not acknowledge"), "{error}");
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+        loop {
+            let event = timeout(TIMEOUT, events.recv()).await.unwrap().unwrap();
+            if matches!(event, MppEvent::Receipt(_)) {
+                break;
+            }
+        }
+        assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn unreadable_receipt_keeps_payment_and_connection() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            // An explicit null `externalId` makes the Receipt unreadable, while
+            // its status, method and reference still acknowledge the payment.
+            let mut receipt = json_to_value(Receipt::success("tempo", "0xfirst")).unwrap();
+            receipt["externalId"] = Value::Null;
+            send_text(&mut ws, json!({ "type": "receipt", "receipt": receipt })).await;
+            send_text(&mut ws, receipt_frame()).await;
+            sleep(Duration::from_millis(100)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect = MppWsConnect::new(url, provider.clone());
+    let mut events = connect.mpp_handle().events;
+    let _connection = connect.connect().await.unwrap();
+
+    let error = next_error(&mut events).await;
+    assert!(error.contains("unreadable Receipt"), "{error}");
+    // The connection stays open: the next readable Receipt still arrives.
+    loop {
+        let event = timeout(TIMEOUT, events.recv()).await.unwrap().unwrap();
+        if matches!(event, MppEvent::Receipt(_)) {
+            break;
+        }
+    }
+
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn server_error_rolls_back_payment_state() {
     let url = spawn_server(|mut ws| {
         Box::pin(async move {
