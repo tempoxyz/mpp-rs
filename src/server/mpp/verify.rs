@@ -49,10 +49,14 @@ where
     /// Refuse to settle a charge when [`Mpp::create()`](super::Mpp::create)
     /// found the default in-memory replay store in production or on a
     /// multi-instance platform.
+    ///
+    /// The refusal is the server's own configuration fault, so it carries the
+    /// internal code: it maps to a masked 500, as issuance does, and not to a
+    /// payment problem a new Credential could fix.
     fn verify_charge_store(&self) -> std::result::Result<(), VerificationError> {
         #[cfg(feature = "tempo")]
         if let Some(refusal) = &self.config.charge_store_refusal {
-            return Err(VerificationError::new(refusal.clone()));
+            return Err(VerificationError::internal(refusal.clone()));
         }
         Ok(())
     }
@@ -468,6 +472,7 @@ where
         amount: &str,
         options: crate::server::ChargeOptions<'_>,
     ) -> std::result::Result<Receipt, VerificationError> {
+        self.verify_charge_store()?;
         let expected = self.expected_charge_request(amount, options).map_err(|e| {
             VerificationError::new(format!("Failed to build expected charge request: {e}"))
         })?;

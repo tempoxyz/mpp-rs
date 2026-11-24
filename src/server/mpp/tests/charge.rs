@@ -303,6 +303,23 @@ async fn test_mpp_create_refuses_charges_with_the_default_store_in_production() 
         err.message
     );
 
+    // It is the server's fault, so it maps to a masked 500, not a 402.
+    assert_eq!(err.code, Some(crate::protocol::traits::ErrorCode::Internal));
+    use crate::error::PaymentError;
+    let problem = err.to_problem_details(None);
+    assert_eq!(problem.status, 500);
+    assert!(!problem.detail.contains("VERCEL"), "{}", problem.detail);
+    let err = refused
+        .verify_charge(&credential, "1.00")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(crate::protocol::traits::ErrorCode::Internal));
+    assert!(
+        err.message.starts_with("tempo has no store configured"),
+        "{}",
+        err.message
+    );
+
     // An explicit store opts out.
     let memory: Arc<dyn crate::store::Store> = Arc::new(crate::store::MemoryStore::new());
     let stored = Mpp::create_with_env(store_test_builder().store(memory), vercel).unwrap();
