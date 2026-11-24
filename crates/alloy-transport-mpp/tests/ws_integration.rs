@@ -295,6 +295,230 @@ async fn receipt_object_not_acknowledging_payment_does_not_commit() {
 }
 
 #[tokio::test]
+async fn unacknowledged_payment_is_abandoned_at_the_receipt_deadline() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            // A non-acknowledging Receipt every 150ms for 2s: if each one
+            // extended the deadline, it would fire only ~500ms after the last.
+            for _ in 0..14 {
+                send_text(&mut ws, json!({ "type": "receipt", "receipt": {} })).await;
+                sleep(Duration::from_millis(150)).await;
+            }
+            sleep(Duration::from_secs(2)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect =
+        MppWsConnect::new(url, provider.clone()).with_handshake_timeout(Duration::from_millis(500));
+    let mut events = connect.mpp_handle().events;
+    let started = Instant::now();
+    let _connection = connect.connect().await.unwrap();
+
+    loop {
+        let error = next_error(&mut events).await;
+        if error.contains("in time") {
+            break;
+        }
+        assert!(error.contains("does not acknowledge"), "{error}");
+    }
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    timeout(TIMEOUT, async {
+        while provider.abandons.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn payment_without_any_receipt_is_abandoned_at_the_receipt_deadline() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            sleep(Duration::from_secs(3)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect =
+        MppWsConnect::new(url, provider.clone()).with_handshake_timeout(Duration::from_millis(300));
+    let mut events = connect.mpp_handle().events;
+    let started = Instant::now();
+    let _connection = connect.connect().await.unwrap();
+
+    let error = next_error(&mut events).await;
+    assert!(error.contains("in time"), "{error}");
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    timeout(TIMEOUT, async {
+        while provider.abandons.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn payment_is_abandoned_at_the_receipt_deadline_while_a_write_blocks() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            // Stop reading but hold the socket open, so the client's writes
+            // fill the TCP buffers and block.
+            sleep(Duration::from_secs(5)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect =
+        MppWsConnect::new(url, provider.clone()).with_handshake_timeout(Duration::from_millis(500));
+    let mut events = connect.mpp_handle().events;
+    let started = Instant::now();
+    let frontend = connect.into_service().await.unwrap();
+
+    // 32 MiB of outbound RPCs: more than loopback TCP buffers hold.
+    let raw = format!("0x{}", "ab".repeat(512 * 1024));
+    for id in 0..32 {
+        let req = Request::new("eth_sendRawTransaction", Id::Number(id), [raw.clone()])
+            .serialize()
+            .unwrap();
+        let frontend = frontend.clone();
+        spawn(async move {
+            let _ = frontend.send(req).await;
+        });
+    }
+
+    let error = next_error(&mut events).await;
+    assert!(error.contains("in time"), "{error}");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(2000), "{elapsed:?}");
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    timeout(TIMEOUT, async {
+        while provider.abandons.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 1);
+}
+
+fn data_frame() -> Value {
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "eth_subscription",
+        "params": { "subscription": "0x1", "result": "0x1" },
+    });
+    json!({ "type": "message", "data": notification.to_string() })
+}
+
+#[tokio::test]
+async fn data_stream_longer_than_the_receipt_deadline_keeps_the_payment() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            // Stream Data for ~1s, more than three timeouts, and send the
+            // payment's Receipt only at the end.
+            for _ in 0..10 {
+                send_text(&mut ws, data_frame()).await;
+                sleep(Duration::from_millis(100)).await;
+            }
+            send_text(&mut ws, receipt_frame()).await;
+            sleep(Duration::from_millis(500)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect =
+        MppWsConnect::new(url, provider.clone()).with_handshake_timeout(Duration::from_millis(300));
+    let mut events = connect.mpp_handle().events;
+    let _connection = connect.connect().await.unwrap();
+
+    loop {
+        match timeout(TIMEOUT, events.recv()).await.unwrap().unwrap() {
+            MppEvent::Receipt(_) => break,
+            MppEvent::Error(error) => panic!("unexpected error: {error}"),
+            _ => {}
+        }
+    }
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn unacknowledged_receipts_after_data_end_at_the_receipt_deadline() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            for _ in 0..3 {
+                send_text(&mut ws, data_frame()).await;
+                sleep(Duration::from_millis(100)).await;
+            }
+            // Non-acknowledging Receipts, then Data, every 100ms for 2s: the
+            // first Receipt re-arms the deadline and nothing extends it.
+            for _ in 0..10 {
+                send_text(&mut ws, json!({ "type": "receipt", "receipt": {} })).await;
+                sleep(Duration::from_millis(100)).await;
+                send_text(&mut ws, data_frame()).await;
+                sleep(Duration::from_millis(100)).await;
+            }
+            sleep(Duration::from_secs(2)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect =
+        MppWsConnect::new(url, provider.clone()).with_handshake_timeout(Duration::from_millis(300));
+    let mut events = connect.mpp_handle().events;
+    let started = Instant::now();
+    let _connection = connect.connect().await.unwrap();
+
+    loop {
+        let error = next_error(&mut events).await;
+        if error.contains("in time") {
+            break;
+        }
+        assert!(error.contains("does not acknowledge"), "{error}");
+    }
+    // Data for ~300ms, then the 300ms window after the first Receipt.
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(550), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    timeout(TIMEOUT, async {
+        while provider.abandons.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn unreadable_receipt_keeps_payment_and_connection() {
     let url = spawn_server(|mut ws| {
         Box::pin(async move {
