@@ -32,6 +32,7 @@ use std::{
     fmt,
     future::{ready, Future},
     io::Error as IoError,
+    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -46,7 +47,7 @@ use tokio::{
         watch::{self, Receiver as WatchReceiver},
     },
     task::{JoinError, JoinHandle},
-    time::{sleep, Instant},
+    time::{sleep, Instant, Sleep},
 };
 use tokio_tungstenite::{
     connect_async_with_config,
@@ -533,10 +534,22 @@ async fn run_translator<P, V>(
             _ = ready(()), if can_flush => {
                 let rpc = pending_outbound.pop_front().expect("guarded by can_flush");
                 keepalive.as_mut().reset(Instant::now() + keepalive_interval);
-                if let Err(err) = send_jsonrpc(&mut socket, rpc).await {
-                    error!(%err, "WS connection error");
-                    termination = Some(TerminationReason::Transient);
-                    break;
+                let sent = until_receipt_deadline(
+                    send_jsonrpc(&mut socket, rpc),
+                    receipt_deadline.as_mut(),
+                    receipt_deadline_live,
+                ).await;
+                match sent {
+                    Some(Ok(())) => {}
+                    Some(Err(err)) => {
+                        error!(%err, "WS connection error");
+                        termination = Some(TerminationReason::Transient);
+                        break;
+                    }
+                    None => {
+                        termination = Some(receipt_deadline_expired(&events_tx));
+                        break;
+                    }
                 }
             }
 
@@ -628,10 +641,22 @@ async fn run_translator<P, V>(
                     break;
                 }
                 keepalive.as_mut().reset(Instant::now() + keepalive_interval);
-                if let Err(err) = socket.send(Message::Ping(Default::default())).await {
-                    error!(%err, "WS connection error");
-                    termination = Some(TerminationReason::Transient);
-                    break;
+                let sent = until_receipt_deadline(
+                    socket.send(Message::Ping(Default::default())),
+                    receipt_deadline.as_mut(),
+                    receipt_deadline_live,
+                ).await;
+                match sent {
+                    Some(Ok(())) => {}
+                    Some(Err(err)) => {
+                        error!(%err, "WS connection error");
+                        termination = Some(TerminationReason::Transient);
+                        break;
+                    }
+                    None => {
+                        termination = Some(receipt_deadline_expired(&events_tx));
+                        break;
+                    }
                 }
                 expecting_pong = true;
             }
@@ -649,12 +674,7 @@ async fn run_translator<P, V>(
             // 7. A pending payment is still unacknowledged at the Receipt
             //    deadline: end the connection, which abandons it.
             _ = &mut receipt_deadline, if receipt_deadline_live => {
-                error!("MPP payment not acknowledged before the Receipt deadline");
-                let _ = events_tx.send(MppEvent::Error(
-                    "no Receipt acknowledged the pending payment in time; not reconnecting"
-                        .to_string(),
-                ));
-                termination = Some(TerminationReason::Fatal);
+                termination = Some(receipt_deadline_expired(&events_tx));
                 break;
             }
 
@@ -756,6 +776,32 @@ async fn run_translator<P, V>(
         }
         None => {}
     }
+}
+
+/// Run a socket write, giving up at the Receipt deadline while a payment is
+/// pending (`live`). A peer that stops reading can block a write
+/// indefinitely, and the deadline arm is only polled between writes.
+/// Returns `None` when the deadline fired first.
+async fn until_receipt_deadline<F: Future>(
+    write: F,
+    deadline: Pin<&mut Sleep>,
+    live: bool,
+) -> Option<F::Output> {
+    select! {
+        biased;
+        out = write => Some(out),
+        _ = deadline, if live => None,
+    }
+}
+
+/// Report that the pending payment went unacknowledged past the Receipt
+/// deadline. Ending the connection abandons the payment.
+fn receipt_deadline_expired(events_tx: &broadcast::Sender<MppEvent>) -> TerminationReason {
+    error!("MPP payment not acknowledged before the Receipt deadline");
+    let _ = events_tx.send(MppEvent::Error(
+        "no Receipt acknowledged the pending payment in time; not reconnecting".to_string(),
+    ));
+    TerminationReason::Fatal
 }
 
 /// Wait on a possibly-`None` `JoinHandle`. Caller must guard with

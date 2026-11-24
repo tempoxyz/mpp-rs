@@ -373,6 +373,55 @@ async fn payment_without_any_receipt_is_abandoned_at_the_receipt_deadline() {
 }
 
 #[tokio::test]
+async fn payment_is_abandoned_at_the_receipt_deadline_while_a_write_blocks() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            // Stop reading but hold the socket open, so the client's writes
+            // fill the TCP buffers and block.
+            sleep(Duration::from_secs(5)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect =
+        MppWsConnect::new(url, provider.clone()).with_handshake_timeout(Duration::from_millis(500));
+    let mut events = connect.mpp_handle().events;
+    let started = Instant::now();
+    let frontend = connect.into_service().await.unwrap();
+
+    // 32 MiB of outbound RPCs: more than loopback TCP buffers hold.
+    let raw = format!("0x{}", "ab".repeat(512 * 1024));
+    for id in 0..32 {
+        let req = Request::new("eth_sendRawTransaction", Id::Number(id), [raw.clone()])
+            .serialize()
+            .unwrap();
+        let frontend = frontend.clone();
+        spawn(async move {
+            let _ = frontend.send(req).await;
+        });
+    }
+
+    let error = next_error(&mut events).await;
+    assert!(error.contains("in time"), "{error}");
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(2000), "{elapsed:?}");
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    timeout(TIMEOUT, async {
+        while provider.abandons.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(provider.abandons.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn unreadable_receipt_keeps_payment_and_connection() {
     let url = spawn_server(|mut ws| {
         Box::pin(async move {
