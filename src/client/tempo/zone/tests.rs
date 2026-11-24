@@ -1231,14 +1231,78 @@ async fn test_receipt_lookup_that_proves_nothing_keeps_the_derived_sender_tags()
     fail_reads.store(true, Ordering::SeqCst);
     settled.store(true, Ordering::SeqCst);
     provider.pay(&challenge).await.unwrap();
+    // The lookup runs beside the search for the kept tags, which may find
+    // the settlement before the lookup is sent.
     let calls = zone_calls.lock().unwrap();
-    assert_eq!(
+    assert!(
         calls
             .iter()
             .filter(|call| *call == "eth_getTransactionReceipt")
-            .count(),
-        1
+            .count()
+            <= 1
     );
+}
+
+#[tokio::test]
+async fn test_stalled_receipt_lookup_does_not_delay_a_search_for_kept_sender_tags() {
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let chain = Arc::new(Mutex::new(ZoneChain::new(6, 7)));
+    let stall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Once the tags are read, the Zone stops answering receipt lookups.
+    let (zone_url, _) = {
+        let stall = stall.clone();
+        spawn_rpc_stalling_when(
+            redacting_zone_handler_on(sent.clone(), chain.clone(), Arc::default()),
+            move |method, _| method == "eth_getTransactionReceipt" && stall.load(Ordering::SeqCst),
+        )
+        .await
+    };
+    let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tempo_url, _) = {
+        let sent = sent.clone();
+        let settled = settled.clone();
+        spawn_rpc(Arc::new(move |method, _| match method {
+            "eth_chainId" => Ok(json!("0xa5bf")),
+            "eth_blockNumber" => Ok(json!("0x10")),
+            "eth_getLogs" if settled.load(Ordering::SeqCst) => Ok(json!([settlement_log(
+                sent_sender_tag(&sent),
+                true,
+                B256::repeat_byte(0x33)
+            )])),
+            "eth_getLogs" => Ok(json!([])),
+            _ => Err((-32000, format!("l1: {method}"))),
+        }))
+        .await
+    };
+    let mut zone = TempoZone::new(zone_url, MODERATO_ZONE_3)
+        .unwrap()
+        .with_settlement_timeout(Duration::ZERO);
+    zone.rpc_timeout = Duration::from_secs(30);
+    let provider = TempoProvider::new(payer(), tempo_url)
+        .unwrap()
+        .with_zone(zone)
+        .unwrap();
+    let challenge = challenge_with(json!({}), expires_in(120));
+
+    assert!(matches!(
+        provider.pay(&challenge).await.unwrap_err(),
+        MppError::ZoneSettlementPending { .. }
+    ));
+    stall.store(true, Ordering::SeqCst);
+    settled.store(true, Ordering::SeqCst);
+    // The kept tags find the settlement without waiting out the lookup.
+    let started = std::time::Instant::now();
+    let credential = provider.pay(&challenge).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        credential.charge_payload().unwrap().zone_sender_tag(),
+        Some(format!("{:#x}", sent_sender_tag(&sent)).as_str())
+    );
+    assert_eq!(sent.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

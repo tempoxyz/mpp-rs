@@ -187,6 +187,23 @@ struct DerivedSenderTags {
     sender_tags: Option<(B256, Vec<B256>)>,
 }
 
+impl PendingWithdrawal {
+    /// The sender tags derived for the block last known to include the
+    /// withdrawal, when an earlier attempt read them.
+    fn cached_sender_tags(&self) -> Option<Vec<B256>> {
+        let derived = self
+            .derived
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &derived.sender_tags {
+            Some((from, sender_tags)) if derived.block_hash == Some(*from) => {
+                Some(sender_tags.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A sent Zone withdrawal: its sender tag when the receipt carried it, and
 /// what derives it otherwise, as mppx's `ZoneWithdrawal`.
 #[derive(Clone, Debug)]
@@ -829,23 +846,80 @@ impl TempoZone {
         // that HTTP and MCP flows retry. A block whose state shows no
         // withdrawal of this payer's, or too many, never changes, so that
         // outcome is unknown rather than retryable.
-        let sender_tags = match &sent.sender_tags {
-            Some(sender_tags) => sender_tags.clone(),
-            None => match self.derived_sender_tags(paid, &sent, &withdrawal).await {
-                Ok(derived) => derived,
-                Err(CandidateError::Refused(_)) => {
-                    return Err(MppError::PaymentOutcomeUnknown {
-                        transaction_hash: format!("{:#x}", sent.transaction_hash),
-                    });
+        let cursor = &withdrawal.settlement_cursor;
+        let scan = |sender_tags: Vec<B256>| async move {
+            let timeout = settlement_timeout(paid, self.settlement_timeout);
+            // Even the first search ends at the challenge's expiry. After it,
+            // the wait looks once: only a settlement from before then can
+            // still be redeemed.
+            let limit = if is_expired(paid) {
+                FIRST_SCAN_TIMEOUT
+            } else {
+                settlement_timeout(paid, timeout.max(FIRST_SCAN_TIMEOUT))
+            };
+            let settled = wait_for_settlement_from(
+                tempo,
+                zone::portal_address(zone_id),
+                &sender_tags,
+                Some(recipient),
+                timeout,
+                limit,
+                cursor,
+            )
+            .await;
+            (sender_tags, settled)
+        };
+        let (sender_tags, settlement) = match &sent.sender_tags {
+            Some(sender_tags) => scan(sender_tags.clone()).await,
+            None => {
+                // Tags kept from an earlier attempt are searched for on Tempo
+                // at once, while the receipt is looked up again, so a slow
+                // lookup can't use up the time left to redeem a settlement
+                // they already find. They give way only when the lookup shows
+                // the transaction in another block.
+                let cached = withdrawal.cached_sender_tags();
+                let refreshed = cached.is_some();
+                let resumed = match cached {
+                    Some(cached) => {
+                        let refresh = self.refresh_inclusion(paid, &sent, &withdrawal);
+                        let search = scan(cached);
+                        tokio::pin!(refresh, search);
+                        tokio::select! {
+                            (tags, settled) = &mut search => match settled {
+                                Ok(found) => Some((tags, Ok(found))),
+                                // A miss waits for the lookup, which may name
+                                // the block whose tags settle.
+                                Err(error) => (!refresh.await).then_some((tags, Err(error))),
+                            },
+                            moved = &mut refresh => {
+                                if moved { None } else { Some(search.await) }
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                match resumed {
+                    Some(resumed) => resumed,
+                    None => match self
+                        .derived_sender_tags(paid, &sent, &withdrawal, refreshed)
+                        .await
+                    {
+                        Ok(derived) => scan(derived).await,
+                        Err(CandidateError::Refused(_)) => {
+                            return Err(MppError::PaymentOutcomeUnknown {
+                                transaction_hash: format!("{:#x}", sent.transaction_hash),
+                            });
+                        }
+                        Err(CandidateError::Read(_)) => {
+                            // Pin where the settlement search starts now, so a
+                            // retry that reads the tags much later still covers
+                            // a settlement made in between.
+                            self.pin_settlement_search(tempo, &withdrawal).await;
+                            return Err(pending_error(Vec::new()));
+                        }
+                    },
                 }
-                Err(CandidateError::Read(_)) => {
-                    // Pin where the settlement search starts now, so a
-                    // retry that reads the tags much later still covers a
-                    // settlement made in between.
-                    self.pin_settlement_search(tempo, &withdrawal).await;
-                    return Err(pending_error(Vec::new()));
-                }
-            },
+            }
         };
         let tag_strings = || {
             sender_tags
@@ -853,28 +927,7 @@ impl TempoZone {
                 .map(|tag| format!("{tag:#x}"))
                 .collect::<Vec<_>>()
         };
-
-        let timeout = settlement_timeout(paid, self.settlement_timeout);
-        let expired_before_wait = is_expired(paid);
-        // Even the first search ends at the challenge's expiry. After it, the
-        // wait looks once: only a settlement from before then can still be
-        // redeemed.
-        let limit = if expired_before_wait {
-            FIRST_SCAN_TIMEOUT
-        } else {
-            settlement_timeout(paid, timeout.max(FIRST_SCAN_TIMEOUT))
-        };
-        let settlement = wait_for_settlement_from(
-            tempo,
-            zone::portal_address(zone_id),
-            &sender_tags,
-            Some(recipient),
-            timeout,
-            limit,
-            &withdrawal.settlement_cursor,
-        )
-        .await
-        .map_err(|_| pending_error(tag_strings()))?;
+        let settlement = settlement.map_err(|_| pending_error(tag_strings()))?;
         // The tag of the withdrawal that settled, among the candidates.
         let sender_tag = settlement.sender_tag;
         // The Credential pays once: a later challenge with the same terms is a
@@ -1249,7 +1302,8 @@ impl TempoZone {
     /// The sender tags a withdrawal whose receipt had no event may carry,
     /// derived from the state of the Zone block that includes it.
     ///
-    /// A retry looks the transaction's receipt up again first: if the Zone
+    /// A retry looks the transaction's receipt up again first, unless the
+    /// caller already did (`refreshed`): if the Zone
     /// moved it to another block, as after a reorg, the tags come from that
     /// block, and tags derived from the earlier one are dropped. A lookup
     /// that proves nothing keeps the last known block. Both reads of the
@@ -1260,6 +1314,7 @@ impl TempoZone {
         paid: &PaymentChallenge,
         sent: &SentWithdrawal,
         withdrawal: &PendingWithdrawal,
+        refreshed: bool,
     ) -> Result<Vec<B256>, CandidateError> {
         let lock = || {
             withdrawal
@@ -1267,35 +1322,18 @@ impl TempoZone {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         };
-        let known = lock().block_hash;
-        let block_hash = match known {
-            // The first derivation uses the receipt the send returned.
-            None => sent.block_hash,
-            Some(known) => {
-                let lookup = within(
-                    remaining_bound(paid, self.rpc_timeout),
-                    self.rpc_provider
-                        .raw_request::<_, Option<serde_json::Value>>(
-                            "eth_getTransactionReceipt".into(),
-                            [sent.transaction_hash],
-                        ),
-                )
-                .await;
-                let moved = match lookup {
-                    Some(Ok(Some(receipt))) => included_block(&receipt, sent.transaction_hash),
-                    _ => None,
-                };
-                Some(moved.unwrap_or(known))
-            }
-        };
-        let Some(block_hash) = block_hash else {
-            return Err(CandidateError::Refused(MppError::Http(format!(
-                "Zone withdrawal transaction {:#x} has no block.",
-                sent.transaction_hash
-            ))));
-        };
-        {
+        if !refreshed {
+            self.refresh_inclusion(paid, sent, withdrawal).await;
+        }
+        let block_hash = {
             let mut derived = lock();
+            // The first derivation uses the receipt the send returned.
+            let Some(block_hash) = derived.block_hash.or(sent.block_hash) else {
+                return Err(CandidateError::Refused(MppError::Http(format!(
+                    "Zone withdrawal transaction {:#x} has no block.",
+                    sent.transaction_hash
+                ))));
+            };
             derived.block_hash = Some(block_hash);
             match &derived.sender_tags {
                 Some((from, sender_tags)) if *from == block_hash => {
@@ -1304,7 +1342,8 @@ impl TempoZone {
                 Some(_) => derived.sender_tags = None,
                 None => {}
             }
-        }
+            block_hash
+        };
         // The send check reserved no time for this read, so it ends at the
         // challenge's expiry: a read still running then fails as pending,
         // and a retry resumes it, rather than the Credential going out late.
@@ -1329,6 +1368,56 @@ impl TempoZone {
             derived.sender_tags = Some((block_hash, read.clone()));
         }
         Ok(read)
+    }
+
+    /// Looks a withdrawal's receipt up again, for a retry of one whose
+    /// receipt had no event, and records the block it now names.
+    ///
+    /// Returns whether the block last known to include the withdrawal changed
+    /// meanwhile, by this lookup or a concurrent attempt's, so tags derived
+    /// from it no longer hold. A lookup that proves nothing changes nothing,
+    /// and one that answers after another attempt recorded a block defers to
+    /// it, so an older lookup never overwrites a newer inclusion.
+    async fn refresh_inclusion(
+        &self,
+        paid: &PaymentChallenge,
+        sent: &SentWithdrawal,
+        withdrawal: &PendingWithdrawal,
+    ) -> bool {
+        let lock = || {
+            withdrawal
+                .derived
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        };
+        let Some(known) = lock().block_hash else {
+            return false;
+        };
+        let lookup = within(
+            remaining_bound(paid, self.rpc_timeout),
+            self.rpc_provider
+                .raw_request::<_, Option<serde_json::Value>>(
+                    "eth_getTransactionReceipt".into(),
+                    [sent.transaction_hash],
+                ),
+        )
+        .await;
+        let moved = match lookup {
+            Some(Ok(Some(receipt))) => included_block(&receipt, sent.transaction_hash),
+            _ => None,
+        };
+        let mut derived = lock();
+        if derived.block_hash != Some(known) {
+            return true;
+        }
+        match moved {
+            Some(moved) if moved != known => {
+                derived.block_hash = Some(moved);
+                derived.sender_tags = None;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Looks for the receipt of a withdrawal whose send response failed.
