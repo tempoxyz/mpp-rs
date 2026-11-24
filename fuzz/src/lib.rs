@@ -23,7 +23,7 @@ impl<'a> Arbitrary<'a> for Text {
     }
 }
 
-/// A method name matching `[a-z]+` (`1*LOWERALPHA`).
+/// A method name matching the core spec's grammar, `1*LOWERALPHA`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Method(pub String);
 

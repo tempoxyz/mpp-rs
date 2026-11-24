@@ -48,21 +48,6 @@ pub(crate) fn with_expiry_grace(
         .or_else(|| opaque.cloned())
 }
 
-/// The route metadata of `opaque`: its JSON value without the expiry grace
-/// marker, `None` when nothing else is left. `Err` when it can't be decoded.
-pub(crate) fn route_meta(opaque: Option<&Base64UrlJson>) -> Result<Option<serde_json::Value>, ()> {
-    let Some(opaque) = opaque else {
-        return Ok(None);
-    };
-    match opaque.decode_value().map_err(|_| ())? {
-        serde_json::Value::Object(mut meta) => {
-            meta.remove(EXPIRY_GRACE_KEY);
-            Ok((!meta.is_empty()).then_some(serde_json::Value::Object(meta)))
-        }
-        other => Ok(Some(other)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,14 +72,6 @@ mod tests {
         assert!(!has_expiry_grace(Some(&route)));
         assert_eq!(with_expiry_grace(Some(&marked), false), Some(route.clone()));
         assert_eq!(with_expiry_grace(Some(&route), false), Some(route.clone()));
-        assert_eq!(
-            route_meta(Some(&marked)).unwrap(),
-            Some(serde_json::json!({ "plan": "pro" }))
-        );
-        assert_eq!(
-            route_meta(Some(&with_expiry_grace(None, true).unwrap())).unwrap(),
-            None
-        );
     }
 
     #[test]

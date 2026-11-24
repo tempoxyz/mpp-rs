@@ -17,31 +17,63 @@ pub(crate) trait CredentialGate: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
 }
 
+/// Whether two base-10 amounts are equal numerically: receivers accept
+/// leading zeros, as the Tempo charge spec requires. Anything that is not a
+/// digit string compares as text.
+fn same_amount(a: &str, b: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if digits(a) && digits(b) {
+        a.trim_start_matches('0') == b.trim_start_matches('0')
+    } else {
+        a == b
+    }
+}
+
+/// An `opaque` in the form it is matched in: a JSON object without the
+/// per-challenge nonces and the expiry grace marker (an object left empty counts as absent), any other
+/// JSON value as is, and a value that is not JSON as its raw text.
+#[derive(Debug, PartialEq)]
+enum MatchedOpaque {
+    Json(serde_json::Value),
+    Raw(String),
+}
+
+fn matched_opaque(opaque: Option<&crate::protocol::core::Base64UrlJson>) -> Option<MatchedOpaque> {
+    let opaque = opaque?;
+    match opaque.decode_value() {
+        Ok(serde_json::Value::Object(mut members)) => {
+            members.remove(super::NONCE_KEY);
+            members.remove(super::LEGACY_NONCE_KEY);
+            members.remove(crate::protocol::core::expiry_grace::EXPIRY_GRACE_KEY);
+            (!members.is_empty()).then_some(MatchedOpaque::Json(serde_json::Value::Object(members)))
+        }
+        Ok(other) => Some(MatchedOpaque::Json(other)),
+        Err(_) => Some(MatchedOpaque::Raw(opaque.raw().to_string())),
+    }
+}
+
 impl<M, S> Mpp<M, S>
 where
     M: ChargeMethod,
 {
     /// Reject unless the credential's echoed `opaque` equals the configured
-    /// one, apart from the expiry grace marker (`_mppx_expiry_grace`) that
-    /// Tempo charge challenges carry while `zone_credential_grace` is on.
+    /// one, ignoring the per-challenge `_mpp_nonce` and mppx's `_mppx_nonce`,
+    /// and the expiry grace marker (`_mppx_expiry_grace`) that Tempo charge
+    /// challenges carry while `zone_credential_grace` is on.
     pub(super) fn verify_opaque(
         &self,
         credential: &PaymentCredential,
     ) -> std::result::Result<(), VerificationError> {
-        use crate::protocol::core::expiry_grace::route_meta;
-
-        let configured_opaque = self.config.opaque.as_ref();
-        let echoed_opaque = credential.challenge.opaque.as_ref();
-        let matches = echoed_opaque.map(|o| o.raw()) == configured_opaque.map(|o| o.raw())
-            || matches!(
-                (route_meta(echoed_opaque), route_meta(configured_opaque)),
-                (Ok(echoed), Ok(configured)) if echoed == configured
-            );
-        if !matches {
-            return Err(VerificationError::with_code(
+        let mismatch = || {
+            VerificationError::with_code(
                 "credential opaque data does not match this route's requirements",
                 crate::protocol::traits::ErrorCode::InvalidChallenge,
-            ));
+            )
+        };
+        let configured = matched_opaque(self.config.opaque.as_ref());
+        let echoed = matched_opaque(credential.challenge.opaque.as_ref());
+        if echoed != configured {
+            return Err(mismatch());
         }
         Ok(())
     }
@@ -225,13 +257,36 @@ where
         &self,
         credential: &PaymentCredential,
     ) -> std::result::Result<(), VerificationError> {
+        self.verify_hmac(credential)?;
+        self.verify_expiry(credential)
+    }
+
+    /// Reject a credential whose challenge this handler did not issue, or
+    /// any credential when the secret key is too short to bind challenges.
+    pub(super) fn verify_hmac(
+        &self,
+        credential: &PaymentCredential,
+    ) -> std::result::Result<(), VerificationError> {
+        self.check_secret_key().map_err(|error| {
+            VerificationError::with_code(
+                error.to_string(),
+                crate::protocol::traits::ErrorCode::Internal,
+            )
+        })?;
         if !self.issued_challenge(credential) {
             return Err(VerificationError::with_code(
                 "Challenge ID mismatch - not issued by this server",
                 crate::protocol::traits::ErrorCode::InvalidChallenge,
             ));
         }
+        Ok(())
+    }
 
+    /// Reject a credential whose challenge has no `expires` or has expired.
+    pub(super) fn verify_expiry(
+        &self,
+        credential: &PaymentCredential,
+    ) -> std::result::Result<(), VerificationError> {
         let expires = credential.challenge.expires.as_deref().ok_or_else(|| {
             VerificationError::with_code(
                 "Challenge missing required expires field",
@@ -318,7 +373,8 @@ where
         credential: &PaymentCredential,
         expected: &ChargeRequest,
     ) -> bool {
-        self.issued_challenge(credential)
+        self.check_secret_key().is_ok()
+            && self.issued_challenge(credential)
             && Self::decode_credential_request(credential).is_ok_and(|request| {
                 self.verify_expected_request_matches(credential, &request, expected)
                     .is_ok()
@@ -536,7 +592,7 @@ where
         request: &ChargeRequest,
         expected: &ChargeRequest,
     ) -> std::result::Result<(), VerificationError> {
-        if request.amount != expected.amount {
+        if !same_amount(&request.amount, &expected.amount) {
             return Err(VerificationError::with_code(
                 format!(
                     "Amount mismatch: credential has {} but endpoint expects {}",
@@ -684,9 +740,12 @@ where
         bound: bool,
     ) -> std::result::Result<ChargeValidation, VerificationError> {
         self.verify_charge_store()?;
-        self.verify_hmac_and_expiry(credential)?;
+        // The core spec's order: binding (id, digest, realm and route), then
+        // expiry, then the payment method.
+        self.verify_hmac(credential)?;
         self.verify_body_digest(credential, body)?;
         self.verify_pinned_fields(credential, request, bound)?;
+        self.verify_expiry(credential)?;
         self.method.validate(credential, request).await
     }
 
@@ -751,11 +810,14 @@ where
         bound: bool,
     ) -> std::result::Result<Option<Receipt>, VerificationError> {
         self.verify_charge_store()?;
-        // Tier 1: HMAC provenance + expiry
-        self.verify_hmac_and_expiry(credential)?;
+        // Tier 1: HMAC provenance and body digest
+        self.verify_hmac(credential)?;
         self.verify_body_digest(credential, body)?;
         // Tier 2: Pinned field safety net
         self.verify_pinned_fields(credential, request, bound)?;
+        // Expiry comes after every binding check, as the core spec orders
+        // them; replay and payment checks belong to the method.
+        self.verify_expiry(credential)?;
         // An identity payment check runs before the payment is validated or
         // broadcast, as mppx runs it before settlement.
         if let Some(gate) = gate {
