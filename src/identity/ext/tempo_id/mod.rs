@@ -14,6 +14,10 @@
 //!   `DPoP` with a new ES256 proof for each request, plus the optional ID
 //!   token in `Tempo-Id-Token`.
 //!
+//! - **Issuer:** [`issuer::create`] (with `identity-attestation`) exchanges
+//!   an access token for `tempo-id` and `email` attestations, which servers
+//!   verify like any issuer's, and `client::attestations` obtains them.
+//!
 //! The token uses `Authorization`, so create the server with
 //! `requires_auth`, so Payment Credentials travel in `Payment-Authorization`.
 //!
@@ -41,6 +45,9 @@ mod types;
 
 pub mod server;
 
+#[cfg(feature = "identity-attestation")]
+pub mod issuer;
+
 #[cfg(feature = "client")]
 pub mod client;
 
@@ -52,6 +59,12 @@ pub mod constants {
     pub const TYPE: &str = "tempo-id";
     /// Tempo ID in production: the issuer of every access token.
     pub const ISSUER: &str = "https://id.tempo.xyz";
+    /// Path, relative to a Tempo ID attestation issuer's URL, that exchanges a
+    /// token for an attestation.
+    pub const ATTEST_PATH: &str = "/tempo-id/attest";
+    /// Attestation types a Tempo ID attestation issuer signs: the user's
+    /// Tempo ID and verified email.
+    pub const ATTESTATION_TYPES: &[&str] = &["tempo-id", "email"];
     /// Header that carries the user's ID token, for their email address.
     pub const ID_TOKEN_HEADER: &str = "Tempo-Id-Token";
     /// Seconds a DPoP proof is accepted after its `iat`.
