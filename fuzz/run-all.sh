@@ -5,7 +5,7 @@
 #
 # FUZZ_JOBS targets run at once (default 1). Exits non-zero if a target
 # crashes, hangs or leaks; its log tail and the reproducer (base64) are
-# printed. FUZZ_FEATURES selects the crate features (default `tempo`), and
+# printed. FUZZ_FEATURES selects the crate features (default `tempo,identity`), and
 # extra `cargo fuzz` arguments go in CARGO_FUZZ_ARGS.
 set -euo pipefail
 
@@ -17,7 +17,7 @@ cd "$fuzz_dir/.."
 
 cargo_fuzz=(cargo +nightly fuzz)
 # shellcheck disable=SC2206
-build_args=(--features "${FUZZ_FEATURES:-tempo}" ${CARGO_FUZZ_ARGS:-})
+build_args=(--features "${FUZZ_FEATURES:-tempo,identity}" ${CARGO_FUZZ_ARGS:-})
 
 "${cargo_fuzz[@]}" build "${build_args[@]}"
 
@@ -29,7 +29,7 @@ fi
 dictionary() {
   case "$1" in
     fuzz_www_authenticate | fuzz_challenge_roundtrip | fuzz_challenge_list | fuzz_challenge_id | \
-      fuzz_accept_payment | fuzz_sse_event)
+      fuzz_accept_payment | fuzz_sse_event | fuzz_identity)
       echo "-dict=$fuzz_dir/dict/http.dict"
       ;;
     fuzz_authorization | fuzz_credential_roundtrip | fuzz_receipt | fuzz_base64url_json | \

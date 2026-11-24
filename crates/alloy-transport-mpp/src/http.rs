@@ -366,6 +366,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         }
     }
 

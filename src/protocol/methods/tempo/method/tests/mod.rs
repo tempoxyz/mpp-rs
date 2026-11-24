@@ -33,6 +33,7 @@ mod simulate;
 mod transaction_credential;
 mod transaction_transfers;
 mod verify;
+mod zone_credential;
 
 struct AsyncOnlySigner {
     inner: alloy::signers::local::PrivateKeySigner,

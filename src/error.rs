@@ -215,11 +215,73 @@ pub enum MppError {
         transaction_hash: String,
     },
 
+    /// A Zone withdrawal paying a challenge did not settle on Tempo before the
+    /// client stopped waiting, as mppx's `ZoneSettlementPendingError`. The
+    /// withdrawal cannot be undone and may still settle.
+    ///
+    /// Pay `challenge` again with the same provider to resume waiting
+    /// without withdrawing again, or find the settlement with `sender_tag`
+    /// (or one of `sender_tags`) on the Zone's portal. A fresh challenge for the same terms never starts
+    /// another withdrawal: from the origin that issued `challenge` it resumes
+    /// this one and answers `challenge`; otherwise it fails with this error.
+    #[error("Zone {zone_id} withdrawal {}for challenge \"{challenge_id}\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again.", sender_tag_clause(.sender_tag, .sender_tags))]
+    ZoneSettlementPending {
+        /// The challenge the withdrawal pays, to pay again to resume waiting.
+        challenge: Box<crate::protocol::core::PaymentChallenge>,
+        /// ID of the challenge the withdrawal pays.
+        challenge_id: String,
+        /// Sender tag of the withdrawal, as the portal's `WithdrawalProcessed`
+        /// event carries it; empty when it was not read, or when a Zone RPC
+        /// hid it and more than one candidate remains (see `sender_tags`).
+        sender_tag: String,
+        /// Sender tags the withdrawal may carry, as mppx's `senderTags`: its
+        /// tag alone when known, else every candidate; empty when it was not
+        /// read.
+        sender_tags: Vec<String>,
+        /// ID of the Zone the withdrawal left.
+        zone_id: u32,
+    },
+
+    /// A Zone withdrawal paying a challenge settled on Tempo, but its payout
+    /// bounced (the portal's `WithdrawalProcessed` reports `callbackSuccess`
+    /// false): the amount went back to the payer's Zone balance and the
+    /// challenge is unpaid, while the withdrawal's fees are spent.
+    ///
+    /// Paying `challenge_id` again with the same provider withdraws again.
+    /// Callers that choose among several offers should not fall back to
+    /// another one automatically, since each attempt spends another
+    /// withdrawal's fees.
+    #[error("Zone {zone_id} withdrawal {sender_tag} for challenge \"{challenge_id}\" bounced on Tempo: its amount was returned to the payer's Zone balance.")]
+    ZoneWithdrawalBounced {
+        /// ID of the challenge the withdrawal paid.
+        challenge_id: String,
+        /// Sender tag of the withdrawal, as the portal's `WithdrawalProcessed` event carries it.
+        sender_tag: String,
+        /// ID of the Zone the withdrawal left.
+        zone_id: u32,
+    },
+
     /// A session operation may have been applied; reconcile it before paying again.
     #[error("session payment outcome unknown: {context}; reconcile before retrying")]
     SessionPaymentOutcomeUnknown {
         /// Operation whose delivery or response was uncertain.
         context: String,
+    },
+
+    /// A payment of any method may have taken effect, but its outcome is
+    /// unknown, so the payer must reconcile it before paying again.
+    ///
+    /// Providers return this when they cannot prove that no payment happened,
+    /// for example when a submission timed out, and have no transaction hash
+    /// to report. Clients that try alternative offers stop on it rather than
+    /// risk paying twice, and a session top-up that fails with it is treated
+    /// like one whose management response was lost: no further top-up is
+    /// signed for that channel until it is reconciled.
+    #[error("payment outcome unknown{}; reconcile before retrying", reference.as_deref().map(|r| format!(" (ref {r})")).unwrap_or_default())]
+    UnknownPaymentOutcome {
+        /// Optional provider reference to correlate the payment when reconciling,
+        /// such as a payment intent or request ID.
+        reference: Option<String>,
     },
 
     // ==================== HTTP Errors ====================
@@ -519,6 +581,19 @@ fn format_channel_closed(reason: &Option<String>) -> String {
     }
 }
 
+/// The sender tag, followed by a space, in a settlement-pending message: the
+/// candidate tags joined with "or" when more than one remains, and empty when
+/// the tag is unknown.
+fn sender_tag_clause(sender_tag: &str, sender_tags: &[String]) -> String {
+    if !sender_tag.is_empty() {
+        format!("{sender_tag} ")
+    } else if sender_tags.is_empty() {
+        String::new()
+    } else {
+        format!("with sender tag {} ", sender_tags.join(" or "))
+    }
+}
+
 impl MppError {
     /// Create an unsupported payment method error
     pub fn unsupported_method(method: &impl std::fmt::Display) -> Self {
@@ -559,6 +634,19 @@ impl MppError {
             id: Some(id.into()),
             reason: Some(reason.into()),
         }
+    }
+
+    /// Whether this is the error [`parse_payable_challenges`] returns for a
+    /// challenge whose server escaped a bound auth-param as `\uXXXX`, which
+    /// no Credential can answer.
+    ///
+    /// [`parse_payable_challenges`]: crate::protocol::core::parse_payable_challenges
+    pub fn is_legacy_unicode_escape(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidChallenge { reason: Some(reason), .. }
+                if reason == crate::protocol::core::headers::LEGACY_UNICODE_ESCAPE_REASON
+        )
     }
 
     /// Create an invalid challenge error without details.

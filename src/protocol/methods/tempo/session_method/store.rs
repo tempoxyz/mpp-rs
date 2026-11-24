@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 
 use crate::protocol::traits::VerificationError;
 
@@ -59,6 +59,15 @@ pub struct ChannelState {
     #[serde(default)]
     pub close_requested_at: u64,
     pub created_at: String,
+    /// TIP-1166 opening commitment: the configurable account commitment the
+    /// voucher signer had when the channel opened, from the open receipt's
+    /// `OpeningCommitmentRecorded` event, or zero when it had none. `None` means
+    /// unknown (a channel reused without its open receipt, or a record stored
+    /// before this field existed): a TIP-1034 channel looks it up on chain
+    /// before verifying a voucher, and never takes it to be zero. Records
+    /// that store it as `signer_snapshot`, its earlier name, still load.
+    #[serde(default, alias = "signer_snapshot")]
+    pub opening_commitment: Option<B256>,
 }
 
 /// Trait for channel state persistence.

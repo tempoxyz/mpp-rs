@@ -10,12 +10,14 @@ mod error;
 mod provider;
 pub mod session;
 pub mod signing;
+pub mod zone;
 
 pub use accounts_provider::TempoAccountsProvider;
 pub use autoswap::AutoswapConfig;
 pub use error::TempoClientError;
 
 pub use provider::TempoProvider;
+pub use zone::TempoZone;
 
 /// Build the RPC provider used while preparing Tempo payments.
 ///

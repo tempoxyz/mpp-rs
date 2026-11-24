@@ -9,7 +9,7 @@
 //!
 //! The parser is implemented without regex for minimal dependencies.
 
-use super::auth_params::{escape_quoted_value, Tokenizer};
+use super::auth_params::{escape_quoted_description, escape_quoted_value, is_token, Tokenizer};
 use super::challenge::PaymentChallenge;
 use super::credential::PaymentCredential;
 use super::receipt::Receipt;
@@ -189,15 +189,9 @@ fn is_valid_intent_name(value: &str) -> bool {
     !value.is_empty() && !value.contains('|')
 }
 
-/// Validate the method identifier grammar used by mppx.
+/// Validate the method identifier grammar: `payment-method-id = 1*LOWERALPHA`.
 fn is_valid_method_name(value: &str) -> bool {
-    let mut chars = value.chars();
-    matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
-        && chars.all(|character| {
-            character.is_ascii_lowercase()
-                || character.is_ascii_digit()
-                || matches!(character, ':' | '_' | '-')
-        })
+    super::types::is_valid_method_id(value)
 }
 
 /// Validate that a `request` parameter is a base64url-encoded JSON object.
@@ -278,10 +272,44 @@ pub fn parse_www_authenticate(header: &str) -> Result<PaymentChallenge> {
 
 /// Reads the auth-params that follow a `Payment` scheme into a challenge.
 fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
+    read_challenge_flagged(tokens).map(|(challenge, _)| challenge)
+}
+
+/// Like [`read_challenge`], and also whether a quoted value of an auth-param
+/// the Challenge keeps, other than `description`, held a legacy `\uXXXX`
+/// escape.
+fn read_challenge_flagged(tokens: &mut Tokenizer<'_>) -> Result<(PaymentChallenge, bool)> {
     let mut params = HashMap::new();
+    let mut unicode_escape = false;
     while let Some((name, value)) = tokens.param()? {
+        // auth-params = auth-param *( OWS "," OWS auth-param )
+        if !params.is_empty() && !tokens.after_comma() {
+            return Err(MppError::invalid_challenge_reason(
+                "Expected ',' between auth-params",
+            ));
+        }
+        // auth-param = token BWS "=" BWS ( token / quoted-string )
+        if !is_token(name) {
+            // The name is server-supplied and unbounded: leave it out.
+            return Err(MppError::invalid_challenge_reason(
+                "Invalid auth-param name: expected a token",
+            ));
+        }
         // Auth-param names are case-insensitive (RFC 9110 §11.2).
         let key = name.to_ascii_lowercase();
+        // These are bound by the challenge id or echoed in the Credential;
+        // `description` and unrecognized auth-params are neither.
+        unicode_escape |= matches!(
+            key.as_str(),
+            "id" | "realm"
+                | "method"
+                | "intent"
+                | "request"
+                | "expires"
+                | "digest"
+                | "opaque"
+                | "header"
+        ) && tokens.read_unicode_escape();
         if key == "request" && value.len() > MAX_TOKEN_LEN {
             return Err(MppError::invalid_challenge_reason(format!(
                 "Request parameter exceeds maximum length of {} bytes",
@@ -294,6 +322,13 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
                 name
             )));
         }
+        // Checked after the length and duplicate checks, which reject cheaply.
+        // An empty unquoted value is still read as "", as mppx reads it.
+        if !tokens.quoted() && !value.is_empty() && !is_token(&value) {
+            return Err(MppError::invalid_challenge_reason(
+                "Invalid auth-param value: expected a token or quoted-string",
+            ));
+        }
         params.insert(key, value.into_owned());
     }
 
@@ -302,7 +337,7 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
     let method_raw = require_param!(params, "method").clone();
     if !is_valid_method_name(&method_raw) {
         return Err(MppError::invalid_challenge_reason(format!(
-            "Invalid method: \"{}\". Must match method-name ABNF.",
+            "Invalid method: \"{}\". Must be lowercase letters a-z per spec.",
             method_raw
         )));
     }
@@ -322,7 +357,7 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
         opaque.as_ref().map(Base64UrlJson::raw),
     )?;
 
-    Ok(PaymentChallenge {
+    let challenge = PaymentChallenge {
         id,
         realm,
         method,
@@ -335,7 +370,9 @@ fn read_challenge(tokens: &mut Tokenizer<'_>) -> Result<PaymentChallenge> {
         header: super::parse_advertised_credential_header(
             params.get("header").map(String::as_str),
         )?,
-    })
+        legacy_unicode_escape: unicode_escape,
+    };
+    Ok((challenge, unicode_escape))
 }
 
 /// Parse all Payment challenges from one or more WWW-Authenticate header values.
@@ -413,13 +450,65 @@ pub fn parse_www_authenticate_all_bytes<'a>(
         .collect()
 }
 
+/// Parse the Payment challenges of raw `WWW-Authenticate` field values for
+/// paying one of them.
+///
+/// Like [`parse_www_authenticate_all_bytes`], except that a challenge with a
+/// legacy `\uXXXX` escape in an auth-param it keeps, other than
+/// `description`, is an error
+/// (see [`MppError::is_legacy_unicode_escape`]). Servers that escaped
+/// characters above U+00FF that way (mppx 0.8.18 to 0.21.1, pympp 0.15 to
+/// 0.26, mpp-go 0.4 to 0.9.1) bound the decoded character in the challenge id,
+/// while a quoted-pair reads `\u00e9` as `u00e9`. A Credential for such a
+/// challenge would echo values the server rejects, after a pushed payment has
+/// already moved funds, so clients skip it before paying.
+///
+/// # Examples
+///
+/// ```
+/// use mpp::protocol::core::parse_payable_challenges;
+///
+/// let header: &[u8] =
+///     br#"Payment id="abc", realm="caf\u00e9", method="tempo", intent="charge", request="e30""#;
+/// let challenges = parse_payable_challenges([header]);
+/// assert!(challenges[0].as_ref().unwrap_err().is_legacy_unicode_escape());
+/// ```
+pub fn parse_payable_challenges<'a>(
+    headers: impl IntoIterator<Item = &'a [u8]>,
+) -> Vec<Result<PaymentChallenge>> {
+    headers
+        .into_iter()
+        .flat_map(|value| parse_challenges_flagged(&decode_latin1(value)))
+        .map(|result| match result? {
+            (challenge, true) => Err(MppError::invalid_challenge(
+                challenge.id,
+                LEGACY_UNICODE_ESCAPE_REASON,
+            )),
+            (challenge, false) => Ok(challenge),
+        })
+        .collect()
+}
+
+/// Reason of the error [`parse_payable_challenges`] returns for a challenge
+/// with a legacy `\uXXXX` escape in a bound auth-param.
+pub(crate) const LEGACY_UNICODE_ESCAPE_REASON: &str = "Legacy unicode-escaped challenge: the server escaped a bound parameter as \\uXXXX; upgrade the server";
+
 /// Parses every `Payment` challenge of one field value.
 fn parse_challenges(header: &str) -> Vec<Result<PaymentChallenge>> {
+    parse_challenges_flagged(header)
+        .into_iter()
+        .map(|result| result.map(|(challenge, _)| challenge))
+        .collect()
+}
+
+/// Parses every `Payment` challenge of one field value, each with whether it
+/// held a legacy `\uXXXX` escape in a bound auth-param.
+fn parse_challenges_flagged(header: &str) -> Vec<Result<(PaymentChallenge, bool)>> {
     let mut tokens = Tokenizer::new(header);
     let mut challenges = Vec::new();
     while let Some(Ok(token)) = tokens.next() {
         if token.is_payment_scheme() {
-            challenges.push(read_challenge(&mut tokens));
+            challenges.push(read_challenge_flagged(&mut tokens));
         }
     }
     challenges
@@ -453,6 +542,7 @@ fn decode_latin1(value: &[u8]) -> Cow<'_, str> {
 ///     digest: None,
 ///     opaque: None,
 ///     header: None,
+///     legacy_unicode_escape: false,
 /// };
 /// let header = format_www_authenticate(&challenge).unwrap();
 /// assert!(header.starts_with("Payment id=\"abc123\""));
@@ -465,9 +555,17 @@ fn decode_latin1(value: &[u8]) -> Cow<'_, str> {
 /// is not a base64url-encoded JSON object, or a malformed `expires`, `digest`
 /// or `opaque`. Quoted values containing CR or LF are rejected too.
 pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
+    // A parsed legacy-escaped Challenge would be sent on with values its
+    // issuer never bound into the ID.
+    if challenge.legacy_unicode_escape {
+        return Err(MppError::invalid_challenge(
+            challenge.id.clone(),
+            LEGACY_UNICODE_ESCAPE_REASON,
+        ));
+    }
     if !is_valid_method_name(challenge.method.as_str()) {
         return Err(MppError::invalid_challenge_reason(format!(
-            "Invalid method: \"{}\". Must match method-name ABNF.",
+            "Invalid method: \"{}\". Must be lowercase letters a-z per spec.",
             challenge.method
         )));
     }
@@ -505,7 +603,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
     if let Some(ref description) = challenge.description {
         parts.push(format!(
             "description=\"{}\"",
-            escape_quoted_value(description)?
+            escape_quoted_description(description)?
         ));
     }
 
@@ -513,7 +611,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
         parts.push(format!("digest=\"{}\"", escape_quoted_value(digest)?));
     }
 
-    if let Some(header) = super::parse_advertised_credential_header(challenge.header.as_deref())? {
+    if let Some(header) = super::binding::local_credential_header(challenge.header.as_deref())? {
         parts.push(format!("header=\"{}\"", escape_quoted_value(&header)?));
     }
 
@@ -545,6 +643,7 @@ pub fn format_www_authenticate(challenge: &PaymentChallenge) -> Result<String> {
 ///     digest: None,
 ///     opaque: None,
 ///     header: None,
+///     legacy_unicode_escape: false,
 /// };
 /// let headers = format_www_authenticate_many(&[challenge]).unwrap();
 /// assert_eq!(headers.len(), 1);
@@ -553,9 +652,12 @@ pub fn format_www_authenticate_many(challenges: &[PaymentChallenge]) -> Result<V
     challenges.iter().map(format_www_authenticate).collect()
 }
 
-/// Parse an Authorization header into a PaymentCredential.
+/// Parse a Payment credential into a PaymentCredential.
 ///
-/// Format: `Payment <base64url-json>`
+/// Format: `Payment <base64url-json>`, and nothing else, as mppx's
+/// `Credential.deserialize` reads it. To read the credential from an
+/// `Authorization` field value that may list other schemes too, pass it
+/// through [`extract_payment_scheme`] first.
 ///
 /// Headers longer than 64 KiB are rejected before decoding.
 pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
@@ -567,11 +669,18 @@ pub fn parse_authorization(header: &str) -> Result<PaymentCredential> {
         )));
     }
 
-    let payment_part = extract_payment_scheme(header)
+    // credentials = "Payment" 1*SP base64url-nopad, with optional
+    // whitespace around the field value.
+    let value = header.trim_matches([' ', '\t']);
+    let token = value
+        .get(..PAYMENT_SCHEME.len())
+        .filter(|scheme| scheme.eq_ignore_ascii_case(PAYMENT_SCHEME))
+        .map(|_| &value[PAYMENT_SCHEME.len()..])
+        .and_then(|rest| {
+            let token = rest.trim_start_matches([' ', '\t']);
+            (token.len() < rest.len() && !token.is_empty()).then_some(token)
+        })
         .ok_or_else(|| MppError::malformed_credential("Expected 'Payment' scheme"))?;
-
-    // Strip "Payment " prefix to get the token
-    let token = payment_part.get(8..).unwrap_or("").trim();
 
     let decoded =
         base64url_decode(token).map_err(|_| MppError::malformed_credential("Invalid base64url"))?;
@@ -1230,8 +1339,84 @@ mod tests {
 
         // Prepend a Bearer scheme to simulate mixed Authorization
         let mixed = format!("Bearer some-token, {}", formatted);
-        let parsed = parse_authorization(&mixed).unwrap();
+        let parsed = parse_authorization(extract_payment_scheme(&mixed).unwrap()).unwrap();
         assert_eq!(parsed.challenge.id, "abc123");
+    }
+
+    #[test]
+    fn test_parse_authorization_rejects_text_around_the_credential() {
+        let formatted = format_authorization(&PaymentCredential::new(
+            test_challenge().to_echo(),
+            PaymentPayload::transaction("0xabc"),
+        ))
+        .unwrap();
+        let token = &formatted["Payment ".len()..];
+        for accepted in [
+            formatted.clone(),
+            format!("payment {token}"),
+            format!("Payment  {token}"),
+            format!("Payment\t{token}"),
+            format!(" Payment {token} "),
+        ] {
+            assert!(parse_authorization(&accepted).is_ok(), "{accepted:?}");
+        }
+        for rejected in [
+            format!("{formatted}, Basic realm=\"x\""),
+            format!("Bearer abc, {formatted}"),
+            format!(",{formatted}"),
+            format!("Payment {token} x"),
+            format!("Payment{token}"),
+            "Payment ".to_string(),
+            "Payment".to_string(),
+        ] {
+            assert!(parse_authorization(&rejected).is_err(), "{rejected:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_requires_commas_between_params() {
+        for header in [
+            r#"Payment id="0" method=a realm="" intent="a" request="e30""#,
+            r#"Payment id=0 realm="\," method="a" intent="a" request=e30"#,
+            r#"Payment id="0", realm="api" method="tempo", intent="charge", request="e30""#,
+        ] {
+            let error = parse_www_authenticate(header).unwrap_err().to_string();
+            assert!(error.contains("Expected ','"), "{header}: {error}");
+            let all = parse_www_authenticate_all([header]);
+            let error = all[0].as_ref().unwrap_err().to_string();
+            assert!(error.contains("Expected ','"), "{header}: {error}");
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_non_token_names_and_values() {
+        for (header, reason) in [
+            (
+                r#"Payment id=\,", realm="api", method="tempo", intent="charge", request="e30""#,
+                "Invalid auth-param value",
+            ),
+            (
+                r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", d"escription="x""#,
+                "Invalid auth-param name",
+            ),
+            (
+                r#"Payment id=a:b, realm="api", method="tempo", intent="charge", request="e30""#,
+                "Invalid auth-param value",
+            ),
+            (
+                r#"Payment id="abc", realm="api", method="tempo", intent="charge", request=e30=e30"#,
+                "Invalid auth-param value",
+            ),
+        ] {
+            let error = parse_www_authenticate(header).unwrap_err().to_string();
+            assert!(error.contains(reason), "{header}: {error}");
+        }
+        let header =
+            "Payment id=a!#$%&'*+-.^_`|~9, realm=api, method=tempo, intent=charge, request=e30";
+        assert_eq!(
+            parse_www_authenticate(header).unwrap().id,
+            "a!#$%&'*+-.^_`|~9"
+        );
     }
 
     #[test]
@@ -1269,7 +1454,7 @@ mod tests {
 
     #[test]
     fn test_parse_www_authenticate_accepts_canonical_method_names() {
-        for method in ["tempo", "x402", "tempo-v2", "a:b", "a_b", "a1:b_2-c"] {
+        for method in ["tempo", "stripe", "evm", "a"] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#
             );
@@ -1289,7 +1474,8 @@ mod tests {
     #[test]
     fn test_parse_www_authenticate_rejects_invalid_method_names() {
         for method in [
-            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "Tempo",
+            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "Tempo", "x402", "tempo2",
+            "tempo-v2", "a:b", "a_b", "a1:b_2-c",
         ] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="{method}", intent="charge", request="e30""#
@@ -1300,19 +1486,20 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_www_authenticate_decodes_unicode_escapes() {
+    fn test_parse_www_authenticate_reads_quoted_pairs() {
+        // A quoted-pair (RFC 9110 §5.6.4) is the character after the
+        // backslash: \uXXXX is the text uXXXX, not an escape.
         for (escaped, expected) in [
             (
                 r"em dash \u2014 and coffee \u2615",
-                "em dash \u{2014} and coffee \u{2615}",
+                "em dash u2014 and coffee u2615",
             ),
-            (r"grinning \ud83d\ude00 face", "grinning \u{1f600} face"),
+            (r"grinning \ud83d\ude00 face", "grinning ud83dude00 face"),
             ("café naïve", "café naïve"),
-            (r"lone \ud83d here", "lone \u{fffd} here"),
-            (r"lone \ude00 here", "lone \u{fffd} here"),
             (r"not an escape \\u2014", r"not an escape \u2014"),
             (r"short \u12 tail", "short u12 tail"),
-            (r"ascii api\u0061", "ascii apia"),
+            (r"ascii api\u0061", "ascii apiu0061"),
+            (r"\a\b \é", "ab é"),
         ] {
             let header = format!(
                 r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description="{escaped}""#
@@ -1327,7 +1514,134 @@ mod tests {
     }
 
     #[test]
-    fn test_format_www_authenticate_escapes_unicode_as_utf16() {
+    fn test_parse_www_authenticate_reads_quoted_pairs_in_every_param() {
+        let header = r#"Payment id="ch\_1", realm="merchant\u2014api.example.com", method="te\mpo", intent="char\ge", request="e\30", expires="2030-01-01T00:00:00\Z", digest="sha-256=:\a:", opaque="e\30""#;
+        let challenge = parse_www_authenticate(header).unwrap();
+        assert_eq!(challenge.id, "ch_1");
+        assert_eq!(challenge.realm, "merchantu2014api.example.com");
+        assert_eq!(challenge.method.as_str(), "tempo");
+        assert_eq!(challenge.intent.as_str(), "charge");
+        assert_eq!(challenge.request.raw(), "e30");
+        assert_eq!(challenge.expires.as_deref(), Some("2030-01-01T00:00:00Z"));
+        assert_eq!(challenge.digest.as_deref(), Some("sha-256=:a:"));
+        assert_eq!(
+            challenge.opaque.as_ref().map(Base64UrlJson::raw),
+            Some("e30")
+        );
+    }
+
+    #[test]
+    fn test_parse_payable_challenges_refuses_legacy_unicode_escapes() {
+        // Older servers wrote characters above U+00FF in bound auth-params as
+        // \uXXXX. A quoted-pair still reads them as uXXXX, but a Credential
+        // would echo values the challenge id does not bind.
+        for (param, value) in [
+            ("realm", r"caf\u00e9.example.com"),
+            ("realm", r"merchant\u2014api.example.com"),
+            ("realm", r"lower hex \u00E9 and \uabcd"),
+            ("id", r"ch\u00e9"),
+        ] {
+            let header = test_header_with(param, value);
+            let parsed = parse_www_authenticate(&header).unwrap();
+            assert!(!format!("{parsed:?}").contains('\\'), "{param}={value}");
+            let results = parse_payable_challenges([header.as_bytes()]);
+            assert_eq!(results.len(), 1, "{param}={value}");
+            let error = results[0].as_ref().unwrap_err();
+            assert!(error.is_legacy_unicode_escape(), "{param}={value}: {error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("Legacy unicode-escaped challenge"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parsed_legacy_unicode_escape_is_refused_for_paying_and_sending() {
+        // Code that parses the header itself still gets the quoted-pair
+        // reading, flagged, and every Credential and header path refuses it.
+        let legacy = parse_www_authenticate(&test_header_with("realm", r"caf\u00e9")).unwrap();
+        assert_eq!(legacy.realm, "cafu00e9");
+        assert!(legacy.legacy_unicode_escape);
+        for error in [
+            legacy.ensure_payable().unwrap_err(),
+            legacy.validate_for_charge("tempo").unwrap_err(),
+            format_www_authenticate(&legacy).unwrap_err(),
+        ] {
+            assert!(error.is_legacy_unicode_escape(), "{error}");
+        }
+        let all = parse_www_authenticate_all([test_header_with("id", r"ch\u00e9").as_str()]);
+        assert!(all[0].as_ref().unwrap().legacy_unicode_escape);
+
+        // Quoted-pairs that are not the legacy escape, an escape in
+        // `description`, and Challenges read from JSON are not flagged.
+        for (param, value) in [("realm", r"slash \\u00e9"), ("description", r"\u2014")] {
+            let parsed = parse_www_authenticate(&test_header_with(param, value)).unwrap();
+            assert!(!parsed.legacy_unicode_escape, "{param}={value}");
+            parsed.ensure_payable().unwrap();
+        }
+        let json: PaymentChallenge =
+            serde_json::from_value(serde_json::to_value(&legacy).unwrap()).unwrap();
+        assert!(!json.legacy_unicode_escape);
+        assert!(!serde_json::to_string(&legacy).unwrap().contains("legacy"));
+    }
+
+    #[test]
+    fn test_parse_payable_challenges_reads_other_quoted_pairs() {
+        for (param, value, expected) in [
+            ("realm", r#"quote \" here"#, r#"quote " here"#),
+            ("realm", r"slash \\ here", r"slash \ here"),
+            ("realm", r"escaped slash \\u00e9", r"escaped slash \u00e9"),
+            ("realm", r"short \u12 tail", "short u12 tail"),
+            ("realm", r"not hex \u12g4", "not hex u12g4"),
+            ("description", r"em dash \u2014", "api"),
+            ("ext", r"unbound \u00e9", "api"),
+        ] {
+            let header = test_header_with(param, value);
+            let results = parse_payable_challenges([header.as_bytes()]);
+            let challenge = results[0]
+                .as_ref()
+                .unwrap_or_else(|error| panic!("{param}={value}: {error}"));
+            assert_eq!(challenge.realm, expected, "{param}={value}");
+        }
+    }
+
+    #[test]
+    fn test_parse_payable_challenges_skips_only_the_escaped_offer() {
+        let legacy = test_header_with("realm", r"caf\u00e9");
+        let plain = test_header_with("realm", "api").replace(r#"id="abc""#, r#"id="plain""#);
+        let results = parse_payable_challenges([format!("{legacy}, {plain}").as_bytes()]);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].as_ref().unwrap_err().is_legacy_unicode_escape());
+        assert_eq!(results[1].as_ref().unwrap().id, "plain");
+        // Errors that are not about the escape keep their own reason.
+        let broken = parse_payable_challenges([b"Payment id=\"x\"".as_slice()]);
+        assert!(!broken[0].as_ref().unwrap_err().is_legacy_unicode_escape());
+    }
+
+    /// A challenge header whose `param` auth-param is the quoted `raw` text.
+    fn test_header_with(param: &str, raw: &str) -> String {
+        let mut params = vec![
+            ("id", "abc"),
+            ("realm", "api"),
+            ("method", "tempo"),
+            ("intent", "charge"),
+            ("request", "e30"),
+        ];
+        match params.iter_mut().find(|(name, _)| *name == param) {
+            Some(entry) => entry.1 = raw,
+            None => params.push((param, raw)),
+        }
+        let params: Vec<_> = params
+            .iter()
+            .map(|(name, value)| format!(r#"{name}="{value}""#))
+            .collect();
+        format!("Payment {}", params.join(", "))
+    }
+
+    #[test]
+    fn test_format_www_authenticate_escapes_description_as_utf16() {
         let mut challenge = test_challenge();
         challenge.description = Some("Payment \u{2014} coffee \u{2615} \u{1f600}".to_string());
 
@@ -1335,7 +1649,10 @@ mod tests {
 
         assert!(header.contains(r#"description="Payment \u2014 coffee \u2615 \ud83d\ude00""#));
         let parsed = parse_www_authenticate(&header).unwrap();
-        assert_eq!(parsed.description, challenge.description);
+        assert_eq!(
+            parsed.description.as_deref(),
+            Some("Payment u2014 coffee u2615 ud83dude00")
+        );
         assert_eq!(parsed.realm, challenge.realm);
         assert_eq!(parsed.method, challenge.method);
         assert_eq!(parsed.intent, challenge.intent);
@@ -1351,7 +1668,6 @@ mod tests {
             "1 \u{d7} Classmatic \u{2014} General Admission \u{1f39f}\u{fe0f}",
         ] {
             let mut challenge = test_challenge();
-            challenge.realm = text.to_string();
             challenge.description = Some(text.to_string());
 
             let header = format_www_authenticate(&challenge).unwrap();
@@ -1362,10 +1678,33 @@ mod tests {
                 "{header:?}"
             );
             let value = axum::http::HeaderValue::from_str(&header).unwrap();
-            let parsed = parse_www_authenticate(value.to_str().unwrap()).unwrap();
-            assert_eq!(parsed.realm, text);
-            assert_eq!(parsed.description.as_deref(), Some(text));
+            parse_www_authenticate(value.to_str().unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn test_format_www_authenticate_rejects_text_quoted_pairs_cannot_carry() {
+        // Bound values must parse back unchanged, and a quoted-pair carries
+        // only printable ASCII and HTAB.
+        for text in [
+            "caf\u{e9}",
+            "bell\u{7}",
+            "nul\u{0}",
+            "del\u{7f}",
+            "a\u{2014}b",
+        ] {
+            let mut challenge = test_challenge();
+            challenge.realm = text.to_string();
+            assert!(format_www_authenticate(&challenge).is_err(), "{text:?}");
+        }
+
+        let mut challenge = test_challenge();
+        challenge.realm = "tab\there \"q\" \\ ~".to_string();
+        let header = format_www_authenticate(&challenge).unwrap();
+        assert_eq!(
+            parse_www_authenticate(&header).unwrap().realm,
+            challenge.realm
+        );
     }
 
     #[test]
@@ -1461,6 +1800,24 @@ mod tests {
 
         let decoded: serde_json::Value = challenge.request.decode().unwrap();
         assert_eq!(decoded["amount"], "94");
+    }
+
+    #[test]
+    fn test_parsers_reject_leading_padding() {
+        let receipt = base64url_encode(
+            br#"{"method":"tempo","reference":"0xabc","status":"success","timestamp":"2026-01-29T12:00:00Z"}"#,
+        );
+        assert!(parse_receipt(&receipt).is_ok());
+        assert!(parse_receipt(&format!("={receipt}")).is_err());
+
+        let credential = format_authorization(&PaymentCredential::new(
+            test_challenge().to_echo(),
+            PaymentPayload::transaction("0xabc"),
+        ))
+        .unwrap();
+        let token = &credential["Payment ".len()..];
+        assert!(parse_authorization(&credential).is_ok());
+        assert!(parse_authorization(&format!("Payment ={token}")).is_err());
     }
 
     #[test]
@@ -1648,17 +2005,59 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_www_authenticate_omits_default_authorization_header() {
-        let header = concat!(
-            r#"Payment id="abc", realm="api", method="tempo", intent="charge", "#,
-            r#"request="e30", header="Authorization""#,
-        );
-        let parsed = parse_www_authenticate(header).unwrap();
-        assert!(parsed.header.is_none());
-        assert_eq!(parsed.credential_header(), "Authorization");
-        assert!(!format_www_authenticate(&parsed)
-            .unwrap()
-            .contains("header="));
+    fn test_parse_www_authenticate_validates_raw_credential_header() {
+        let base =
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30""#;
+        let cases: [(Option<&str>, Option<&str>); 6] = [
+            (None, None),
+            (Some("Payment-Authorization"), Some("Payment-Authorization")),
+            (Some("payment-authorization"), Some("payment-authorization")),
+            (Some("Authorization"), None),
+            (Some(""), None),
+            (Some("X-Payment"), None),
+        ];
+        for (raw, expected) in cases {
+            let header = match raw {
+                Some(raw) => format!(r#"{base}, header="{raw}""#),
+                None => base.to_string(),
+            };
+            match (raw, parse_www_authenticate(&header)) {
+                (None, Ok(parsed)) => {
+                    assert!(parsed.header.is_none());
+                    assert_eq!(parsed.credential_header(), "Authorization");
+                }
+                (Some(_), Ok(parsed)) if expected.is_some() => {
+                    assert_eq!(parsed.header.as_deref(), expected, "{raw:?}");
+                    assert_eq!(parsed.credential_header(), "Payment-Authorization");
+                }
+                (Some(raw), Err(err)) if expected.is_none() => {
+                    let message = err.to_string();
+                    assert!(
+                        message.contains("challenges may only select Payment-Authorization"),
+                        "{raw:?}: {message}"
+                    );
+                    assert!(!message.contains("X-Payment"), "{message}");
+                }
+                (raw, result) => panic!("{raw:?}: unexpected {result:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_all_keeps_valid_challenge_beside_unsupported_header() {
+        for unsupported in ["Authorization", "", "X-Payment"] {
+            let header = format!(
+                concat!(
+                    r#"Payment id="bad", realm="api", method="tempo", intent="charge", request="e30", header="{}", "#,
+                    r#"Payment id="good", realm="api", method="tempo", intent="charge", request="e30""#,
+                ),
+                unsupported
+            );
+            let all = parse_www_authenticate_all([header.as_str()]);
+            assert_eq!(all.len(), 2, "{unsupported:?}");
+            assert!(all[0].is_err(), "{unsupported:?}");
+            assert_eq!(all[1].as_ref().unwrap().id, "good", "{unsupported:?}");
+        }
     }
 
     #[test]
@@ -1689,14 +2088,106 @@ mod tests {
         );
         let parsed = parse_www_authenticate(header).unwrap();
         assert_eq!(parsed.header.as_deref(), Some("payment-authorization"));
-        assert_eq!(parsed.credential_header(), "payment-authorization");
+        assert_eq!(parsed.credential_header(), "Payment-Authorization");
+        assert_eq!(
+            parsed.to_echo().header.as_deref(),
+            Some("payment-authorization")
+        );
+    }
+
+    #[test]
+    fn test_lowercase_bound_credential_header_round_trips() {
+        let request = Base64UrlJson::from_value(&serde_json::json!({"amount": "1"})).unwrap();
+        let issued = PaymentChallenge::with_secret_key_full(
+            "secret",
+            "api",
+            "tempo",
+            "charge",
+            request,
+            None,
+            None,
+            None,
+            None,
+            Some("payment-authorization"),
+        );
+        assert_eq!(issued.header.as_deref(), Some("payment-authorization"));
+
+        let www_authenticate = format_www_authenticate(&issued).unwrap();
+        assert!(www_authenticate.contains(r#"header="payment-authorization""#));
+        let received = parse_www_authenticate(&www_authenticate).unwrap();
+        assert_eq!(received.credential_header(), "Payment-Authorization");
+
+        let credential = PaymentCredential::new(received.to_echo(), PaymentPayload::hash("0x1"));
+        let verified = parse_authorization(&format_authorization(&credential).unwrap()).unwrap();
+        assert_eq!(
+            verified.challenge.header.as_deref(),
+            Some("payment-authorization")
+        );
+        let echo = &verified.challenge;
+        let recomputed = crate::protocol::core::compute_challenge_id_with_header(
+            "secret",
+            &echo.realm,
+            echo.method.as_str(),
+            echo.intent.as_str(),
+            echo.request.raw(),
+            echo.expires.as_deref(),
+            echo.digest.as_deref(),
+            echo.opaque.as_ref().map(Base64UrlJson::raw),
+            echo.header.as_deref(),
+        );
+        assert_eq!(recomputed, issued.id);
     }
 
     #[test]
     fn test_format_www_authenticate_rejects_unsupported_credential_header() {
-        let mut challenge = test_challenge();
-        challenge.header = Some("Cookie".to_string());
-        assert!(format_www_authenticate(&challenge).is_err());
+        for name in ["Cookie", "X-Payment", ""] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+            assert!(format_www_authenticate(&challenge).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn test_format_www_authenticate_credential_header_shorthand() {
+        for name in ["Authorization", "authorization"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+            let formatted = format_www_authenticate(&challenge).unwrap();
+            assert!(!formatted.contains("header="), "{name}: {formatted}");
+        }
+        for name in ["Payment-Authorization", "PAYMENT-AUTHORIZATION"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+            let formatted = format_www_authenticate(&challenge).unwrap();
+            assert!(
+                formatted.contains(&format!(r#"header="{name}""#)),
+                "{name}: {formatted}"
+            );
+        }
+        let built = test_challenge().with_header("Payment-Authorization");
+        assert!(format_www_authenticate(&built)
+            .unwrap()
+            .contains(r#"header="Payment-Authorization""#));
+    }
+
+    #[test]
+    fn test_parse_authorization_rejects_echoed_default_credential_header() {
+        for name in ["Authorization", ""] {
+            assert!(
+                matches!(
+                    parse_wire_challenge_as_echo(&wire_challenge(&[("header", name)])),
+                    Err(MppError::MalformedCredential(_))
+                ),
+                "{name:?}"
+            );
+        }
+        let echoed =
+            parse_wire_challenge_as_echo(&wire_challenge(&[("header", "payment-authorization")]))
+                .unwrap();
+        assert_eq!(
+            echoed.challenge.header.as_deref(),
+            Some("payment-authorization")
+        );
     }
 
     #[test]
@@ -1705,7 +2196,18 @@ mod tests {
         challenge.header = Some("Cookie".to_string());
         let credential =
             PaymentCredential::new(challenge.to_echo(), PaymentPayload::transaction("0xabc"));
-        let header = format_authorization(&credential).unwrap();
+        // Formatting refuses the value, so encode it as a peer could.
+        assert!(format_authorization(&credential).is_err());
+        let mut json = serde_json::to_value(PaymentCredential::new(
+            test_challenge().to_echo(),
+            PaymentPayload::transaction("0xabc"),
+        ))
+        .unwrap();
+        json["challenge"]["header"] = "Cookie".into();
+        let header = format!(
+            "Payment {}",
+            base64url_encode(serde_json::to_string(&json).unwrap().as_bytes())
+        );
         assert!(matches!(
             parse_authorization(&header),
             Err(MppError::MalformedCredential(_))
@@ -1816,11 +2318,23 @@ mod tests {
         assert!(parse_wire_challenge_as_header(&challenge).is_err());
         assert!(serde_json::from_value::<PaymentChallenge>(challenge).is_err());
 
-        let challenge = wire_challenge(&[("header", "Authorization")]);
+        for name in ["Authorization", ""] {
+            let challenge = wire_challenge(&[("header", name)]);
+            assert!(
+                parse_wire_challenge_as_header(&challenge).is_err(),
+                "{name:?}"
+            );
+            assert!(
+                serde_json::from_value::<PaymentChallenge>(challenge).is_err(),
+                "{name:?}"
+            );
+        }
+
+        let challenge = wire_challenge(&[("header", "payment-authorization")]);
         let from_header = parse_wire_challenge_as_header(&challenge).unwrap();
         let from_serde: PaymentChallenge = serde_json::from_value(challenge).unwrap();
-        assert_eq!(from_header.header, None);
-        assert_eq!(from_serde.header, None);
+        assert_eq!(from_header.header.as_deref(), Some("payment-authorization"));
+        assert_eq!(from_serde.header, from_header.header);
     }
 
     /// Without field validation the `|`-joined HMAC input is ambiguous: a

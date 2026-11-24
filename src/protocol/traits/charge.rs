@@ -271,6 +271,27 @@ pub trait ChargeMethod: Clone + Send + Sync {
         false
     }
 
+    /// How long after its Challenge expires this method still accepts a
+    /// `zone` Credential, as mppx's `zoneCredentialGraceMs`.
+    ///
+    /// [`crate::server::Mpp`] issues charge Challenges with the expiry grace
+    /// marker while this is nonzero and lets a `zone` Credential for an
+    /// expired Challenge reach the method within it. The default is zero: no
+    /// grace.
+    fn zone_credential_grace(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
+    /// Whether this method verifies `zone` Credentials.
+    ///
+    /// [`crate::server::Mpp`] refuses to issue a charge Challenge that offers
+    /// Zones (`methodDetails.zones`) for a method that does not, such as a
+    /// Tempo charge method that delegates verification to a relay. The default
+    /// is `true`.
+    fn verifies_zone_credentials(&self) -> bool {
+        true
+    }
+
     /// Validate a credential without consuming or broadcasting it.
     ///
     /// This is an advisory pre-check. Implementations must not reserve replay

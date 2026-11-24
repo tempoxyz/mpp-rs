@@ -22,6 +22,7 @@ use crate::protocol::core::{PaymentChallenge, PaymentCredential};
 use crate::protocol::intents::SessionRequest;
 use crate::protocol::methods::tempo::precompile_voucher::{
     compute_precompile_channel_id, compute_precompile_channel_id_with_escrow,
+    precompile_close_authorization_signing_hash_with_escrow,
     sign_precompile_close_authorization_primitive_with_escrow,
     sign_precompile_close_authorization_with_escrow, sign_precompile_voucher,
     sign_precompile_voucher_primitive, sign_precompile_voucher_primitive_with_escrow,
@@ -34,8 +35,60 @@ use crate::protocol::methods::tempo::session::{
 use crate::protocol::methods::tempo::voucher::{compute_channel_id, sign_voucher};
 use crate::protocol::methods::tempo::CHAIN_ID;
 
+use super::configurable::ConfigurableVoucherSigner;
+
+alloy::sol! {
+    /// TIP-1166 (T15) additions to the TIP-1034 channel reserve precompile.
+    #[derive(Debug, PartialEq, Eq)]
+    interface ITIP1166ChannelReserve {
+        /// `open` recorded the voucher signer's configurable account
+        /// commitment, which the descriptor's salt holds, as the channel's
+        /// opening commitment.
+        event OpeningCommitmentRecorded(bytes32 indexed channelId, address indexed signer, bytes32 commitment);
+        /// A nonzero `topUp` after the voucher signer's configuration changed.
+        error SignerConfigChanged(address signer);
+        /// `open` with a salt other than the voucher signer's nonzero commitment.
+        error SaltNotSignerCommitment(address signer, bytes32 commitment);
+        /// A nonzero `topUp` after a signer with no commitment at open gained one.
+        error RootKeyRetired(address signer);
+    }
+
+    /// Read side of the TIP-1107 configurable account precompile.
+    interface IConfigurableAccount {
+        function getConfigCommitment(address account) external view returns (bytes32 commitment);
+    }
+}
+
 #[cfg(feature = "tempo")]
 const EXPIRING_NONCE_VALID_BEFORE_SECS: u64 = 25;
+
+/// Gas declared by a sponsored session transaction, which the client can't
+/// estimate: the node bills the sender in `eth_estimateGas` when no fee payer
+/// has signed, and the sender may hold none of the fee token.
+#[cfg(feature = "tempo")]
+const SPONSORED_GAS_LIMIT: u64 = 2_000_000;
+
+/// Gas declared by a transaction the client doesn't estimate (a sponsored
+/// one, or a legacy session open) when it also authorizes the signing access
+/// key, and the most an estimate for one that does may ask for. Installing a
+/// key writes its limits and call scopes to the account keychain, which needs
+/// far more than [`SPONSORED_GAS_LIMIT`]: an open that installed a key with
+/// four limits and 14 scoped selectors used 18,503,016 gas on Tempo mainnet.
+/// It stays under the 25,000,000 gas that fee payers such as Tempo Gateway
+/// sponsor.
+#[cfg(feature = "tempo")]
+pub(crate) const KEY_AUTHORIZATION_GAS_LIMIT: u64 = 20_000_000;
+
+/// The gas a session transaction the client doesn't estimate declares: more
+/// when it carries a key authorization.
+#[cfg(feature = "tempo")]
+const fn sponsored_gas_limit(authorizes_key: bool) -> u64 {
+    if authorizes_key {
+        KEY_AUTHORIZATION_GAS_LIMIT
+    } else {
+        SPONSORED_GAS_LIMIT
+    }
+}
 
 /// Default escrow contract addresses per chain ID.
 pub fn default_escrow_contract(chain_id: u64) -> Option<Address> {
@@ -113,17 +166,7 @@ pub fn resolve_escrow_with_policy(
     allow_custom_escrow: bool,
 ) -> Result<Address, MppError> {
     let request = challenge.request.decode::<SessionRequest>().ok();
-    let advertised = request
-        .as_ref()
-        .and_then(|req| req.method_details.as_ref())
-        .and_then(|details| {
-            ["escrowContract", "escrow"].into_iter().find_map(|key| {
-                details
-                    .get(key)
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|value| value.parse::<Address>().ok())
-            })
-        });
+    let advertised = request.as_ref().and_then(advertised_escrow);
     let protocol = request.as_ref().and_then(|req| req.session_protocol());
     let tip1034 = match protocol.as_deref() {
         Some(SESSION_PROTOCOL_TIP1034) => true,
@@ -171,7 +214,36 @@ pub fn resolve_escrow_with_policy(
     Ok(escrow)
 }
 
+/// The escrow address a session request advertises in its method details, if any.
+fn advertised_escrow(request: &SessionRequest) -> Option<Address> {
+    let details = request.method_details.as_ref()?;
+    ["escrowContract", "escrow"].into_iter().find_map(|key| {
+        details
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<Address>().ok())
+    })
+}
+
+/// Whether a session challenge selects the TIP-1034 channel reserve, by its
+/// `sessionProtocol` marker or, without one, by advertising the reserve.
+fn is_tip1034_challenge(challenge: &PaymentChallenge) -> bool {
+    let Ok(request) = challenge.request.decode::<SessionRequest>() else {
+        return false;
+    };
+    match request.session_protocol().as_deref() {
+        Some(protocol) => protocol == SESSION_PROTOCOL_TIP1034,
+        None => advertised_escrow(&request) == Some(TIP20_CHANNEL_RESERVE_ADDRESS),
+    }
+}
+
 /// Build a `PaymentCredential` from a challenge and session payload.
+///
+/// For a TIP-1034 session, the credential's `source` names the channel's
+/// funding payer from the payload's descriptor, falling back to
+/// `signer_address`, so a delegated voucher signer still identifies the
+/// funding account, as mppx does. Legacy escrow sessions always name
+/// `signer_address`, as mppx's legacy client does.
 pub fn build_credential(
     challenge: &PaymentChallenge,
     payload: SessionCredentialPayload,
@@ -179,8 +251,23 @@ pub fn build_credential(
     signer_address: Address,
 ) -> PaymentCredential {
     let echo = challenge.to_echo();
-    let source = PaymentCredential::evm_did(chain_id, &signer_address.to_string());
+    let payer = is_tip1034_challenge(challenge)
+        .then(|| descriptor_payer(&payload))
+        .flatten()
+        .unwrap_or(signer_address);
+    let source = PaymentCredential::evm_did(chain_id, &payer.to_string());
     PaymentCredential::with_source(echo, source, payload)
+}
+
+/// The funding payer named by a session payload's channel descriptor, if any.
+pub(crate) fn descriptor_payer(payload: &SessionCredentialPayload) -> Option<Address> {
+    let descriptor = match payload {
+        SessionCredentialPayload::Open { descriptor, .. }
+        | SessionCredentialPayload::TopUp { descriptor, .. }
+        | SessionCredentialPayload::Voucher { descriptor, .. }
+        | SessionCredentialPayload::Close { descriptor, .. } => descriptor.as_ref(),
+    };
+    descriptor.and_then(|descriptor| descriptor.payer.parse().ok())
 }
 
 /// Create a voucher payload by signing a voucher.
@@ -287,6 +374,49 @@ pub async fn create_precompile_voucher_payload_with_descriptor_primitive(
         chain_id,
     )
     .await?;
+
+    Ok(SessionCredentialPayload::Voucher {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
+        settlement_route: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+    })
+}
+
+/// The salt of a TIP-1034 channel descriptor.
+#[cfg(feature = "tempo")]
+fn descriptor_salt(descriptor: &ChannelDescriptor) -> Result<B256, MppError> {
+    descriptor
+        .salt
+        .parse::<B256>()
+        .map_err(|e| MppError::InvalidConfig(format!("invalid TIP-1034 descriptor salt: {e}")))
+}
+
+/// Voucher payload for TIP-1034 signed by a TIP-1166 configurable account
+/// (`0x05`). Servers accept it only when they advertise
+/// `configurableVouchers` and the chain runs T15.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_voucher_payload_with_descriptor_configurable(
+    signer: &ConfigurableVoucherSigner,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )?;
+    signer.ensure_can_sign_channel(descriptor_salt(&descriptor)?)?;
+    let signature = signer
+        .sign_precompile_voucher(
+            channel_id,
+            cumulative_amount,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            chain_id,
+        )
+        .await?;
 
     Ok(SessionCredentialPayload::Voucher {
         channel_id: channel_id.to_string(),
@@ -479,6 +609,58 @@ pub async fn create_precompile_close_payload_with_descriptor_primitive(
     })
 }
 
+/// Close payload for TIP-1034 whose final voucher and close authorization are
+/// both signed by a TIP-1166 configurable account (`0x05`), the channel's
+/// authorized signer. Signing the close authorization with the payer's key
+/// instead fails when that key is an access key, which is neither the payer
+/// nor the authorized signer.
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_close_payload_with_descriptor_configurable(
+    voucher_signer: &ConfigurableVoucherSigner,
+    channel_id: B256,
+    descriptor: ChannelDescriptor,
+    cumulative_amount: u128,
+    chain_id: u64,
+) -> Result<SessionCredentialPayload, MppError> {
+    let expected_channel_id = compute_precompile_channel_id_from_descriptor_with_escrow(
+        &descriptor,
+        TIP20_CHANNEL_RESERVE_ADDRESS,
+        chain_id,
+    )?;
+    if expected_channel_id != channel_id {
+        return Err(MppError::InvalidConfig(
+            "TIP-1034 close descriptor does not match channel_id".to_string(),
+        ));
+    }
+
+    voucher_signer.ensure_can_sign_channel(descriptor_salt(&descriptor)?)?;
+    let signature = voucher_signer
+        .sign_precompile_voucher(
+            channel_id,
+            cumulative_amount,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            chain_id,
+        )
+        .await?;
+    let close = voucher_signer
+        .sign_digest(precompile_close_authorization_signing_hash_with_escrow(
+            channel_id,
+            cumulative_amount,
+            TIP20_CHANNEL_RESERVE_ADDRESS,
+            chain_id,
+        )?)
+        .await?;
+
+    Ok(SessionCredentialPayload::Close {
+        channel_id: channel_id.to_string(),
+        descriptor: Some(descriptor),
+        settlement_route: None,
+        cumulative_amount: cumulative_amount.to_string(),
+        signature: alloy::hex::encode_prefixed(&signature),
+        close_signature: Some(alloy::hex::encode_prefixed(&close)),
+    })
+}
+
 /// Close payload for TIP-1034 with a descriptor and explicit escrow/precompile verifier.
 #[cfg(feature = "tempo")]
 pub async fn create_precompile_close_payload_with_descriptor_and_escrow(
@@ -641,7 +823,7 @@ where
         fee_token: options.currency,
         nonce,
         nonce_key,
-        gas_limit: 2_000_000,
+        gas_limit: sponsored_gas_limit(key_authorization.is_some()),
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
@@ -792,6 +974,18 @@ fn random_past_valid_after() -> Option<std::num::NonZeroU64> {
     prefix.copy_from_slice(&random[..8]);
     let timestamp = (u64::from_be_bytes(prefix) % latest).max(1);
     std::num::NonZeroU64::new(timestamp)
+}
+
+/// The `validAfter` of an open transaction: random and past when its salt is
+/// the voucher signer's configuration commitment, which is the same for every
+/// open, else none (a random salt already makes each open distinct).
+#[cfg(feature = "tempo")]
+fn open_valid_after(salt_is_commitment: bool) -> Option<std::num::NonZeroU64> {
+    if salt_is_commitment {
+        random_past_valid_after()
+    } else {
+        None
+    }
 }
 
 #[cfg(feature = "tempo")]
@@ -1039,6 +1233,37 @@ where
     P: Provider<TempoNetwork>,
     S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
 {
+    create_precompile_open_payload_with_voucher_signer(
+        provider,
+        signer,
+        signing_mode,
+        payer,
+        options,
+        None,
+    )
+    .await
+}
+
+/// [`create_precompile_open_payload`] whose initial voucher is signed by
+/// `voucher_signer`, a TIP-1166 configurable account, when given.
+///
+/// The configurable account becomes the channel's authorized signer, and
+/// unless `options.salt` is set the salt is the account's on-chain
+/// configuration commitment when it has one (T15 requires it), else random.
+/// Without `voucher_signer` this is [`create_precompile_open_payload`].
+#[cfg(feature = "tempo")]
+pub async fn create_precompile_open_payload_with_voucher_signer<P, S>(
+    provider: &P,
+    signer: &S,
+    signing_mode: Option<&crate::client::tempo::signing::TempoSigningMode>,
+    payer: Address,
+    options: OpenPrecompilePayloadOptions,
+    voucher_signer: Option<&ConfigurableVoucherSigner>,
+) -> Result<(ChannelEntry, SessionCredentialPayload), MppError>
+where
+    P: Provider<TempoNetwork>,
+    S: Clone + Into<crate::client::tempo::signing::TempoPrimitiveSigner>,
+{
     if options.deposit > PRECOMPILE_MAX_CUMULATIVE_AMOUNT {
         return Err(MppError::InvalidConfig(format!(
             "deposit {} exceeds precompile uint96 max",
@@ -1057,8 +1282,37 @@ where
     let primitive_signer = signer.clone().into();
     let signature_type = primitive_signer.signature_type();
 
-    let authorized_signer = options.authorized_signer.unwrap_or(payer);
-    let salt = options.salt.unwrap_or_else(B256::random);
+    let authorized_signer = match voucher_signer {
+        Some(voucher_signer) => {
+            let account = voucher_signer.account();
+            if options
+                .authorized_signer
+                .is_some_and(|authorized| authorized != account)
+            {
+                return Err(MppError::InvalidConfig(format!(
+                    "authorized signer must be the configurable account {account}"
+                )));
+            }
+            account
+        }
+        None => options.authorized_signer.unwrap_or(payer),
+    };
+    let (salt, salt_is_commitment) = match (options.salt, voucher_signer) {
+        (Some(salt), _) => (salt, false),
+        (None, Some(voucher_signer)) => match voucher_signer.open_salt(provider).await? {
+            Some(commitment) => (commitment, true),
+            None => (B256::random(), false),
+        },
+        (None, None) => (B256::random(), false),
+    };
+    if let Some(voucher_signer) = voucher_signer {
+        voucher_signer.ensure_can_sign_channel(salt)?;
+    }
+    // A salt fixed to the signer's commitment leaves two identical opens
+    // without per-open entropy, so they would serialize to the same
+    // transaction and expiring-nonce hash. Give them a random past
+    // `validAfter`, as top-ups get.
+    let valid_after = open_valid_after(salt_is_commitment);
 
     let open_data = ITIP20ChannelReserve::openCall::new((
         options.payee,
@@ -1097,7 +1351,7 @@ where
         fee_token: options.fee_token,
         nonce,
         nonce_key,
-        gas_limit: 2_000_000,
+        gas_limit: sponsored_gas_limit(key_authorization.is_some()),
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
@@ -1107,7 +1361,7 @@ where
     if !options.fee_payer {
         let request = session_estimation_request(
             &transaction_options,
-            None,
+            valid_after,
             payer,
             primitive_signer.address(),
             signature_type,
@@ -1131,7 +1385,8 @@ where
             }
         };
     }
-    let unsigned_tx = build_tempo_tx(transaction_options);
+    let mut unsigned_tx = build_tempo_tx(transaction_options);
+    unsigned_tx.valid_after = valid_after;
     // Derive id from the unsigned tx before signing; expiringNonceHash binds
     // the signing-payload bytes.
     let expiring_nonce_hash = if options.fee_payer {
@@ -1176,13 +1431,27 @@ where
     };
     let signed_tx_hex = alloy::hex::encode_prefixed(&tx_bytes);
 
-    let voucher_sig = sign_precompile_voucher_primitive(
-        &primitive_signer,
-        channel_id,
-        options.initial_amount,
-        options.chain_id,
-    )
-    .await?;
+    let voucher_sig = match voucher_signer {
+        Some(voucher_signer) => {
+            voucher_signer
+                .sign_precompile_voucher(
+                    channel_id,
+                    options.initial_amount,
+                    TIP20_CHANNEL_RESERVE_ADDRESS,
+                    options.chain_id,
+                )
+                .await?
+        }
+        None => {
+            sign_precompile_voucher_primitive(
+                &primitive_signer,
+                channel_id,
+                options.initial_amount,
+                options.chain_id,
+            )
+            .await?
+        }
+    };
 
     let entry = ChannelEntry {
         channel_id,
@@ -1295,7 +1564,7 @@ where
         fee_token: options.fee_token,
         nonce,
         nonce_key,
-        gas_limit: 2_000_000,
+        gas_limit: sponsored_gas_limit(key_authorization.is_some()),
         max_fee_per_gas: gas_price,
         max_priority_fee_per_gas: gas_price,
         fee_payer: options.fee_payer,
@@ -1746,6 +2015,83 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "tempo")]
+    #[tokio::test]
+    async fn opens_salted_with_a_commitment_stay_distinct() {
+        use crate::protocol::methods::tempo::configurable_account::{
+            ConfigurableAccountConfig, ConfigurableAccountOwner,
+        };
+        use alloy::{
+            providers::{mock::Asserter, ProviderBuilder},
+            signers::local::PrivateKeySigner,
+        };
+
+        let owner = PrivateKeySigner::random();
+        let config = ConfigurableAccountConfig {
+            salt: B256::repeat_byte(3),
+            version: 0,
+            threshold: 1,
+            owners: vec![ConfigurableAccountOwner {
+                owner: owner.address(),
+                weight: 1,
+            }],
+        };
+        let account = config.account_address().unwrap();
+        let voucher_signer = ConfigurableVoucherSigner::new(account, config, vec![owner]).unwrap();
+        let commitment = voucher_signer.commitment();
+        let payer = PrivateKeySigner::random();
+
+        let open = || async {
+            let asserter = Asserter::new();
+            asserter.push_success(&Bytes::from(commitment.to_vec())); // getConfigCommitment
+            asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+            let provider =
+                ProviderBuilder::new_with_network::<TempoNetwork>().connect_mocked_client(asserter);
+            create_precompile_open_payload_with_voucher_signer(
+                &provider,
+                &payer,
+                None,
+                payer.address(),
+                OpenPrecompilePayloadOptions {
+                    prefix_calls: vec![],
+                    operator: Address::ZERO,
+                    authorized_signer: None,
+                    payee: Address::repeat_byte(0x11),
+                    currency: Address::repeat_byte(0x22),
+                    fee_token: Address::repeat_byte(0x22),
+                    deposit: 1_000,
+                    initial_amount: 10,
+                    chain_id: 4217,
+                    fee_payer: true,
+                    salt: None,
+                },
+                Some(&voucher_signer),
+            )
+            .await
+            .unwrap()
+        };
+        let (first, _) = open().await;
+        let (second, _) = open().await;
+        assert_eq!(first.salt, commitment);
+        assert_eq!(second.salt, commitment);
+        let first_hash = first.descriptor.unwrap().expiring_nonce_hash;
+        let second_hash = second.descriptor.unwrap().expiring_nonce_hash;
+        assert_ne!(first_hash, second_hash);
+        assert_ne!(first.channel_id, second.channel_id);
+    }
+
+    #[cfg(feature = "tempo")]
+    #[test]
+    fn only_commitment_salted_opens_get_a_valid_after() {
+        assert!(open_valid_after(false).is_none());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let valid_after = open_valid_after(true).unwrap().get();
+        assert!(valid_after <= now - 60);
+    }
+
     #[test]
     fn test_channel_entry_clone() {
         let entry = ChannelEntry {
@@ -1784,6 +2130,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let override_addr: Address = "0x1111111111111111111111111111111111111111"
@@ -1813,6 +2160,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let result = resolve_escrow(&challenge, 42431, None).unwrap();
@@ -1843,6 +2191,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(resolve_escrow(&challenge, 42431, None).is_err());
@@ -1871,6 +2220,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert_eq!(
@@ -1900,6 +2250,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert_eq!(
@@ -2096,6 +2447,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let result = resolve_escrow(&challenge, 9999, None);
@@ -2122,6 +2474,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let payload = SessionCredentialPayload::Voucher {
@@ -2254,6 +2607,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert_eq!(resolve_chain_id(&challenge), 4217);
@@ -2279,6 +2633,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert_eq!(resolve_chain_id(&challenge), CHAIN_ID);
@@ -2302,6 +2657,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         // Match MPPx's default Tempo client: mainnet when no chain is advertised.
@@ -2332,6 +2688,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         // Invalid address in challenge should fall back to default
@@ -2359,6 +2716,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let override_addr: Address = "0x3333333333333333333333333333333333333333"
@@ -2417,6 +2775,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let payload = SessionCredentialPayload::Voucher {
@@ -2434,6 +2793,90 @@ mod tests {
         let did = cred.source.as_ref().unwrap();
         let expected = format!("did:pkh:eip155:4217:{}", addr);
         assert_eq!(did, &expected, "DID should match exact pkh format");
+    }
+
+    #[test]
+    fn test_build_credential_names_the_funding_payer_for_a_delegated_signer() {
+        use crate::protocol::core::{Base64UrlJson, PaymentChallenge};
+        use crate::protocol::methods::tempo::session::ChannelDescriptor;
+
+        let challenge_with = |method_details: serde_json::Value| PaymentChallenge {
+            id: "payer".to_string(),
+            realm: "api.example.com".to_string(),
+            method: "tempo".into(),
+            intent: "session".into(),
+            request: Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1",
+                "currency": "0x3333333333333333333333333333333333333333",
+                "methodDetails": method_details,
+            }))
+            .unwrap(),
+            expires: None,
+            description: None,
+            digest: None,
+            opaque: None,
+            header: None,
+            legacy_unicode_escape: false,
+        };
+        let payer: Address = "0x0000000000000000000000000000000000000099"
+            .parse()
+            .unwrap();
+        let signer: Address = "0x1111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let descriptor = ChannelDescriptor {
+            payer: payer.to_string(),
+            payee: "0x2222222222222222222222222222222222222222".to_string(),
+            operator: "0x0000000000000000000000000000000000000000".to_string(),
+            token: "0x3333333333333333333333333333333333333333".to_string(),
+            salt: format!("0x{}", "00".repeat(32)),
+            authorized_signer: signer.to_string(),
+            expiring_nonce_hash: format!("0x{}", "00".repeat(32)),
+        };
+        let payload = SessionCredentialPayload::Voucher {
+            channel_id: "0xabc".to_string(),
+            descriptor: Some(descriptor),
+            settlement_route: None,
+            cumulative_amount: "1".to_string(),
+            signature: "0x1234".to_string(),
+        };
+
+        let payer_did = format!("did:pkh:eip155:42431:{payer}");
+        let signer_did = format!("did:pkh:eip155:42431:{signer}");
+        for (method_details, expected) in [
+            (
+                serde_json::json!({ "sessionProtocol": SESSION_PROTOCOL_TIP1034 }),
+                &payer_did,
+            ),
+            (
+                serde_json::json!({ "escrowContract": TIP20_CHANNEL_RESERVE_ADDRESS.to_string() }),
+                &payer_did,
+            ),
+            // A legacy session names the transaction signer, whatever the descriptor says.
+            (
+                serde_json::json!({ "sessionProtocol": SESSION_PROTOCOL_LEGACY }),
+                &signer_did,
+            ),
+            (
+                serde_json::json!({
+                    "escrowContract": "0x4444444444444444444444444444444444444444",
+                }),
+                &signer_did,
+            ),
+            (serde_json::json!({}), &signer_did),
+        ] {
+            let cred = build_credential(
+                &challenge_with(method_details.clone()),
+                payload.clone(),
+                42431,
+                signer,
+            );
+            assert_eq!(
+                cred.source.as_deref(),
+                Some(expected.as_str()),
+                "{method_details}"
+            );
+        }
     }
 
     #[cfg(feature = "evm")]
@@ -2559,6 +3002,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         for allow_custom_escrow in [false, true] {

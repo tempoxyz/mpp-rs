@@ -119,6 +119,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let request = from_challenge(&challenge).unwrap();
@@ -146,6 +147,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         let decoded: ChargeRequest = from_challenge_typed(&challenge).unwrap();

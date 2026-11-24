@@ -48,15 +48,10 @@ impl MethodName {
         self.0.eq_ignore_ascii_case(other)
     }
 
-    /// Check whether this method name matches the canonical mppx grammar.
+    /// Check whether this method name matches the spec grammar
+    /// `payment-method-id = 1*LOWERALPHA` (one or more of `a`-`z`).
     pub fn is_valid(&self) -> bool {
-        let mut chars = self.0.chars();
-        matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
-            && chars.all(|character| {
-                character.is_ascii_lowercase()
-                    || character.is_ascii_digit()
-                    || matches!(character, ':' | '_' | '-')
-            })
+        is_valid_method_id(&self.0)
     }
 }
 
@@ -96,10 +91,16 @@ impl<'de> Deserialize<'de> for MethodName {
             Ok(method)
         } else {
             Err(serde::de::Error::custom(
-                "invalid method name: must start with a lowercase ASCII letter and contain only lowercase letters, digits, colons, underscores, or hyphens",
+                "invalid method name: must be one or more lowercase ASCII letters (a-z)",
             ))
         }
     }
+}
+
+/// Whether `value` matches the spec grammar `payment-method-id = 1*LOWERALPHA`
+/// (one or more of `a`-`z`; no digits, `:`, `_`, `-` or capitals).
+pub(crate) fn is_valid_method_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_lowercase())
 }
 
 /// Payment intent identifier (newtype over String).
@@ -275,15 +276,28 @@ pub fn base64url_encode(data: &[u8]) -> String {
 /// Decode a base64url string to bytes.
 ///
 /// Accepts both URL-safe (`-`, `_`) and standard (`+`, `/`) alphabets,
-/// with or without `=` padding. This follows Postel's law — be strict in
-/// what you produce (see [`base64url_encode`]) but lenient in what you
+/// with or without trailing `=` padding. `=` anywhere else, or padding
+/// where no bits are missing, is rejected. This follows Postel's law — be
+/// strict in what you produce (see [`base64url_encode`]) but lenient in what you
 /// accept — and aligns with the mppx TypeScript SDK which also accepts
 /// both variants.
 pub fn base64url_decode(input: &str) -> Result<Vec<u8>> {
-    // Normalize standard base64 to URL-safe alphabet and strip padding.
-    let normalized: String = input
+    // Padding may only end the input, as in mppx: `=` anywhere else is not
+    // padding and must not be dropped.
+    let unpadded = input
+        .strip_suffix("==")
+        .or_else(|| input.strip_suffix('='))
+        .unwrap_or(input);
+    if unpadded.contains('=') || (unpadded.len() < input.len() && unpadded.len().is_multiple_of(4))
+    {
+        return Err(MppError::InvalidBase64Url(
+            "Invalid base64url: '=' is only allowed as trailing padding".to_string(),
+        ));
+    }
+
+    // Normalize standard base64 to the URL-safe alphabet.
+    let normalized: String = unpadded
         .chars()
-        .filter(|c| *c != '=')
         .map(|c| match c {
             '+' => '-',
             '/' => '_',
@@ -355,6 +369,7 @@ impl fmt::Display for PaymentProtocol {
 /// - `transaction`: Signed blockchain transaction (to be broadcast by server)
 /// - `hash`: Transaction hash (already broadcast by client)
 /// - `proof`: Signed typed proof for zero-amount identity flows
+/// - `zone`: Tempo settlement of a Zone withdrawal (Tempo charge)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PayloadType {
@@ -364,6 +379,8 @@ pub enum PayloadType {
     Hash,
     /// Signed typed proof for zero-amount identity flows
     Proof,
+    /// Tempo transaction that settled a Zone withdrawal to the recipient
+    Zone,
 }
 
 impl fmt::Display for PayloadType {
@@ -372,6 +389,7 @@ impl fmt::Display for PayloadType {
             Self::Transaction => write!(f, "transaction"),
             Self::Hash => write!(f, "hash"),
             Self::Proof => write!(f, "proof"),
+            Self::Zone => write!(f, "zone"),
         }
     }
 }
@@ -417,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_method_name_serde() {
-        for value in ["base", "x402", "tempo-v2", "a:b", "a_b", "a1:b_2-c"] {
+        for value in ["base", "tempo", "stripe", "evm"] {
             let method = MethodName::new(value);
             let json = serde_json::to_string(&method).unwrap();
             let parsed: MethodName = serde_json::from_str(&json).unwrap();
@@ -428,7 +446,8 @@ mod tests {
     #[test]
     fn test_method_name_deserialization_rejects_invalid_names() {
         for method in [
-            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "TEMPO",
+            "", "123", "-tempo", ":tempo", "_tempo", "*", "tempo!", "TEMPO", "x402", "tempo2",
+            "tempo-v2", "a:b", "a_b", "a1:b_2-c",
         ] {
             let json = serde_json::to_string(method).unwrap();
             let error = serde_json::from_str::<MethodName>(&json).unwrap_err();
@@ -483,6 +502,15 @@ mod tests {
         assert!(standard.contains('=') || standard.contains('+') || standard.contains('/'));
         let decoded = base64url_decode(&standard).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_base64url_decode_rejects_misplaced_padding() {
+        for input in ["=Ace0", "Ac=E", "A=A=", "AA===", "=", "e30=e30", "=e30"] {
+            assert!(base64url_decode(input).is_err(), "{input}");
+        }
+        assert_eq!(base64url_decode("AA==").unwrap(), [0]);
+        assert_eq!(base64url_decode("AA=").unwrap(), [0]);
     }
 
     #[test]
@@ -572,6 +600,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&PayloadType::Proof).unwrap(),
             "\"proof\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PayloadType::Zone).unwrap(),
+            "\"zone\""
         );
     }
 

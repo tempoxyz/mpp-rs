@@ -7,6 +7,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use mpp::protocol::core::extract_payment_scheme;
 use mpp::protocol::methods::tempo::PATH_USD;
 use mpp::server::{
     tempo, ChargeOptions, Mpp, TempoChargeMethod, TempoConfig, TempoProvider, TempoRelayConfig,
@@ -73,6 +74,7 @@ async fn photo(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl 
         if let Ok(credential) = auth
             .to_str()
             .map_err(|_| ())
+            .and_then(|value| extract_payment_scheme(value).ok_or(()))
             .and_then(|value| parse_authorization(value).map_err(|_| ()))
         {
             match payment

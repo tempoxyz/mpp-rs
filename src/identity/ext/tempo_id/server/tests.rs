@@ -866,3 +866,6 @@ fn payment_check_needs_requires_auth() {
         .payment(&tempo_id.payment_check)
         .reads_authorization());
 }
+
+#[cfg(feature = "identity-attestation")]
+mod issuer;

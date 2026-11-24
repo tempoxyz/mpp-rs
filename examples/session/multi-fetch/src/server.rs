@@ -19,6 +19,7 @@ use axum::{
     Router,
 };
 use mpp::client::channel_ops::default_escrow_contract;
+use mpp::protocol::core::extract_payment_scheme;
 use mpp::server::{
     deduct_from_channel, tempo, Mpp, SessionChallengeOptions, SessionChannelStore,
     SessionMethodConfig, TempoChargeMethod, TempoConfig, TempoSessionMethod,
@@ -236,6 +237,7 @@ fn parse_credential(headers: &HeaderMap) -> Option<PaymentCredential> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
+        .and_then(extract_payment_scheme)
         .and_then(|s| parse_authorization(s).ok())
 }
 
@@ -270,6 +272,7 @@ mod tests {
             pending_close: None,
             close_requested_at: 0,
             created_at: "2026-01-01T00:00:00Z".to_string(),
+            opening_commitment: None,
         }
     }
 
