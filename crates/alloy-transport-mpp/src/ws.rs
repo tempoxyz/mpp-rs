@@ -612,9 +612,24 @@ async fn run_translator<P, V>(
                 pending_voucher = None;
                 match res {
                     Ok(Ok(cred)) => {
-                        if let Err(reason) = send_credential(&mut socket, &cred, &events_tx, true).await {
-                            termination = Some(reason);
-                            break;
+                        // A pending payment's Receipt deadline also bounds
+                        // the voucher write, so a peer that stops reading
+                        // cannot hold the payment open.
+                        let sent = until_receipt_deadline(
+                            send_credential(&mut socket, &cred, &events_tx, true),
+                            receipt_deadline.as_mut(),
+                            receipt_deadline_armed,
+                        ).await;
+                        match sent {
+                            Some(Ok(())) => {}
+                            Some(Err(reason)) => {
+                                termination = Some(reason);
+                                break;
+                            }
+                            None => {
+                                termination = Some(receipt_deadline_expired(&events_tx));
+                                break;
+                            }
                         }
                         handshake_complete = true;
                         credential_awaiting_receipt = true;
