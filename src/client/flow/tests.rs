@@ -296,6 +296,7 @@ impl PaymentProvider for TestProvider {
                 challenge: Box::new(challenge.clone()),
                 challenge_id: challenge.id.clone(),
                 sender_tag: String::new(),
+                sender_tags: Vec::new(),
                 zone_id: 3,
             });
         }

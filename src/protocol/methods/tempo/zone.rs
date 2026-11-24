@@ -87,6 +87,10 @@ mod abi {
             /// Returns the fee the outbox charges on top of a withdrawal.
             function calculateWithdrawalFee(uint64 gasLimit) external view returns (uint128 fee);
 
+            /// Returns the fallback nonce of the latest withdrawal request:
+            /// each request takes the next one.
+            function lastFallbackNonce() external view returns (uint64);
+
             /// Requests a withdrawal from the Zone to Tempo.
             function requestWithdrawal(
                 address token,

@@ -220,19 +220,24 @@ pub enum MppError {
     /// withdrawal cannot be undone and may still settle.
     ///
     /// Pay `challenge` again with the same provider to resume waiting
-    /// without withdrawing again, or find the settlement with `sender_tag` on
-    /// the Zone's portal. A fresh challenge for the same terms never starts
+    /// without withdrawing again, or find the settlement with `sender_tag`
+    /// (or one of `sender_tags`) on the Zone's portal. A fresh challenge for the same terms never starts
     /// another withdrawal: from the origin that issued `challenge` it resumes
     /// this one and answers `challenge`; otherwise it fails with this error.
-    #[error("Zone {zone_id} withdrawal {}for challenge \"{challenge_id}\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again.", sender_tag_clause(.sender_tag))]
+    #[error("Zone {zone_id} withdrawal {}for challenge \"{challenge_id}\" has not settled on Tempo yet. Pay this challenge again to resume waiting: a fresh challenge would withdraw again.", sender_tag_clause(.sender_tag, .sender_tags))]
     ZoneSettlementPending {
         /// The challenge the withdrawal pays, to pay again to resume waiting.
         challenge: Box<crate::protocol::core::PaymentChallenge>,
         /// ID of the challenge the withdrawal pays.
         challenge_id: String,
         /// Sender tag of the withdrawal, as the portal's `WithdrawalProcessed`
-        /// event carries it; empty when it was not read.
+        /// event carries it; empty when it was not read, or when a Zone RPC
+        /// hid it and more than one candidate remains (see `sender_tags`).
         sender_tag: String,
+        /// Sender tags the withdrawal may carry, as mppx's `senderTags`: its
+        /// tag alone when known, else every candidate; empty when it was not
+        /// read.
+        sender_tags: Vec<String>,
         /// ID of the Zone the withdrawal left.
         zone_id: u32,
     },
@@ -576,13 +581,16 @@ fn format_channel_closed(reason: &Option<String>) -> String {
     }
 }
 
-/// The sender tag, followed by a space, in a settlement-pending message; empty
-/// when the tag is unknown.
-fn sender_tag_clause(sender_tag: &str) -> String {
-    if sender_tag.is_empty() {
+/// The sender tag, followed by a space, in a settlement-pending message: the
+/// candidate tags joined with "or" when more than one remains, and empty when
+/// the tag is unknown.
+fn sender_tag_clause(sender_tag: &str, sender_tags: &[String]) -> String {
+    if !sender_tag.is_empty() {
+        format!("{sender_tag} ")
+    } else if sender_tags.is_empty() {
         String::new()
     } else {
-        format!("{sender_tag} ")
+        format!("with sender tag {} ", sender_tags.join(" or "))
     }
 }
 
