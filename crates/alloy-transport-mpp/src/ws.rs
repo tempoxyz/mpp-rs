@@ -339,9 +339,13 @@ impl<P, V> MppWsConnect<P, V> {
     /// Sets the per-phase handshake timeout.
     ///
     /// Bounds the time spent waiting for the server's `challenge` /
-    /// `needVoucher`, for the local `pay()` / `next_voucher()` to complete,
-    /// and for a Receipt that acknowledges a payment after its credential is
-    /// sent. On expiry the connection is closed with a fatal error and not
+    /// `needVoucher` and for the local `pay()` / `next_voucher()` to complete.
+    /// It also bounds a payment that the server neither acknowledges nor
+    /// serves: after a payment's credential is sent, the server has this long
+    /// to send a Data or `needVoucher` frame, or a Receipt that acknowledges
+    /// it. After a Receipt that does not acknowledge the payment, a final
+    /// window of this length starts, which later frames don't extend. On
+    /// expiry the connection is closed with a fatal error and not
     /// reconnected.
     pub const fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
         self.handshake_timeout = handshake_timeout;
@@ -500,12 +504,12 @@ async fn run_translator<P, V>(
     pin!(handshake_deadline);
 
     // Bounds how long a payment may stay pending without a Receipt that
-    // acknowledges it. Armed when the payment's credential is sent and never
-    // extended by later frames (Receipts that acknowledge nothing included),
-    // so a server cannot hold the payment (and any lease its provider keeps)
-    // open indefinitely. It only fires while a payment is pending.
+    // acknowledges it, so a server cannot hold the payment (and any lease its
+    // provider keeps) open indefinitely. See `ReceiptDeadline` for when it is
+    // armed. An armed deadline is never extended by later frames.
     let receipt_deadline = sleep(handshake_timeout);
     pin!(receipt_deadline);
+    let mut receipt_deadline_state = ReceiptDeadline::Off;
 
     // Off-loop tasks: spawning `pay`/`next_voucher` keeps the keepalive arm
     // responsive while signing/broadcasting takes place.
@@ -523,7 +527,7 @@ async fn run_translator<P, V>(
         let payment_in_flight = pending_pay.is_some() || pending_voucher.is_some();
         let frontend_open = handshake_complete && !payment_in_flight;
         let can_flush = frontend_open && !pending_outbound.is_empty();
-        let receipt_deadline_live = payment_awaiting_receipt.is_some();
+        let receipt_deadline_armed = receipt_deadline_state.is_armed();
 
         select! {
             biased;
@@ -537,7 +541,7 @@ async fn run_translator<P, V>(
                 let sent = until_receipt_deadline(
                     send_jsonrpc(&mut socket, rpc),
                     receipt_deadline.as_mut(),
-                    receipt_deadline_live,
+                    receipt_deadline_armed,
                 ).await;
                 match sent {
                     Some(Ok(())) => {}
@@ -579,6 +583,7 @@ async fn run_translator<P, V>(
                         handshake_complete = true;
                         credential_awaiting_receipt = true;
                         payment_awaiting_receipt = Some(payment);
+                        receipt_deadline_state = ReceiptDeadline::AwaitingProgress;
                         receipt_deadline
                             .as_mut()
                             .reset(Instant::now() + handshake_timeout);
@@ -644,7 +649,7 @@ async fn run_translator<P, V>(
                 let sent = until_receipt_deadline(
                     socket.send(Message::Ping(Default::default())),
                     receipt_deadline.as_mut(),
-                    receipt_deadline_live,
+                    receipt_deadline_armed,
                 ).await;
                 match sent {
                     Some(Ok(())) => {}
@@ -671,14 +676,10 @@ async fn run_translator<P, V>(
                 break;
             }
 
-            // 7. A pending payment is still unacknowledged at the Receipt
-            //    deadline: end the connection, which abandons it.
-            _ = &mut receipt_deadline, if receipt_deadline_live => {
-                termination = Some(receipt_deadline_expired(&events_tx));
-                break;
-            }
-
-            // 8. Inbound from socket → MPP frame.
+            // 7. Inbound from socket → MPP frame. Polled before the Receipt
+            //    deadline so a frame that already arrived (an acknowledging
+            //    Receipt) settles the payment before an expired deadline is
+            //    seen.
             resp = socket.next() => {
                 let pay_was_pending = pending_pay.is_some();
                 let voucher_was_pending = pending_voucher.is_some();
@@ -702,7 +703,25 @@ async fn run_translator<P, V>(
                             max_payments,
                             &mut payments_left,
                         ).await {
-                            Ok(()) => {
+                            Ok(frame) => {
+                                // Track the Receipt deadline for the pending
+                                // payment, then end the connection if it has
+                                // passed: checking here keeps a server that
+                                // floods frames from starving arm 8.
+                                if payment_awaiting_receipt.is_none() {
+                                    receipt_deadline_state = ReceiptDeadline::Off;
+                                }
+                                if receipt_deadline_state.observe(frame) {
+                                    receipt_deadline
+                                        .as_mut()
+                                        .reset(Instant::now() + handshake_timeout);
+                                }
+                                if receipt_deadline_state.is_armed()
+                                    && Instant::now() >= receipt_deadline.deadline()
+                                {
+                                    termination = Some(receipt_deadline_expired(&events_tx));
+                                    break;
+                                }
                                 // Reset the handshake deadline when a new
                                 // pay()/next_voucher() task is spawned.
                                 let entered_pay = !pay_was_pending && pending_pay.is_some();
@@ -743,6 +762,13 @@ async fn run_translator<P, V>(
                     }
                 }
             }
+
+            // 8. A pending payment is still unacknowledged at the Receipt
+            //    deadline: end the connection, which abandons it.
+            _ = &mut receipt_deadline, if receipt_deadline_armed => {
+                termination = Some(receipt_deadline_expired(&events_tx));
+                break;
+            }
         }
     }
 
@@ -778,19 +804,79 @@ async fn run_translator<P, V>(
     }
 }
 
-/// Run a socket write, giving up at the Receipt deadline while a payment is
-/// pending (`live`). A peer that stops reading can block a write
-/// indefinitely, and the deadline arm is only polled between writes.
-/// Returns `None` when the deadline fired first.
+/// Run a socket write, giving up at the Receipt deadline while it is
+/// `armed`. A peer that stops reading can block a write indefinitely, and
+/// the deadline arm is only polled between writes. Returns `None` when the
+/// deadline fired first.
 async fn until_receipt_deadline<F: Future>(
     write: F,
     deadline: Pin<&mut Sleep>,
-    live: bool,
+    armed: bool,
 ) -> Option<F::Output> {
     select! {
         biased;
         out = write => Some(out),
-        _ = deadline, if live => None,
+        _ = deadline, if armed => None,
+    }
+}
+
+/// What an inbound frame means for the Receipt deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InboundFrame {
+    /// A Data or `needVoucher` frame: the server is serving the payment.
+    Progress,
+    /// A Receipt that does not acknowledge the pending payment.
+    UnacknowledgedReceipt,
+    /// Any other frame.
+    Other,
+}
+
+/// Where the Receipt deadline of the pending payment stands.
+///
+/// A server may stream Data frames and send the payment's Receipt only at
+/// the end, so the deadline bounds only a server that shows no progress
+/// after the credential, or one that keeps sending Receipts that
+/// acknowledge nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReceiptDeadline {
+    /// No payment is pending.
+    Off,
+    /// Armed when the credential was sent; the first Data or `needVoucher`
+    /// frame disarms it.
+    AwaitingProgress,
+    /// Disarmed: the server is serving the payment, whose final Receipt
+    /// commits it.
+    Progressing,
+    /// Armed after a Receipt that does not acknowledge the payment; no later
+    /// frame disarms or extends it.
+    Final,
+}
+
+impl ReceiptDeadline {
+    /// Whether the deadline can fire.
+    const fn is_armed(self) -> bool {
+        matches!(self, Self::AwaitingProgress | Self::Final)
+    }
+
+    /// Apply an inbound frame. Returns `true` when the deadline must be
+    /// re-armed from now: only on a first unacknowledging Receipt while
+    /// disarmed, so an armed deadline is never extended.
+    fn observe(&mut self, frame: InboundFrame) -> bool {
+        match (*self, frame) {
+            (Self::AwaitingProgress, InboundFrame::Progress) => {
+                *self = Self::Progressing;
+                false
+            }
+            (Self::AwaitingProgress, InboundFrame::UnacknowledgedReceipt) => {
+                *self = Self::Final;
+                false
+            }
+            (Self::Progressing, InboundFrame::UnacknowledgedReceipt) => {
+                *self = Self::Final;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -868,7 +954,7 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
     credential_awaiting_receipt: &mut bool,
     max_payments: usize,
     payments_left: &mut usize,
-) -> Result<(), TerminationReason> {
+) -> Result<InboundFrame, TerminationReason> {
     match msg {
         Message::Text(text) => {
             handle_text(
@@ -900,7 +986,7 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
             error!("Received binary WS frame; expected text");
             Err(TerminationReason::Fatal)
         }
-        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(()),
+        Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => Ok(InboundFrame::Other),
     }
 }
 
@@ -923,7 +1009,7 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     credential_awaiting_receipt: &mut bool,
     max_payments: usize,
     payments_left: &mut usize,
-) -> Result<(), TerminationReason> {
+) -> Result<InboundFrame, TerminationReason> {
     let server_msg: WsServerMessage = match json_from_str(text) {
         Ok(m) => m,
         Err(err) => {
@@ -1014,7 +1100,7 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                 let credential = provider.pay(&parsed).await?;
                 Ok(PendingPayment::new(provider, parsed, credential))
             }));
-            Ok(())
+            Ok(InboundFrame::Other)
         }
         WsServerMessage::Data { data } => {
             // mpp-rs encodes the inner payload as a JSON-encoded string.
@@ -1028,10 +1114,13 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                     return Err(TerminationReason::Fatal);
                 }
             };
-            interface.send_to_frontend(item).map_err(|err| {
-                error!(item=?err.0, "failed to forward to frontend");
-                TerminationReason::Fatal
-            })
+            interface
+                .send_to_frontend(item)
+                .map(|()| InboundFrame::Progress)
+                .map_err(|err| {
+                    error!(item=?err.0, "failed to forward to frontend");
+                    TerminationReason::Fatal
+                })
         }
         WsServerMessage::NeedVoucher {
             channel_id,
@@ -1059,7 +1148,7 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
 
             let provider = voucher_provider.clone();
             *pending_voucher = Some(spawn(async move { provider.next_voucher(&req).await }));
-            Ok(())
+            Ok(InboundFrame::Progress)
         }
         WsServerMessage::Receipt { receipt } => {
             // A frame without a Receipt object (such as `null`) is malformed,
@@ -1077,7 +1166,8 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             // (an empty one, a failed status, another method) acknowledges
             // nothing: it is reported and skipped, and the payment stays
             // pending until a Receipt or an error frame settles it, or the
-            // Receipt deadline ends the connection.
+            // Receipt deadline (armed by this Receipt if it wasn't) ends the
+            // connection.
             if let Some(payment) = payment_awaiting_receipt.as_ref() {
                 if !acknowledges_payment(&receipt, payment.challenge()) {
                     error!("Receipt frame does not acknowledge the pending payment");
@@ -1085,7 +1175,7 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                         "Receipt does not acknowledge the pending payment; payment not committed"
                             .to_owned(),
                     ));
-                    return Ok(());
+                    return Ok(InboundFrame::UnacknowledgedReceipt);
                 }
             }
             if let Some(payment) = payment_awaiting_receipt.take() {
@@ -1109,13 +1199,13 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                     let _ = events_tx.send(MppEvent::Error(format!(
                         "unreadable Receipt: {err}; payment kept"
                     )));
-                    return Ok(());
+                    return Ok(InboundFrame::Other);
                 }
             };
             debug!(?parsed, "MPP receipt received");
             let _ = receipt_tx.send(Some(parsed.clone()));
             let _ = events_tx.send(MppEvent::Receipt(parsed));
-            Ok(())
+            Ok(InboundFrame::Other)
         }
         WsServerMessage::Error { error } => {
             if let Some(payment) = payment_awaiting_receipt.take() {
@@ -1171,6 +1261,30 @@ fn install_default_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipt_deadline_is_disarmed_by_progress_and_never_extended() {
+        let mut state = ReceiptDeadline::AwaitingProgress;
+        assert!(state.is_armed());
+        assert!(!state.observe(InboundFrame::Other));
+        assert!(!state.observe(InboundFrame::Progress));
+        assert_eq!(state, ReceiptDeadline::Progressing);
+        assert!(!state.is_armed());
+        // The first unacknowledging Receipt re-arms it from now, once.
+        assert!(state.observe(InboundFrame::UnacknowledgedReceipt));
+        assert_eq!(state, ReceiptDeadline::Final);
+        assert!(!state.observe(InboundFrame::UnacknowledgedReceipt));
+        assert!(!state.observe(InboundFrame::Progress));
+        assert_eq!(state, ReceiptDeadline::Final);
+
+        // An unacknowledging Receipt before any progress keeps the original
+        // deadline.
+        let mut state = ReceiptDeadline::AwaitingProgress;
+        assert!(!state.observe(InboundFrame::UnacknowledgedReceipt));
+        assert_eq!(state, ReceiptDeadline::Final);
+        assert!(!state.observe(InboundFrame::Progress));
+        assert!(state.is_armed());
+    }
 
     #[test]
     fn websocket_proof_lookup_uses_corresponding_http_origin() {
