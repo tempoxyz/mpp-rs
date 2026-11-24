@@ -24,6 +24,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use mpp::protocol::core::extract_payment_scheme;
 use mpp::server::{stripe, Mpp, StripeChargeMethod, StripeConfig};
 use mpp::{format_www_authenticate, parse_authorization};
 use rand::seq::IndexedRandom;
@@ -156,7 +157,8 @@ async fn fortune(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl
     // Check for payment credential in Authorization header
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
-            if let Ok(credential) = parse_authorization(auth_str) {
+            if let Some(Ok(credential)) = extract_payment_scheme(auth_str).map(parse_authorization)
+            {
                 match state.payment.stripe_verify_charge(&credential, "1").await {
                     Ok(receipt) => {
                         let fortune = FORTUNES

@@ -7,5 +7,5 @@ extend-ignore-re = [
   # Opaque base64/base64url protocol values are not words.
   '"[A-Za-z0-9_+/=-]{24,}"',
   # Preserve escaped café strings used by encoding tests and documentation.
-  'caf\\(?:xe9|u\{(?:00)?e9\})',
+  '(?i)caf\\(?:xe9|u\{(?:00)?e9\}|u00e9)',
 ]

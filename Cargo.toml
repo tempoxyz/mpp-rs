@@ -1,6 +1,6 @@
 [package]
 name = "mpp"
-version = "0.20.0"
+version = "0.22.0"
 edition = "2021"
 description = "Rust SDK for the Machine Payments Protocol (MPP)"
 license = "MIT OR Apache-2.0"
@@ -35,7 +35,7 @@ default = ["reqwest-default-tls"]
 
 # Side selection
 client = ["dep:reqwest"]
-server = ["tokio", "futures-core", "async-stream", "http-types"]
+server = ["tokio", "futures-core", "async-stream", "http-types", "dep:tracing"]
 
 # Method implementations
 evm = ["alloy", "hex"]
@@ -68,6 +68,10 @@ identity-tempo-id = [
   "dep:rsa",
   "dep:uuid",
 ]
+# Identity attestations (`Identity-Attestation` EdDSA tokens and issuer JWKS; requires identity)
+identity-attestation = ["identity", "dep:reqwest", "dep:ed25519-dalek"]
+# Email OTP identity attestations (requires identity-attestation)
+identity-email-otp = ["identity-attestation"]
 
 # Utilities
 utils = ["hex"]
@@ -147,10 +151,12 @@ base64 = "0.22"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"], optional = true }
 futures-core = { version = "0.3", optional = true }
 async-stream = { version = "0.3", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 alloy = { version = "2.1.0", default-features = false, features = [
   "contract",
   "provider-http",
   "reqwest",
+  "rlp",
   "rpc-types",
   "signer-local",
   "sol-types",
@@ -201,6 +207,7 @@ getrandom = { version = "0.2", optional = true }
 # Identity dependencies (optional)
 sfv = { version = "0.16", optional = true }
 rsa = { version = "0.10", default-features = false, features = ["std", "pkcs1v15"], optional = true }
+ed25519-dalek = { version = "3", default-features = false, features = ["fast", "zeroize"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2.180", optional = true }

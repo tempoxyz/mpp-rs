@@ -43,6 +43,7 @@ fn test_channel_state(channel_id: &str) -> ChannelState {
         pending_close: None,
         close_requested_at: 0,
         created_at: "2025-01-01T00:00:00Z".to_string(),
+        opening_commitment: None,
     }
 }
 
@@ -355,5 +356,368 @@ impl ChannelStore for ChangeAfterRead {
         Box<dyn Future<Output = Result<Option<ChannelState>, VerificationError>> + Send + '_>,
     > {
         self.inner.update_channel(channel_id, updater)
+    }
+}
+
+#[test]
+fn test_configurable_vouchers_advertised_only_when_enabled() {
+    use crate::protocol::traits::SessionMethod as SessionMethodTrait;
+    let method = test_session_method(Arc::new(InMemoryChannelStore::new()));
+    assert!(!method.configurable_vouchers());
+    let details = method.challenge_method_details().unwrap();
+    assert!(details.get("configurableVouchers").is_none());
+    let method = method.with_configurable_vouchers(true);
+    let details = method.challenge_method_details().unwrap();
+    assert_eq!(details["configurableVouchers"], serde_json::json!(true));
+    let options = method.voucher_options(Some(B256::repeat_byte(1)));
+    assert!(options.configurable);
+    assert_eq!(options.opening_commitment, Some(B256::repeat_byte(1)));
+}
+
+#[test]
+fn test_opening_commitment_from_open_receipt_logs() {
+    use alloy::sol_types::SolEvent;
+    let escrow = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+    let channel_id = B256::repeat_byte(0x21);
+    let commitment = B256::repeat_byte(0x42);
+    let event = precompile::IChannelReserveState::OpeningCommitmentRecorded {
+        channelId: channel_id,
+        signer: alloy::primitives::Address::repeat_byte(3),
+        commitment,
+    };
+    let log = |address, event: &precompile::IChannelReserveState::OpeningCommitmentRecorded| {
+        alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address,
+                data: event.encode_log_data(),
+            },
+            ..Default::default()
+        }
+    };
+    let logs = vec![log(escrow, &event)];
+    assert_eq!(
+        precompile::opening_commitment_from_logs(&logs, escrow, channel_id),
+        Some(commitment)
+    );
+    // Another channel, another emitter, or no event: no opening commitment.
+    assert_eq!(
+        precompile::opening_commitment_from_logs(&logs, escrow, B256::ZERO),
+        None
+    );
+    let foreign = vec![log(alloy::primitives::Address::repeat_byte(9), &event)];
+    assert_eq!(
+        precompile::opening_commitment_from_logs(&foreign, escrow, channel_id),
+        None
+    );
+    assert_eq!(
+        precompile::opening_commitment_from_logs(&[], escrow, channel_id),
+        None
+    );
+}
+
+const PRECOMPILE: alloy::primitives::Address =
+    tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+/// An `OpeningCommitmentRecorded` log from the escrow, as `eth_getLogs` returns it.
+fn commitment_log(channel_id: B256, signer: Address, commitment: B256) -> serde_json::Value {
+    use alloy::sol_types::SolEvent;
+    let event = precompile::IChannelReserveState::OpeningCommitmentRecorded {
+        channelId: channel_id,
+        signer,
+        commitment,
+    };
+    serde_json::to_value(alloy::rpc::types::Log {
+        inner: alloy::primitives::Log {
+            address: PRECOMPILE,
+            data: event.encode_log_data(),
+        },
+        block_hash: Some(B256::repeat_byte(0xdd)),
+        block_number: Some(1),
+        transaction_hash: Some(B256::repeat_byte(0xcc)),
+        transaction_index: Some(0),
+        log_index: Some(0),
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+fn commitment_result(commitment: B256) -> Bytes {
+    Bytes::from(commitment.to_vec())
+}
+
+#[tokio::test]
+async fn test_find_opening_commitment_found_absent_and_failed() {
+    let provider = |asserter: &alloy::providers::mock::Asserter| {
+        alloy::providers::ProviderBuilder::new_with_network::<TempoNetwork>()
+            .connect_mocked_client(asserter.clone())
+    };
+    let channel_id = B256::repeat_byte(0x21);
+    let signer = Address::repeat_byte(0x31);
+    let commitment = B256::repeat_byte(0x42);
+
+    // No commitment now: none at open either, and no log search.
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&commitment_result(B256::ZERO));
+    let found =
+        precompile::find_opening_commitment(&provider(&asserter), PRECOMPILE, channel_id, signer)
+            .await
+            .unwrap();
+    assert_eq!(found, B256::ZERO);
+    assert!(asserter.read_q().is_empty());
+
+    // A commitment now and the channel's event: its commitment.
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&commitment_result(B256::repeat_byte(0x77)));
+    asserter.push_success(&vec![commitment_log(channel_id, signer, commitment)]);
+    let found =
+        precompile::find_opening_commitment(&provider(&asserter), PRECOMPILE, channel_id, signer)
+            .await
+            .unwrap();
+    assert_eq!(found, commitment);
+
+    // A commitment now but no event: the signer registered after the open.
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&commitment_result(commitment));
+    asserter.push_success(&Vec::<serde_json::Value>::new());
+    let found =
+        precompile::find_opening_commitment(&provider(&asserter), PRECOMPILE, channel_id, signer)
+            .await
+            .unwrap();
+    assert_eq!(found, B256::ZERO);
+
+    // An event for another signer is not this channel's opening commitment.
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&commitment_result(commitment));
+    asserter.push_success(&vec![commitment_log(
+        channel_id,
+        Address::repeat_byte(0x99),
+        commitment,
+    )]);
+    assert!(precompile::find_opening_commitment(
+        &provider(&asserter),
+        PRECOMPILE,
+        channel_id,
+        signer
+    )
+    .await
+    .is_err());
+
+    // A failed read is an error, never a zero opening commitment.
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("rpc unavailable");
+    assert!(precompile::find_opening_commitment(
+        &provider(&asserter),
+        PRECOMPILE,
+        channel_id,
+        signer
+    )
+    .await
+    .is_err());
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&commitment_result(commitment));
+    asserter.push_failure_msg("query exceeds max results");
+    assert!(precompile::find_opening_commitment(
+        &provider(&asserter),
+        PRECOMPILE,
+        channel_id,
+        signer
+    )
+    .await
+    .is_err());
+}
+
+/// A TIP-1034 channel stored without its opening commitment, and a primitive
+/// voucher its authorized signer signed for it.
+fn unknown_commitment_channel(
+    amount: u128,
+) -> (
+    String,
+    ChannelState,
+    alloy::signers::local::PrivateKeySigner,
+    String,
+) {
+    use alloy::signers::SignerSync;
+    let signer = alloy::signers::local::PrivateKeySigner::random();
+    let channel_id = B256::repeat_byte(0xab);
+    let mut state = test_channel_state(&channel_id.to_string());
+    state.escrow_contract = PRECOMPILE;
+    state.authorized_signer = signer.address();
+    state.opening_commitment = None;
+    let hash = crate::protocol::methods::tempo::precompile_voucher::precompile_voucher_signing_hash_with_escrow(
+        channel_id,
+        amount,
+        PRECOMPILE,
+        state.chain_id,
+    )
+    .unwrap();
+    let signature = signer.sign_hash_sync(&hash).unwrap();
+    let signature = alloy::hex::encode_prefixed(signature.as_bytes());
+    (channel_id.to_string(), state, signer, signature)
+}
+
+#[tokio::test]
+async fn test_unknown_opening_commitment_without_event_is_resolved_zero_once() {
+    let (channel_id, state, _, signature) = unknown_commitment_channel(1_000);
+    let store = Arc::new(InMemoryChannelStore::new());
+    store.insert(&channel_id, state);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&commitment_result(B256::repeat_byte(0x42)));
+    asserter.push_success(&Vec::<serde_json::Value>::new());
+    let method = mocked_session_method(store.clone(), asserter.clone());
+
+    let accepted = method
+        .verify_and_accept_voucher(&channel_id, None, 1_000, &signature, 0)
+        .await
+        .unwrap();
+    assert_eq!(accepted.opening_commitment, Some(B256::ZERO));
+    assert!(asserter.read_q().is_empty(), "both lookups were made");
+
+    // The resolved opening commitment is recorded: later vouchers need no lookup.
+    let stored = store.get_channel(&channel_id).await.unwrap().unwrap();
+    assert_eq!(stored.opening_commitment, Some(B256::ZERO));
+    // With no RPC response queued, a lookup would fail as a network error.
+    let replay = method
+        .verify_and_accept_voucher(&channel_id, None, 1_000, &signature, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(replay.code, Some(ErrorCode::DeltaTooSmall));
+}
+
+#[tokio::test]
+async fn test_unknown_opening_commitment_with_event_rejects_primitive_voucher() {
+    let (channel_id, state, signer, signature) = unknown_commitment_channel(1_000);
+    let commitment = B256::repeat_byte(0x42);
+    let store = Arc::new(InMemoryChannelStore::new());
+    store.insert(&channel_id, state);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_success(&commitment_result(commitment));
+    asserter.push_success(&vec![commitment_log(
+        channel_id.parse().unwrap(),
+        signer.address(),
+        commitment,
+    )]);
+    let method = mocked_session_method(store.clone(), asserter.clone());
+
+    let err = method
+        .verify_and_accept_voucher(&channel_id, None, 1_000, &signature, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, Some(ErrorCode::InvalidSignature));
+    let stored = store.get_channel(&channel_id).await.unwrap().unwrap();
+    assert_eq!(stored.opening_commitment, Some(commitment));
+    assert_eq!(stored.highest_voucher_amount, 0);
+    assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test]
+async fn test_unknown_opening_commitment_lookup_failure_rejects_voucher() {
+    let (channel_id, state, _, signature) = unknown_commitment_channel(1_000);
+    let store = Arc::new(InMemoryChannelStore::new());
+    store.insert(&channel_id, state);
+    let asserter = alloy::providers::mock::Asserter::new();
+    asserter.push_failure_msg("rpc unavailable");
+    let method = mocked_session_method(store.clone(), asserter.clone());
+
+    assert!(method
+        .verify_and_accept_voucher(&channel_id, None, 1_000, &signature, 0)
+        .await
+        .is_err());
+    let stored = store.get_channel(&channel_id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.opening_commitment, None,
+        "an unknown opening commitment stays unknown"
+    );
+    assert_eq!(stored.highest_voucher_amount, 0);
+}
+
+#[cfg(feature = "client")]
+#[tokio::test]
+async fn test_precompile_vouchers_still_accept_p256_primitives() {
+    use crate::client::tempo::signing::{P256Jwk, TempoP256Signer};
+    use crate::protocol::methods::tempo::precompile_voucher::{
+        sign_precompile_voucher_primitive, VoucherVerifyOptions,
+    };
+    use alloy::signers::Signer;
+
+    let signer = TempoP256Signer::from_webcrypto_jwk(&P256Jwk {
+        kty: "EC".into(),
+        crv: "P-256".into(),
+        x: "OtOGGpViE5JRa7WT7wVYPtLlhm9ctiYKMBcjf9ibkK8".into(),
+        y: "0JYcfjcHWmeRo5xh9WKVsCttJlZ7YV5gqkHuHI6DOI0".into(),
+        d: "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI".into(),
+    })
+    .unwrap();
+    let channel_id = B256::repeat_byte(0xab);
+    let signature = sign_precompile_voucher_primitive(&signer, channel_id, 1_000, 42431)
+        .await
+        .unwrap();
+    let parsed = precompile::parse_signature_for::<crate::server::TempoProvider>(
+        PRECOMPILE,
+        &alloy::hex::encode_prefixed(&signature),
+    )
+    .unwrap();
+    assert_eq!(parsed, signature);
+    let verify = |options: VoucherVerifyOptions| {
+        precompile::verify_voucher_for(
+            PRECOMPILE,
+            42431,
+            channel_id,
+            1_000,
+            &parsed,
+            signer.address(),
+            &options,
+        )
+    };
+
+    // As before configurable vouchers: P-256 primitives verify under the
+    // defaults and on a zero opening commitment, with or without configurable vouchers.
+    // Session servers accepted them before this change, so they still do.
+    assert!(verify(VoucherVerifyOptions::default()));
+    for configurable in [false, true] {
+        assert!(verify(VoucherVerifyOptions {
+            configurable,
+            opening_commitment: Some(B256::ZERO),
+        }));
+        // A nonzero opening commitment accepts only `0x05`.
+        assert!(!verify(VoucherVerifyOptions {
+            configurable,
+            opening_commitment: Some(B256::repeat_byte(0x42)),
+        }));
+    }
+
+    // Through the server, on a channel stored with or without its opening commitment
+    // and with configurable vouchers off (the default) or on.
+    for (opening_commitment, configurable) in [
+        (Some(B256::ZERO), false),
+        (None, false),
+        (Some(B256::ZERO), true),
+    ] {
+        let channel_id_hex = channel_id.to_string();
+        let mut state = test_channel_state(&channel_id_hex);
+        state.escrow_contract = PRECOMPILE;
+        state.authorized_signer = signer.address();
+        state.opening_commitment = opening_commitment;
+        let store = Arc::new(InMemoryChannelStore::new());
+        store.insert(&channel_id_hex, state);
+        let asserter = alloy::providers::mock::Asserter::new();
+        if opening_commitment.is_none() {
+            // The lookup finds a zero commitment for the P-256 key.
+            asserter.push_success(&commitment_result(B256::ZERO));
+        }
+        let method = mocked_session_method(store.clone(), asserter.clone())
+            .with_configurable_vouchers(configurable);
+        let accepted = method
+            .verify_and_accept_voucher(
+                &channel_id_hex,
+                None,
+                1_000,
+                &alloy::hex::encode_prefixed(&signature),
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.highest_voucher_amount, 1_000);
+        assert_eq!(accepted.opening_commitment, Some(B256::ZERO));
+        assert!(asserter.read_q().is_empty());
     }
 }

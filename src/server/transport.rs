@@ -388,8 +388,11 @@ mod tests {
         let www_auth = resp.headers()[http_types::header::WWW_AUTHENTICATE]
             .to_str()
             .unwrap();
+        // The control character is sent as a `\uXXXX` escape, which parsers
+        // read back as quoted-pair text.
+        assert!(www_auth.contains(r#"description="bell\u0007""#));
         let parsed = crate::protocol::core::parse_www_authenticate(www_auth).unwrap();
-        assert_eq!(parsed.description, challenge.description);
+        assert_eq!(parsed.description.as_deref(), Some("bellu0007"));
     }
 
     #[test]

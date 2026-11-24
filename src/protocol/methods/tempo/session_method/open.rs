@@ -21,8 +21,8 @@ where
 {
     /// Verify that the open transaction's derived channel ID matches the claimed channelId.
     ///
-    /// Returns the address that signs the channel's vouchers and the deposit
-    /// the transaction opens it with.
+    /// Returns the address that signs the channel's vouchers, the deposit
+    /// the transaction opens it with, and the payer (the transaction's sender).
     pub(super) fn verify_open_channel_id_binding(
         tx_bytes: &[u8],
         claimed_channel_id: B256,
@@ -30,7 +30,7 @@ where
         chain_id: u64,
         expected_payee: Address,
         expected_token: Address,
-    ) -> Result<(Address, u128), VerificationError> {
+    ) -> Result<(Address, u128, Address), VerificationError> {
         use alloy::consensus::transaction::SignerRecoverable;
         use alloy::sol_types::SolCall;
 
@@ -90,7 +90,7 @@ where
             decoded.authorizedSigner
         };
 
-        Ok((voucher_signer, decoded.deposit))
+        Ok((voucher_signer, decoded.deposit, sender))
     }
 
     /// Handle 'open' action.
@@ -192,9 +192,17 @@ where
                     expected_token,
                     Self::resolve_operator(details)?,
                 )?;
+                precompile::verify_open_source(
+                    &*self.provider,
+                    credential.source.as_deref(),
+                    chain_id,
+                    descriptor.payer,
+                    &tx_bytes,
+                )
+                .await?;
                 (Some(descriptor), signer, deposit)
             } else {
-                let (signer, deposit) = Self::verify_open_channel_id_binding(
+                let (signer, deposit, payer) = Self::verify_open_channel_id_binding(
                     &tx_bytes,
                     channel_id_b256,
                     escrow,
@@ -202,6 +210,15 @@ where
                     expected_payee,
                     expected_token,
                 )?;
+                // mppx has no legacy escrow; bind the source here too so every open is covered.
+                precompile::verify_open_source(
+                    &*self.provider,
+                    credential.source.as_deref(),
+                    chain_id,
+                    payer,
+                    &tx_bytes,
+                )
+                .await?;
                 (None, signer, deposit)
             };
 
@@ -220,14 +237,43 @@ where
             ));
         }
         let sig_bytes = precompile::parse_signature_for::<P>(escrow, signature_str)?;
-        if !precompile::verify_voucher_for(
-            escrow,
-            chain_id,
-            channel_id_b256,
-            cumulative_amount,
-            &sig_bytes,
-            voucher_signer,
-        ) {
+        let verify_open_voucher = |signer: Address, opening_commitment: Option<B256>| {
+            precompile::verify_voucher_for(
+                escrow,
+                chain_id,
+                channel_id_b256,
+                cumulative_amount,
+                &sig_bytes,
+                signer,
+                &self.voucher_options(opening_commitment),
+            )
+        };
+        // From T15 (TIP-1166) a signer with a configurable account commitment
+        // can only open with that commitment as salt, which becomes the
+        // channel's opening commitment; any other signer's channel opens with
+        // a zero one. Read the signer's commitment now so the voucher is
+        // checked against the commitment the open records: a commitment never
+        // returns to zero, and one that changes before inclusion reverts the
+        // open. The receipt is checked again below.
+        let expected_commitment = match precompile_descriptor.as_ref() {
+            Some(descriptor) if !descriptor.salt.is_zero() => {
+                let signer_commitment =
+                    precompile::get_config_commitment(self.provider.as_ref(), voucher_signer)
+                        .await?;
+                if signer_commitment.is_zero() {
+                    Some(B256::ZERO)
+                } else if signer_commitment == descriptor.salt {
+                    Some(signer_commitment)
+                } else {
+                    return Err(VerificationError::credential_mismatch(
+                        "descriptor salt is not the voucher signer's configuration commitment",
+                    ));
+                }
+            }
+            Some(_) => Some(B256::ZERO),
+            None => None,
+        };
+        if !verify_open_voucher(voucher_signer, expected_commitment) {
             return Err(VerificationError::invalid_signature(
                 "invalid voucher signature",
             ));
@@ -251,6 +297,20 @@ where
             )));
         }
         let open_tx_hash = tx_receipt.transaction_hash().to_string();
+        // The open's receipt settles the opening commitment: zero (recorded as such,
+        // not as unknown) when the escrow recorded none.
+        let opening_commitment = if precompile_descriptor.is_some() {
+            Some(
+                precompile::opening_commitment_from_logs(
+                    tx_receipt.logs(),
+                    escrow,
+                    channel_id_b256,
+                )
+                .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
 
         let on_chain = self
             .read_channel(escrow, channel_id_b256, precompile_descriptor.as_ref())
@@ -306,17 +366,11 @@ where
             ));
         }
 
-        // The signature was verified against the transaction's signer above;
-        // only a channel that reports a different one needs another check.
-        if authorized_signer != voucher_signer
-            && !precompile::verify_voucher_for(
-                escrow,
-                chain_id,
-                channel_id_b256,
-                cumulative_amount,
-                &sig_bytes,
-                authorized_signer,
-            )
+        // The signature was verified against the transaction's signer and the
+        // expected opening commitment above; only a channel that reports a
+        // different signer or opening commitment needs another check.
+        if (authorized_signer != voucher_signer || opening_commitment != expected_commitment)
+            && !verify_open_voucher(authorized_signer, opening_commitment)
         {
             return Err(VerificationError::invalid_signature(
                 "invalid voucher signature",
@@ -332,6 +386,7 @@ where
             settlement_route: accepted_settlement_route,
             cumulative_amount,
             signature: sig_bytes,
+            opening_commitment,
         };
         let updated = self
             .store

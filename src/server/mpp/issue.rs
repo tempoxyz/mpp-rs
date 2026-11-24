@@ -70,16 +70,42 @@ where
         &self,
         challenge: PaymentChallenge,
     ) -> Result<PaymentChallenge> {
-        self.pin_opaque(challenge, self.config.nonce)
+        self.pin_opaque(challenge, self.config.nonce, false)
     }
 
-    /// [`apply_pinned_opaque`](Self::apply_pinned_opaque), adding the nonce
-    /// only when `nonce` is set: building the request a route expects needs
-    /// no nonce, so it draws no random bytes.
+    /// [`apply_pinned_opaque`](Self::apply_pinned_opaque) for a Tempo charge
+    /// challenge, with a nonce when `nonce` is set: while
+    /// `zone_credential_grace` is on, its `opaque` also carries the HMAC-bound
+    /// expiry grace marker (`_mppx_expiry_grace`), as mppx's
+    /// `CredentialExpiry.issuanceMeta`. Only a challenge issued with the
+    /// marker gets the grace.
+    #[cfg(feature = "tempo")]
+    pub(super) fn apply_charge_opaque(
+        &self,
+        challenge: PaymentChallenge,
+        nonce: bool,
+    ) -> Result<PaymentChallenge> {
+        self.pin_opaque(
+            challenge,
+            nonce,
+            !self.config.zone_credential_grace.is_zero(),
+        )
+    }
+
+    /// Stamp the route's `opaque`, adding the nonce only when `nonce` is
+    /// set (building the request a route expects needs no nonce, so it draws
+    /// no random bytes) and the expiry grace marker when `expiry_grace` is.
     #[cfg(any(feature = "tempo", feature = "stripe"))]
-    fn pin_opaque(&self, mut challenge: PaymentChallenge, nonce: bool) -> Result<PaymentChallenge> {
+    fn pin_opaque(
+        &self,
+        mut challenge: PaymentChallenge,
+        nonce: bool,
+        expiry_grace: bool,
+    ) -> Result<PaymentChallenge> {
         self.check_secret_key()?;
         let opaque = self.config.opaque.clone().or(challenge.opaque.take());
+        let opaque =
+            crate::protocol::core::expiry_grace::with_expiry_grace(opaque.as_ref(), expiry_grace);
         let opaque = if nonce { with_nonce(opaque)? } else { opaque };
         if opaque.is_none() && self.config.credential_header.is_none() {
             return Ok(challenge);
@@ -98,6 +124,16 @@ where
             challenge.header.as_deref(),
         );
         Ok(challenge)
+    }
+
+    /// Refuse a charge when [`Mpp::create()`] found the default in-memory
+    /// replay store in production or on a multi-instance platform.
+    #[cfg(feature = "tempo")]
+    fn ensure_charge_store(&self) -> Result<()> {
+        match &self.config.charge_store_refusal {
+            Some(refusal) => Err(crate::error::MppError::InvalidConfig(refusal.clone())),
+            None => Ok(()),
+        }
     }
 
     #[cfg(feature = "tempo")]
@@ -151,6 +187,7 @@ where
         amount: &str,
         options: crate::server::ChargeOptions<'_>,
     ) -> Result<Vec<PaymentChallenge>> {
+        self.ensure_charge_store()?;
         self.require_bound_config()?;
         self.config
             .currencies
@@ -186,6 +223,7 @@ where
         options: &crate::server::ChargeOptions<'_>,
         nonce: bool,
     ) -> Result<PaymentChallenge> {
+        self.ensure_charge_store()?;
         let (_, recipient) = self.require_bound_config()?;
         let base_units = crate::server::parse_dollar_amount(amount, self.config.decimals)?;
         let mut request = ChargeRequest {
@@ -217,6 +255,9 @@ where
                 validate_charge_modes(supported_modes)?;
                 details.insert("supportedModes".into(), serde_json::json!(supported_modes));
             }
+            if let Some(zones) = &self.config.zones {
+                details.insert("zones".into(), zones.clone());
+            }
             if !details.is_empty() {
                 request.method_details = Some(serde_json::Value::Object(details));
             }
@@ -228,7 +269,7 @@ where
             options.expires,
             options.description,
         )?;
-        self.pin_opaque(challenge, nonce)
+        self.apply_charge_opaque(challenge, nonce)
     }
 
     /// Generate a charge challenge with explicit parameters (base units).
@@ -260,18 +301,39 @@ where
         expires: Option<&str>,
         description: Option<&str>,
     ) -> Result<PaymentChallenge> {
+        self.ensure_charge_store()?;
         // Verification fails closed on a missing `chainId` when one is pinned,
         // so a caller-built request must carry it like `charge()` requests do.
+        // Configured Zones bind credentials to the route the same way, so
+        // they are advertised here as `charge()` advertises them.
         let mut request = request.clone();
-        if let Some(chain_id) = self.config.chain_id {
+        if self.config.chain_id.is_some() || self.config.zones.is_some() {
             let details = request
                 .method_details
                 .get_or_insert_with(|| serde_json::json!({}));
             if let Some(details) = details.as_object_mut() {
-                details
-                    .entry("chainId")
-                    .or_insert_with(|| serde_json::json!(chain_id));
+                if let Some(chain_id) = self.config.chain_id {
+                    details
+                        .entry("chainId")
+                        .or_insert_with(|| serde_json::json!(chain_id));
+                }
+                if let Some(zones) = &self.config.zones {
+                    details.entry("zones").or_insert_with(|| zones.clone());
+                }
             }
+        }
+        // A relay does not verify Zone credentials, and a payer's Zone
+        // withdrawal cannot be undone once the relay rejects its credential.
+        if self.config.relay
+            && request
+                .method_details
+                .as_ref()
+                .and_then(|details| details.get("zones"))
+                .is_some_and(|zones| !zones.is_null())
+        {
+            return Err(crate::error::MppError::InvalidConfig(
+                "methodDetails.zones cannot be issued with relay(...): the relay does not verify Zone credentials".into(),
+            ));
         }
         let challenge = crate::protocol::methods::tempo::charge_challenge_with_options(
             &self.config.secret_key,
@@ -280,7 +342,7 @@ where
             expires,
             description,
         )?;
-        self.apply_pinned_opaque(challenge)
+        self.apply_charge_opaque(challenge, self.config.nonce)
     }
 
     /// The charge request [`charge_with_options()`](Self::charge_with_options)
@@ -425,8 +487,10 @@ impl<S> Mpp<crate::protocol::methods::stripe::method::ChargeMethod, S> {
                 digest: None,
                 opaque: None,
                 header: None,
+                legacy_unicode_escape: false,
             },
             nonce,
+            false,
         )
     }
 

@@ -70,8 +70,8 @@ pub use protocol::core::{
 // Header parsing/formatting
 pub use protocol::core::{
     format_authorization, format_receipt, format_www_authenticate, format_www_authenticate_many,
-    parse_authorization, parse_receipt, parse_www_authenticate, parse_www_authenticate_all,
-    parse_www_authenticate_all_bytes,
+    parse_authorization, parse_payable_challenges, parse_receipt, parse_www_authenticate,
+    parse_www_authenticate_all, parse_www_authenticate_all_bytes,
 };
 
 // Schema types

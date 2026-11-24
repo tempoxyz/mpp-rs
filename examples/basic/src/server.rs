@@ -22,6 +22,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use mpp::protocol::core::extract_payment_scheme;
 use mpp::protocol::methods::tempo::PATH_USD;
 use mpp::server::{tempo, Mpp, TempoChargeMethod, TempoConfig};
 use mpp::{format_www_authenticate_many, parse_authorization, PrivateKeySigner};
@@ -103,7 +104,8 @@ async fn health() -> impl IntoResponse {
 async fn ping(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> impl IntoResponse {
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
-            if let Ok(credential) = parse_authorization(auth_str) {
+            if let Some(Ok(credential)) = extract_payment_scheme(auth_str).map(parse_authorization)
+            {
                 // Only a credential paid for this route's price is accepted.
                 match payment.verify_charge(&credential, "0.01").await {
                     Ok(receipt) => {
@@ -150,7 +152,8 @@ async fn fortune(State(payment): State<Arc<Payment>>, headers: HeaderMap) -> imp
     // Check for payment credential in Authorization header
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth.to_str() {
-            if let Ok(credential) = parse_authorization(auth_str) {
+            if let Some(Ok(credential)) = extract_payment_scheme(auth_str).map(parse_authorization)
+            {
                 // Only a credential paid for this route's price is accepted,
                 // so paying for `/api/ping` does not unlock a fortune.
                 match payment.verify_charge(&credential, "1").await {

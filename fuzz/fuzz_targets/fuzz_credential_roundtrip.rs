@@ -1,6 +1,7 @@
 //! Format → parse round trip over structured credentials.
 //!
-//! - `format_authorization` output is a single `Payment <base64url>` token.
+//! - `format_authorization` output is a single `Payment <base64url>` token,
+//!   and it fails only for an echoed `header` that cannot be emitted.
 //! - Every credential whose challenge echo is well formed parses back field
 //!   for field, also when other schemes share the header field.
 //! - Charge payloads keep their type and data.
@@ -9,9 +10,11 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
+use mpp::protocol::core::extract_payment_scheme;
 use mpp::{format_authorization, parse_authorization, PaymentCredential, PaymentPayload};
 use mpp_fuzz::{
-    assert_same, has_supported_header, is_well_formed, wire_header, ChallengeInput, Json,
+    assert_same, has_formattable_header, has_supported_header, is_well_formed, wire_header,
+    ChallengeInput, Json,
 };
 
 #[derive(Debug, Arbitrary)]
@@ -54,7 +57,17 @@ fuzz_target!(|input: Input| {
     };
     credential.source = input.source.clone();
 
-    let formatted = format_authorization(&credential).expect("credentials always format");
+    // Only a `header` that cannot be emitted fails to format.
+    let formatted = match format_authorization(&credential) {
+        Ok(formatted) => formatted,
+        Err(error) => {
+            assert!(
+                !has_formattable_header(credential.challenge.header.as_deref()),
+                "{error}: {credential:?}"
+            );
+            return;
+        }
+    };
     let token = formatted.strip_prefix("Payment ").expect("Payment scheme");
     assert!(token
         .bytes()
@@ -65,7 +78,9 @@ fuzz_target!(|input: Input| {
         Some(true) => format!("Bearer dG9rZW4, {formatted}"),
         Some(false) => format!("{formatted}, Bearer dG9rZW4"),
     };
-    let parsed = match parse_authorization(&header) {
+    // A whole Authorization field goes through extract_payment_scheme first.
+    let payment = extract_payment_scheme(&header).unwrap_or(&header);
+    let parsed = match parse_authorization(payment) {
         Ok(parsed) => parsed,
         Err(error) => {
             assert!(

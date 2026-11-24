@@ -24,6 +24,7 @@
 //! - [`is_payment_required`]: Check if a JSON-RPC error requires a (new) payment attempt
 //! - [`extract_challenges`]: Extract challenges from a payment-required error
 //! - [`extract_challenges_from_data`]: Extract challenges from a payment-required payload
+//! - [`error_payment_answer`] / [`result_payment_answer`]: Classify the answer to a paid call as mppx's client does
 //! - [`attach_credential`] / [`try_attach_credential`]: Attach a credential to MCP request params `_meta`
 //! - [`extract_receipt`]: Extract the receipt from MCP result `_meta`
 //! - [`client::McpClient`]: Wrap an MCP SDK adapter with automatic payment handling
@@ -128,11 +129,18 @@ pub struct McpPaymentErrorData {
 /// Extract a payment credential from MCP request metadata (`_meta`).
 ///
 /// Expects the `_meta` object (not the full params). Returns `None` if the
-/// credential key is missing or the value cannot be deserialized.
+/// credential key is missing or the value cannot be deserialized, including
+/// when its echoed challenge selects a credential header other than
+/// `Payment-Authorization`.
 pub fn extract_credential(meta: &serde_json::Value) -> Option<PaymentCredential> {
     let mut credential = meta.get(CREDENTIAL_META_KEY)?.clone();
     normalize_wire_challenge(credential.get_mut("challenge")?)?;
-    serde_json::from_value(credential).ok()
+    let mut credential: PaymentCredential = serde_json::from_value(credential).ok()?;
+    credential.challenge.header = crate::protocol::core::parse_advertised_credential_header(
+        credential.challenge.header.as_deref(),
+    )
+    .ok()?;
+    Some(credential)
 }
 
 /// Create an MCP payment-required error response.
@@ -246,6 +254,86 @@ pub fn is_payment_required(error: &serde_json::Value) -> bool {
     })
 }
 
+/// How a client treats an answer to a paid MCP call that asks for payment,
+/// as mppx's client does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaymentAnswer {
+    /// Payment required (HTTP 402): the client may pay a new Challenge it
+    /// offers, or resend the same Credential when it offers the same Challenge.
+    PaymentRequired,
+    /// A server failure (HTTP 5xx): the payment may have settled, so the
+    /// answer is final, and the payment is neither rolled back nor made again.
+    ServerError,
+    /// Any other refusal, such as HTTP 410 or another 4xx: the answer is final.
+    Rejected,
+}
+
+/// Classifies an MCP JSON-RPC error that answered a paid call.
+///
+/// An internal error (`-32603`), an `internal-payment-error` problem or an
+/// `httpStatus` of 500 or more is a server error. Otherwise
+/// [`PAYMENT_REQUIRED_CODE`] is payment required, and so is
+/// [`PAYMENT_VERIFICATION_FAILED_CODE`] when its `data.httpStatus` is 402 or
+/// absent. Anything else is a rejection.
+pub fn error_payment_answer(error: &serde_json::Value) -> PaymentAnswer {
+    let code = error.get("code").and_then(serde_json::Value::as_i64);
+    let data = error.get("data");
+    if code == Some(INTERNAL_ERROR_CODE.into()) || data.is_some_and(is_server_failure) {
+        PaymentAnswer::ServerError
+    } else if code == Some(PAYMENT_REQUIRED_CODE.into())
+        || (code == Some(PAYMENT_VERIFICATION_FAILED_CODE.into())
+            && data.is_none_or(asks_for_payment))
+    {
+        PaymentAnswer::PaymentRequired
+    } else {
+        PaymentAnswer::Rejected
+    }
+}
+
+/// Classifies a tool result's payment requirement like
+/// [`error_payment_answer`]: payment required when its `httpStatus` is 402 or
+/// absent, a server error when it is 500 or more or the problem is
+/// `internal-payment-error`, and a rejection otherwise.
+///
+/// Expects the result `_meta` object (not the complete tool result). Returns
+/// `None` when it carries no payment requirement.
+pub fn result_payment_answer(meta: &serde_json::Value) -> Option<PaymentAnswer> {
+    let data = meta.get(PAYMENT_REQUIRED_META_KEY)?;
+    Some(if is_server_failure(data) {
+        PaymentAnswer::ServerError
+    } else if asks_for_payment(data) {
+        PaymentAnswer::PaymentRequired
+    } else {
+        PaymentAnswer::Rejected
+    })
+}
+
+/// Whether a payment-required payload's `httpStatus` is 402 or absent.
+fn asks_for_payment(data: &serde_json::Value) -> bool {
+    match data.get("httpStatus") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(status) => status.as_u64() == Some(402),
+    }
+}
+
+/// Whether a payment-required payload reports a server failure.
+fn is_server_failure(data: &serde_json::Value) -> bool {
+    let server_status = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|status| status >= 500)
+    };
+    let problem = data.get("problem");
+    let internal = problem
+        .and_then(|problem| problem.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|problem_type| problem_type.strip_prefix(crate::error::CORE_PROBLEM_TYPE_BASE))
+        .is_some_and(|suffix| suffix == "/internal-payment-error");
+    internal
+        || server_status(data.get("httpStatus"))
+        || server_status(problem.and_then(|problem| problem.get("status")))
+}
+
 /// Extract challenges from an MCP payment-required error.
 ///
 /// Returns `None` if the error has no `data.challenges` array or
@@ -259,6 +347,11 @@ pub fn extract_challenges(error: &serde_json::Value) -> Option<Vec<PaymentChalle
 /// Accepts MCP's expanded JSON `request` object and normalizes it to the
 /// base64url representation retained by the core protocol types. Malformed
 /// entries are skipped so that the remaining alternatives stay usable.
+///
+/// A challenge whose `header` selects anything but `Payment-Authorization`
+/// is skipped too, as no credential may be sent for it. Returns `None` when
+/// no valid challenge remains; [`extract_result_challenges`] instead keeps
+/// such a payment requirement in a tool result.
 pub fn extract_challenges_from_data(
     payment_required: &serde_json::Value,
 ) -> Option<Vec<PaymentChallenge>> {
@@ -277,19 +370,58 @@ pub fn extract_receipt(meta: &serde_json::Value) -> Option<Receipt> {
 /// Extract challenges from an MCP tool result's payment-required metadata.
 ///
 /// Expects the result `_meta` object (not the complete tool result). Returns
-/// `None` when the metadata key is absent or it lists no valid challenge.
+/// `None` when the metadata key is absent or it lists no valid challenge,
+/// except that it returns `Some` with an empty list when every listed
+/// challenge was skipped and at least one of them selected a credential header
+/// other than `Payment-Authorization` or named a method outside the
+/// `1*LOWERALPHA` grammar (such as `tempo-v2` or `x402`). The result still
+/// requires payment, so [`McpClient`](client::McpClient) returns it unpaid, and
+/// rolls back a paid retry answered with it instead of committing it.
 pub fn extract_result_challenges(meta: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
-    extract_challenges_from_data(meta.get(PAYMENT_REQUIRED_META_KEY)?)
+    let entries = meta
+        .get(PAYMENT_REQUIRED_META_KEY)?
+        .get("challenges")?
+        .as_array()?;
+    let challenges = parse_wire_challenges(entries);
+    (!challenges.is_empty()
+        || entries
+            .iter()
+            .any(|entry| has_unsupported_credential_header(entry) || has_invalid_method(entry)))
+    .then_some(challenges)
 }
 
 fn extract_wire_challenges(value: &serde_json::Value) -> Option<Vec<PaymentChallenge>> {
-    let challenges: Vec<_> = value
-        .as_array()?
+    let challenges = parse_wire_challenges(value.as_array()?);
+    (!challenges.is_empty()).then_some(challenges)
+}
+
+fn parse_wire_challenges(entries: &[serde_json::Value]) -> Vec<PaymentChallenge> {
+    entries
         .iter()
         .cloned()
         .filter_map(parse_wire_challenge)
-        .collect();
-    (!challenges.is_empty()).then_some(challenges)
+        .collect()
+}
+
+/// Returns whether a wire challenge selects a credential header other than
+/// `Payment-Authorization`, which clients must not send a credential for.
+fn has_unsupported_credential_header(challenge: &serde_json::Value) -> bool {
+    challenge.get("header").is_some_and(|header| {
+        let header = header.as_str().unwrap_or_default();
+        crate::protocol::core::parse_advertised_credential_header(Some(header)).is_err()
+    })
+}
+
+/// Returns whether a wire challenge names a method outside the method-id
+/// grammar (`1*LOWERALPHA`): an offer this client can never answer.
+///
+/// Checks the raw string, as the parser does: `MethodName::new` lowercases,
+/// so `Tempo` would otherwise pass here while the parser rejects it.
+fn has_invalid_method(challenge: &serde_json::Value) -> bool {
+    challenge
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|method| !crate::protocol::core::types::is_valid_method_id(method))
 }
 
 fn parse_wire_challenge(mut challenge: serde_json::Value) -> Option<PaymentChallenge> {
@@ -320,6 +452,14 @@ fn serialize_wire_challenges<S: Serializer>(
 }
 
 fn wire_challenge(challenge: &PaymentChallenge) -> Result<serde_json::Value, MppError> {
+    // Refuse what extract_challenges would discard, as format_www_authenticate
+    // does for HTTP, so a server never offers a Challenge its clients can't read.
+    if !challenge.method.is_valid() {
+        return Err(MppError::invalid_challenge_reason(format!(
+            "Invalid method: \"{}\". Must be lowercase letters a-z per spec.",
+            challenge.method
+        )));
+    }
     let mut value = serde_json::to_value(challenge)
         .map_err(|error| MppError::InvalidConfig(error.to_string()))?;
     value["request"] = challenge.request.decode_value()?;
@@ -551,6 +691,90 @@ mod tests {
         }
     }
 
+    // ---- credential header ----
+
+    fn wire_challenge_with_header(id: &str, header: &str) -> serde_json::Value {
+        let mut value = serde_json::to_value(test_challenge()).unwrap();
+        value["id"] = id.into();
+        value["header"] = header.into();
+        value
+    }
+
+    #[test]
+    fn test_extract_challenges_skips_unsupported_credential_header() {
+        for header in ["Authorization", "", "X-Payment"] {
+            let valid = serde_json::to_value(test_challenge()).unwrap();
+            let data = serde_json::json!({
+                "challenges": [wire_challenge_with_header("unsupported", header), valid]
+            });
+            let challenges = extract_challenges_from_data(&data).unwrap();
+            assert_eq!(challenges.len(), 1, "{header:?}");
+            assert_ne!(challenges[0].id, "unsupported", "{header:?}");
+
+            let rejected = wire_challenge_with_header("unsupported", header);
+            for challenges in [
+                serde_json::json!([rejected]),
+                serde_json::json!([rejected, {}]),
+            ] {
+                let data = serde_json::json!({ "challenges": challenges });
+                assert!(extract_challenges_from_data(&data).is_none(), "{header:?}");
+                let meta = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: data });
+                assert_eq!(
+                    extract_result_challenges(&meta).map(|c| c.len()),
+                    Some(0),
+                    "{header:?}"
+                );
+            }
+        }
+
+        let data = serde_json::json!({
+            "challenges": [wire_challenge_with_header("lower", "payment-authorization")]
+        });
+        let challenges = extract_challenges_from_data(&data).unwrap();
+        assert_eq!(
+            challenges[0].header.as_deref(),
+            Some("payment-authorization")
+        );
+        let meta = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: data });
+        assert_eq!(extract_result_challenges(&meta).unwrap().len(), 1);
+
+        // Offers only in methods outside the grammar still require payment.
+        for method in ["tempo-v2", "x402", "Tempo", "TEMPO"] {
+            let mut offer = serde_json::to_value(test_challenge()).unwrap();
+            offer["method"] = method.into();
+            let meta =
+                serde_json::json!({ PAYMENT_REQUIRED_META_KEY: {"challenges": [offer, {}]} });
+            assert_eq!(
+                extract_result_challenges(&meta).map(|c| c.len()),
+                Some(0),
+                "{method}"
+            );
+        }
+
+        let malformed = serde_json::json!({ PAYMENT_REQUIRED_META_KEY: {"challenges": [{}]} });
+        assert!(extract_result_challenges(&malformed).is_none());
+        assert!(extract_result_challenges(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn test_extract_credential_rejects_unsupported_echoed_header() {
+        let challenge = test_challenge().with_header("Payment-Authorization");
+        let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0x1"));
+        let mut meta = serde_json::json!({CREDENTIAL_META_KEY: credential});
+        assert_eq!(
+            extract_credential(&meta)
+                .unwrap()
+                .challenge
+                .header
+                .as_deref(),
+            Some("Payment-Authorization")
+        );
+        for header in ["Authorization", "", "X-Payment"] {
+            meta[CREDENTIAL_META_KEY]["challenge"]["header"] = header.into();
+            assert!(extract_credential(&meta).is_none(), "{header:?}");
+        }
+    }
+
     // ---- extract_credential ----
 
     #[test]
@@ -629,6 +853,20 @@ mod tests {
         challenge.request = Base64UrlJson::from_raw("not json");
 
         assert!(serde_json::to_value(payment_required_error(&challenge)).is_err());
+    }
+
+    #[test]
+    fn test_payment_required_error_rejects_invalid_method() {
+        for method in ["x402", "tempo-v2", "a:b"] {
+            let mut challenge = test_challenge();
+            challenge.method = method.into();
+
+            let error = serde_json::to_value(payment_required_error(&challenge)).unwrap_err();
+            assert!(
+                error.to_string().contains("Invalid method"),
+                "{method}: {error}"
+            );
+        }
     }
 
     // ---- attach_receipt ----
@@ -710,6 +948,120 @@ mod tests {
     fn test_is_payment_required_no_code() {
         let error = json!({"message": "something"});
         assert!(!is_payment_required(&error));
+    }
+
+    // ---- payment answers ----
+
+    #[test]
+    fn test_payment_answer_classifies_payment_errors() {
+        use crate::error::PaymentErrorDetails;
+        use PaymentAnswer::*;
+
+        // (problem, its answer as a JSON-RPC error, its answer in a result)
+        let cases = [
+            (
+                PaymentErrorDetails::core("payment-required"),
+                PaymentRequired,
+                PaymentRequired,
+            ),
+            (
+                PaymentErrorDetails::core("verification-failed"),
+                PaymentRequired,
+                PaymentRequired,
+            ),
+            (
+                PaymentErrorDetails::core("credit_insufficient"),
+                PaymentRequired,
+                PaymentRequired,
+            ),
+            (
+                PaymentErrorDetails::core("internal-payment-error").with_status(500),
+                ServerError,
+                ServerError,
+            ),
+            // The problem type alone marks a server failure.
+            (
+                PaymentErrorDetails::core("internal-payment-error"),
+                ServerError,
+                ServerError,
+            ),
+            (
+                PaymentErrorDetails::new("https://example.test/settlement-failed").with_status(503),
+                ServerError,
+                ServerError,
+            ),
+            (
+                PaymentErrorDetails::session("channel-not-found").with_status(410),
+                Rejected,
+                Rejected,
+            ),
+            // -32602 never asks for payment; a result has no code, and its
+            // absent status asks for payment.
+            (
+                PaymentErrorDetails::core("malformed-credential"),
+                Rejected,
+                PaymentRequired,
+            ),
+        ];
+
+        for (problem, error_answer, result_answer) in cases {
+            let problem_type = problem.problem_type.clone();
+            let error = payment_required_error_with_problem(&test_challenge(), problem);
+            let error = serde_json::to_value(&error).unwrap();
+            assert_eq!(error_payment_answer(&error), error_answer, "{problem_type}");
+            let meta = json!({PAYMENT_REQUIRED_META_KEY: error["data"]});
+            assert_eq!(
+                result_payment_answer(&meta),
+                Some(result_answer),
+                "{problem_type}"
+            );
+        }
+
+        // A server failure is never paid again, even under -32042.
+        assert_eq!(
+            error_payment_answer(
+                &json!({"code": -32042, "message": "x", "data": {"httpStatus": 500}})
+            ),
+            ServerError
+        );
+        let required = serde_json::to_value(payment_required_error(&test_challenge())).unwrap();
+        assert_eq!(error_payment_answer(&required), PaymentRequired);
+        // -32042 asks for payment whatever its status; -32043 only at 402.
+        assert_eq!(
+            error_payment_answer(
+                &json!({"code": -32042, "message": "x", "data": {"httpStatus": 410}})
+            ),
+            PaymentRequired
+        );
+        assert_eq!(
+            error_payment_answer(
+                &json!({"code": -32043, "message": "x", "data": {"httpStatus": 410}})
+            ),
+            Rejected
+        );
+        assert_eq!(
+            error_payment_answer(&json!({"code": -32043, "message": "x"})),
+            PaymentRequired
+        );
+        assert_eq!(
+            error_payment_answer(&json!({"code": -32603, "message": "Internal error"})),
+            ServerError
+        );
+        assert_eq!(
+            error_payment_answer(&json!({"code": -32600, "message": "Invalid Request"})),
+            Rejected
+        );
+        assert_eq!(
+            result_payment_answer(
+                &json!({PAYMENT_REQUIRED_META_KEY: {"httpStatus": 500, "challenges": []}})
+            ),
+            Some(ServerError)
+        );
+        assert_eq!(
+            result_payment_answer(&json!({PAYMENT_REQUIRED_META_KEY: {"challenges": []}})),
+            Some(PaymentRequired)
+        );
+        assert_eq!(result_payment_answer(&json!({})), None);
     }
 
     // ---- extract_challenges ----
@@ -1003,6 +1355,7 @@ mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
         assert!(echoed_challenge.verify(secret));
 

@@ -48,8 +48,13 @@ pub struct TempoBuilder {
     pub(crate) fee_payer_fee_token: Option<Address>,
     pub(crate) remote_fee_payer: Option<TempoRemoteFeePayer>,
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
+    /// Whether [`store`](Self::store) or [`without_store`](Self::without_store)
+    /// was called, so `store` is not the default in-memory one.
+    pub(crate) store_configured: bool,
     pub(crate) relay: Option<TempoRelayConfig>,
     pub(crate) requires_auth: bool,
+    pub(crate) zones: Option<crate::protocol::methods::tempo::zone::Zones>,
+    pub(crate) zone_credential_grace: std::time::Duration,
 }
 
 impl TempoBuilder {
@@ -219,17 +224,32 @@ impl TempoBuilder {
 
     /// Set the replay-protection store (default: in-memory).
     ///
-    /// Provide a shared backend (Redis, SQL, etc.) for multi-instance deployments.
-    /// The store, the default one included, also makes zero-amount proof
-    /// credentials single-use per challenge.
+    /// Provide a shared backend (Redis, SQL, etc.) so consumed hashes and proofs
+    /// are visible across all server instances. The store, the default one
+    /// included, also makes zero-amount proof credentials single-use per
+    /// challenge.
+    ///
+    /// If omitted, a handler from [`Mpp::create()`](super::Mpp::create)
+    /// logs a warning and refuses to issue or verify charges (mppx refuses to
+    /// start) when `MPP_ENV` or `NODE_ENV` is `production` or one of these
+    /// platform variables is set: `AWS_LAMBDA_FUNCTION_NAME`,
+    /// `DENO_DEPLOYMENT_ID`, `DYNO`, `FLY_APP_NAME`, `K_SERVICE`, `NETLIFY`,
+    /// `RAILWAY_ENVIRONMENT`, `RENDER` or `VERCEL`, unless a relay is
+    /// configured. Sessions, whose method has its own store, are unaffected.
+    /// Otherwise it falls back to an in-memory store, so other multi-instance
+    /// deployments, such as Kubernetes replicas, are not detected and must
+    /// pass a shared store themselves. Pass `Arc::new(MemoryStore::new())`
+    /// explicitly to accept replay protection scoped to one instance.
     pub fn store(mut self, store: std::sync::Arc<dyn crate::store::Store>) -> Self {
         self.store = Some(store);
+        self.store_configured = true;
         self
     }
 
     /// Disable replay-protection storage (removes the default in-memory store).
     pub fn without_store(mut self) -> Self {
         self.store = None;
+        self.store_configured = true;
         self
     }
 
@@ -243,6 +263,40 @@ impl TempoBuilder {
     /// remains available for application authentication.
     pub fn requires_auth(mut self, enabled: bool) -> Self {
         self.requires_auth = enabled;
+        self
+    }
+
+    /// Accept charges paid from these Zones, as mppx's `zones` server option:
+    /// [`Zones::Any`](crate::protocol::methods::tempo::zone::Zones::Any) for any
+    /// Zone on the challenge's chain, or a list of Zone IDs
+    /// ([`Zones::ids`](crate::protocol::methods::tempo::zone::Zones::ids)).
+    ///
+    /// Charge challenges then advertise them in `methodDetails.zones`, and a
+    /// client may pay from a Zone balance with a `zone` Credential: a
+    /// withdrawal to the recipient, settled on Tempo, whose memo binds it to
+    /// the challenge. [`Mpp::create()`](super::Mpp::create) rejects an empty
+    /// list or an invalid Zone ID.
+    pub fn zones(mut self, zones: crate::protocol::methods::tempo::zone::Zones) -> Self {
+        self.zones = Some(zones);
+        self
+    }
+
+    /// How long after its challenge expires a `zone` Credential is still
+    /// accepted, as mppx's `zoneCredentialGraceMs`. Defaults to zero.
+    ///
+    /// A Zone withdrawal can settle on Tempo shortly before its challenge
+    /// expires and reach the server only after. Within the grace, a `zone`
+    /// Credential for an expired challenge is accepted when its settlement's
+    /// block is older than the expiry; every other Credential type gets no
+    /// grace. [`Mpp::create()`](super::Mpp::create) rejects a grace above
+    /// [`MAX_ZONE_CREDENTIAL_GRACE`](crate::protocol::methods::tempo::zone::MAX_ZONE_CREDENTIAL_GRACE).
+    ///
+    /// The grace marker is a key of the challenge's `opaque` object, so a
+    /// route `opaque` pinned with [`Mpp::with_opaque`](super::Mpp::with_opaque)
+    /// must be a JSON object for the grace to apply; any other value is issued
+    /// unchanged and its challenges get no grace.
+    pub fn zone_credential_grace(mut self, grace: std::time::Duration) -> Self {
+        self.zone_credential_grace = grace;
         self
     }
 }
@@ -327,9 +381,13 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         fee_payer_fee_token: None,
         remote_fee_payer: None,
         // Default in-memory store; replay protection on by default.
+        // Charges refuse it in production (see `default_store_refusal`).
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
+        store_configured: false,
         relay: None,
         requires_auth: false,
+        zones: None,
+        zone_credential_grace: std::time::Duration::ZERO,
     }
 }
 

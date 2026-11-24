@@ -5,7 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::binding::is_payment_authorization_header;
+use super::binding::{
+    is_authorization_shorthand, is_payment_authorization_header, omit_credential_header,
+    serialize_credential_header,
+};
 use super::types::{Base64UrlJson, IntentName, MethodName};
 
 // These lived in this module before it was split; the paths stay valid.
@@ -80,9 +83,29 @@ pub struct PaymentChallenge {
     /// When omitted, clients send the credential in `Authorization`. When
     /// present, the value is `Payment-Authorization` so `Authorization` can
     /// remain in use for ordinary application authentication.
-    /// `Authorization` is the implicit default and is never advertised.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// `Authorization` is the implicit default and is never advertised: set
+    /// here (any case), it is omitted when serialized. Serializing any other
+    /// value fails.
+    #[serde(
+        default,
+        skip_serializing_if = "omit_credential_header",
+        serialize_with = "serialize_credential_header"
+    )]
     pub header: Option<String>,
+
+    /// Whether the `WWW-Authenticate` parser found a legacy `\uXXXX` escape
+    /// in an auth-param the Challenge binds or echoes (any but
+    /// `description`).
+    ///
+    /// Servers that wrote characters above U+00FF that way (mppx 0.8.18 to
+    /// 0.21.1, pympp 0.15 to 0.26, mpp-go 0.4 to 0.9.1) bound the decoded
+    /// character in the Challenge ID, while a quoted-pair reads `\u00e9` as
+    /// `u00e9`, so no Credential for such a Challenge verifies. Payment
+    /// providers and [`format_www_authenticate`](super::format_www_authenticate)
+    /// refuse it (see [`PaymentChallenge::ensure_payable`]). Never serialized;
+    /// `false` for Challenges built in code or read from JSON.
+    #[serde(skip)]
+    pub legacy_unicode_escape: bool,
 }
 
 /// Serde shape of [`PaymentChallenge`]. Deserialized challenges get the same
@@ -124,6 +147,7 @@ impl TryFrom<WireChallenge> for PaymentChallenge {
             digest: wire.digest,
             opaque: wire.opaque,
             header: parse_advertised_credential_header(wire.header.as_deref())?,
+            legacy_unicode_escape: false,
         })
     }
 }
@@ -167,6 +191,7 @@ impl PaymentChallenge {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         }
     }
 
@@ -229,6 +254,7 @@ impl PaymentChallenge {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         }
     }
 
@@ -282,6 +308,7 @@ impl PaymentChallenge {
             digest: digest.map(String::from),
             opaque,
             header,
+            legacy_unicode_escape: false,
         }
     }
 
@@ -333,11 +360,14 @@ impl PaymentChallenge {
 
     /// HTTP field a client must use for the payment credential.
     ///
-    /// Returns `header` when it selects `Payment-Authorization`, otherwise
-    /// `Authorization`.
+    /// Returns `Payment-Authorization` when `header` selects it in any case,
+    /// otherwise `Authorization`. `header` itself keeps the spelling the server
+    /// sent, which the Credential echoes unchanged.
     pub fn credential_header(&self) -> &str {
         match self.header.as_deref() {
-            Some(header) if is_payment_authorization_header(header) => header,
+            Some(header) if is_payment_authorization_header(header) => {
+                super::PAYMENT_AUTHORIZATION_HEADER
+            }
             _ => "Authorization",
         }
     }
@@ -362,7 +392,12 @@ impl PaymentChallenge {
             description: self.description.clone(),
             digest: self.digest.clone(),
             opaque: self.opaque.clone(),
-            header: self.header.clone(),
+            // The `Authorization` shorthand selects the default, which the
+            // echo omits as the challenge's own serialization does.
+            header: self
+                .header
+                .clone()
+                .filter(|header| !is_authorization_shorthand(header)),
         }
     }
 
@@ -461,13 +496,44 @@ impl PaymentChallenge {
         })
     }
 
+    /// Refuse a Challenge flagged as carrying a legacy `\uXXXX` escape
+    /// ([`legacy_unicode_escape`](Self::legacy_unicode_escape)). Session
+    /// voucher, top-up and close paths call it before signing.
+    pub(crate) fn ensure_not_legacy_escaped(&self) -> crate::error::Result<()> {
+        if self.legacy_unicode_escape {
+            return Err(crate::error::MppError::invalid_challenge(
+                self.id.clone(),
+                super::headers::LEGACY_UNICODE_ESCAPE_REASON,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuse a Challenge whose server escaped an auth-param it binds or
+    /// echoes as a legacy `\uXXXX` escape
+    /// ([`legacy_unicode_escape`](Self::legacy_unicode_escape)): no Credential
+    /// for it verifies, so payment providers call this before signing or
+    /// broadcasting anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error [`MppError::is_legacy_unicode_escape`] identifies.
+    ///
+    /// [`MppError::is_legacy_unicode_escape`]: crate::MppError::is_legacy_unicode_escape
+    pub fn ensure_payable(&self) -> crate::error::Result<()> {
+        self.ensure_not_legacy_escaped()
+    }
+
     /// Validate that this challenge can be used for a charge payment with the given method.
     ///
     /// Checks that:
+    /// - The server did not escape a bound auth-param as a legacy `\uXXXX`
+    ///   escape (see [`ensure_payable`](Self::ensure_payable))
     /// - The payment method matches (case-insensitive)
     /// - The intent is "charge"
     /// - The challenge has not expired
     pub fn validate_for_charge(&self, method: &str) -> crate::error::Result<()> {
+        self.ensure_payable()?;
         if !self.method.eq_ignore_ascii_case(method) {
             return Err(crate::error::MppError::UnsupportedPaymentMethod(format!(
                 "Payment method '{}' is not supported. Supported methods: {}",
@@ -495,10 +561,13 @@ impl PaymentChallenge {
     /// Validate that this challenge can be used for a session with the given method.
     ///
     /// Checks that:
+    /// - The server did not escape a bound auth-param as a legacy `\uXXXX`
+    ///   escape (see [`ensure_payable`](Self::ensure_payable))
     /// - The payment method matches (case-insensitive)
     /// - The intent is "session"
     /// - The challenge has not expired
     pub fn validate_for_session(&self, method: &str) -> crate::error::Result<()> {
+        self.ensure_payable()?;
         if !self.method.eq_ignore_ascii_case(method) {
             return Err(crate::error::MppError::UnsupportedPaymentMethod(format!(
                 "Payment method '{}' is not supported. Supported methods: {}",
@@ -568,8 +637,13 @@ pub struct ChallengeEcho {
     /// HTTP field that must carry the Payment credential.
     ///
     /// Echoed from the challenge when present. Omitted when the challenge
-    /// used the default `Authorization` field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// used the default `Authorization` field, including when set here to
+    /// `Authorization` (any case). Serializing any other value fails.
+    #[serde(
+        default,
+        skip_serializing_if = "omit_credential_header",
+        serialize_with = "serialize_credential_header"
+    )]
     pub header: Option<String>,
 }
 
@@ -613,6 +687,7 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         }
     }
 
@@ -678,6 +753,7 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(challenge.verify(secret));
@@ -708,6 +784,7 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(!challenge.verify("wrong-secret"));
@@ -728,6 +805,7 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(!challenge.verify("any-secret"));
@@ -762,6 +840,7 @@ pub(super) mod tests {
             digest: digest.map(String::from),
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(challenge.verify(secret));
@@ -840,6 +919,7 @@ pub(super) mod tests {
             digest: None,
             opaque: None,
             header: None,
+            legacy_unicode_escape: false,
         };
 
         assert!(!challenge.verify(secret));
@@ -1380,6 +1460,73 @@ pub(super) mod tests {
         assigned.header = Some("Cookie".to_string());
         assert_eq!(assigned.credential_header(), "Authorization");
         assert!(assigned.to_header().is_err());
+    }
+
+    #[test]
+    fn test_authorization_shorthand_is_omitted_when_serialized() {
+        for name in ["Authorization", "authorization", "AUTHORIZATION"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+
+            let json = serde_json::to_value(&challenge).unwrap();
+            assert!(json.get("header").is_none(), "{name}: {json}");
+            let received: PaymentChallenge = serde_json::from_value(json).unwrap();
+            assert!(received.header.is_none(), "{name}");
+            assert!(
+                !challenge.to_header().unwrap().contains("header="),
+                "{name}"
+            );
+
+            let echo = challenge.to_echo();
+            assert!(echo.header.is_none(), "{name}");
+            let mut assigned = echo.clone();
+            assigned.header = Some(name.to_string());
+            let json = serde_json::to_value(&assigned).unwrap();
+            assert!(json.get("header").is_none(), "{name}: {json}");
+
+            let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x1"));
+            let parsed = super::super::parse_authorization(
+                &super::super::format_authorization(&credential).unwrap(),
+            )
+            .unwrap();
+            assert!(parsed.challenge.header.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_payment_authorization_header_is_serialized_as_bound() {
+        for name in ["Payment-Authorization", "payment-authorization"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+
+            let json = serde_json::to_value(&challenge).unwrap();
+            assert_eq!(json["header"], name);
+            let received: PaymentChallenge = serde_json::from_value(json).unwrap();
+            assert_eq!(received.header.as_deref(), Some(name));
+            assert_eq!(received.credential_header(), "Payment-Authorization");
+
+            let echo = serde_json::to_value(challenge.to_echo()).unwrap();
+            assert_eq!(echo["header"], name);
+        }
+    }
+
+    #[test]
+    fn test_unsupported_credential_header_fails_to_serialize() {
+        for name in ["", "X-Payment", "Cookie"] {
+            let mut challenge = test_challenge();
+            challenge.header = Some(name.to_string());
+            assert!(serde_json::to_value(&challenge).is_err(), "{name:?}");
+            assert!(challenge.to_header().is_err(), "{name:?}");
+
+            let echo = challenge.to_echo();
+            assert_eq!(echo.header.as_deref(), Some(name));
+            assert!(serde_json::to_value(&echo).is_err(), "{name:?}");
+            let credential = PaymentCredential::new(echo, PaymentPayload::hash("0x1"));
+            assert!(
+                super::super::format_authorization(&credential).is_err(),
+                "{name:?}"
+            );
+        }
     }
 
     #[test]

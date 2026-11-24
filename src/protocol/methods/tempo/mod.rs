@@ -100,6 +100,8 @@
 //! ```
 
 pub mod charge;
+#[cfg(feature = "tempo")]
+pub mod configurable_account;
 
 pub(crate) type DynSigner = dyn alloy::signers::Signer + Send + Sync;
 pub mod fee_payer_envelope;
@@ -114,6 +116,7 @@ pub mod transaction;
 pub mod transfers;
 pub mod types;
 pub mod voucher;
+pub mod zone;
 
 #[cfg(feature = "server")]
 pub mod method;
@@ -424,6 +427,7 @@ pub fn charge_challenge_with_options(
         digest: None,
         opaque: None,
         header: None,
+        legacy_unicode_escape: false,
     })
 }
 

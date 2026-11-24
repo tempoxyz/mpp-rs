@@ -190,14 +190,24 @@ where
                 }));
             }
         }
+        // A TIP-1034 channel recorded without its opening commitment gets it
+        // from chain first; the transition below reads the recorded one.
+        let resolved_commitment = match self.store.get_channel(channel_id_str).await? {
+            Some(channel) => self.resolve_opening_commitment(&channel).await?,
+            None => None,
+        };
         let channel_id = channel_id_str.to_owned();
         let signature = signature_str.to_owned();
+        let configurable_vouchers = self.configurable_vouchers();
         self.store
             .update_channel(
                 channel_id_str,
                 Box::new(move |current| {
-                    let state = current
+                    let mut state = current
                         .ok_or_else(|| VerificationError::channel_not_found("channel not found"))?;
+                    if state.opening_commitment.is_none() {
+                        state.opening_commitment = resolved_commitment;
+                    }
                     let state = match on_chain {
                         Some(on_chain) => ChannelState {
                             finalized: state.finalized || on_chain.finalized,
@@ -211,6 +221,7 @@ where
                         cumulative_amount,
                         &signature,
                         min_delta,
+                        configurable_vouchers,
                     )
                     .map(Some)
                 }),
@@ -225,6 +236,7 @@ where
         cumulative_amount: u128,
         signature_str: &str,
         min_delta: u128,
+        configurable_vouchers: bool,
     ) -> Result<ChannelState, VerificationError> {
         if channel.closing {
             return Err(VerificationError::channel_closed("channel is closing"));
@@ -256,6 +268,10 @@ where
                 cumulative_amount,
                 &sig_bytes,
                 channel.authorized_signer,
+                &crate::protocol::methods::tempo::precompile_voucher::VoucherVerifyOptions {
+                    configurable: configurable_vouchers,
+                    opening_commitment: channel.opening_commitment,
+                },
             );
             if !is_valid {
                 return Err(VerificationError::invalid_signature(

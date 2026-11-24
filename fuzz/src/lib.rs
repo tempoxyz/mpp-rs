@@ -2,8 +2,7 @@
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use mpp::protocol::core::{
-    advertised_credential_header, is_default_credential_header, Base64UrlJson, ChallengeEcho,
-    MethodName, PaymentChallenge,
+    advertised_credential_header, Base64UrlJson, ChallengeEcho, MethodName, PaymentChallenge,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -31,8 +30,8 @@ pub struct Method(pub String);
 impl<'a> Arbitrary<'a> for Method {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
         const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
-        let mut name = String::new();
-        for _ in 0..u.int_in_range(1..=12)? {
+        let mut name = String::from(*u.choose(ALPHABET)? as char);
+        for _ in 0..u.int_in_range(0..=11)? {
             name.push(*u.choose(ALPHABET)? as char);
         }
         Ok(Self(name))
@@ -284,6 +283,7 @@ impl ChallengeInput {
             digest: self.digest.as_ref().map(DigestInput::build),
             opaque: self.opaque.as_ref().map(OpaqueInput::build),
             header: self.header.as_ref().map(HeaderInput::build),
+            legacy_unicode_escape: false,
         }
     }
 
@@ -325,9 +325,52 @@ pub fn quoted_values(challenge: &PaymentChallenge) -> Vec<&str> {
     values
 }
 
-/// Whether the `header` field names a credential header the SDK supports.
+/// Whether `c` can be written in a quoted-string, as itself or after a
+/// backslash: HTAB and printable ASCII.
+pub fn is_quoted_text(c: char) -> bool {
+    c == '\t' || (' '..='~').contains(&c)
+}
+
+/// Whether every quoted value but `description` is quoted text. The
+/// formatter refuses other characters in those values, which a quoted-pair
+/// can't carry; it writes them in `description` as `\uXXXX`.
+pub fn has_quoted_text_values(challenge: &PaymentChallenge) -> bool {
+    let mut bound = challenge.clone();
+    bound.description = None;
+    quoted_values(&bound)
+        .iter()
+        .all(|value| value.chars().all(is_quoted_text))
+}
+
+/// The challenge a parser reads back from the formatted header: each UTF-16
+/// unit of `description` that isn't quoted text is written as `\uXXXX`,
+/// which a parser reads as the quoted-pair text `uXXXX`.
+pub fn read_back(challenge: &PaymentChallenge) -> PaymentChallenge {
+    let mut read = challenge.clone();
+    read.description = challenge.description.as_deref().map(|description| {
+        let mut text = String::with_capacity(description.len());
+        for unit in description.encode_utf16() {
+            match char::from_u32(u32::from(unit)) {
+                Some(c) if is_quoted_text(c) => text.push(c),
+                _ => text.push_str(&format!("u{unit:04x}")),
+            }
+        }
+        text
+    });
+    read
+}
+
+/// Whether a received challenge or Credential echo may carry this `header`
+/// field: absent, or `Payment-Authorization` in any case.
 pub fn has_supported_header(header: Option<&str>) -> bool {
-    is_default_credential_header(header) || advertised_credential_header(header).is_some()
+    header.is_none() || advertised_credential_header(header).is_some()
+}
+
+/// Whether a challenge with this `header` field formats: a supported one, or
+/// `Authorization` in any case as shorthand for the default.
+pub fn has_formattable_header(header: Option<&str>) -> bool {
+    has_supported_header(header)
+        || header.is_some_and(|name| name.eq_ignore_ascii_case("Authorization"))
 }
 
 /// The `header` field as the wire carries it: `Authorization` is the implicit

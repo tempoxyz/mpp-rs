@@ -76,6 +76,90 @@ pub(crate) fn detect_realm() -> String {
     realm_from_env(|name| std::env::var(name).ok())
 }
 
+/// Environment variables that mark a platform which may run several instances
+/// of one server, as in mppx.
+#[cfg(feature = "tempo")]
+const SHARED_PLATFORM_ENV_VARS: &[&str] = &[
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "DENO_DEPLOYMENT_ID",
+    "DYNO",
+    "FLY_APP_NAME",
+    "K_SERVICE",
+    "NETLIFY",
+    "RAILWAY_ENVIRONMENT",
+    "RENDER",
+    "VERCEL",
+];
+
+/// Describes why the runtime looks like production or a multi-instance
+/// platform, or returns `None` for local development and tests.
+///
+/// Checks `MPP_ENV=production` and `NODE_ENV=production` (as mppx and pympp
+/// do), then the variables serverless and multi-replica hosts set (AWS Lambda,
+/// Deno Deploy, Heroku, Fly.io, Cloud Run, Netlify, Railway, Render, Vercel).
+/// Instance-local replay protection is unsafe in all of them. `lookup`
+/// returns the raw value, so a set value that is not valid Unicode still
+/// counts as set.
+#[cfg(feature = "tempo")]
+fn shared_runtime(lookup: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<String> {
+    for name in ["MPP_ENV", "NODE_ENV"] {
+        if lookup(name).is_some_and(|value| {
+            value
+                .to_string_lossy()
+                .trim()
+                .eq_ignore_ascii_case("production")
+        }) {
+            return Some(format!("{name} is \"production\""));
+        }
+    }
+    SHARED_PLATFORM_ENV_VARS
+        .iter()
+        .find(|name| lookup(name).is_some_and(|value| !value.is_empty()))
+        .map(|name| format!("{name} is set"))
+}
+
+/// Reads a production or platform marker for [`Mpp::create`].
+///
+/// Library unit tests read none, so they behave the same whatever the host's
+/// environment; they pass markers to `Mpp::create_with_env` instead.
+#[cfg(all(feature = "tempo", not(test)))]
+fn process_env(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
+}
+
+#[cfg(all(feature = "tempo", test))]
+fn process_env(_name: &str) -> Option<std::ffi::OsString> {
+    None
+}
+
+/// Why the charge method must not use the default in-memory replay store in
+/// production or on a multi-instance platform, where a credential accepted by
+/// one instance could be accepted again by another, or `None` when it may.
+///
+/// An explicit store (an explicit `MemoryStore` included), `without_store()`
+/// or a relay, which enforces single use itself, opts out. Only charges read
+/// this store, so [`Mpp::create`] keeps the refusal and returns it when a
+/// charge is issued or verified: a handler that serves only sessions, whose
+/// method has its own store, is unaffected.
+#[cfg(feature = "tempo")]
+fn default_store_refusal(
+    builder: &super::TempoBuilder,
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
+    if builder.store_configured || builder.relay.is_some() {
+        return None;
+    }
+    shared_runtime(lookup).map(|runtime| {
+        format!(
+            "tempo has no store configured, and {runtime}, so this server may run as several \
+             instances. An in-memory store would let a credential accepted by one instance be \
+             accepted again by another. Pass a shared store with .store(...), such as a Redis \
+             or SQL-backed one, or pass .store(Arc::new(MemoryStore::new())) to accept replay \
+             protection scoped to this instance."
+        )
+    })
+}
+
 pub(crate) fn request_realm_default() -> bool {
     std::env::var("MPP_REALM")
         .ok()
@@ -151,6 +235,20 @@ struct Config {
     can_sponsor: bool,
     machine_token_enabled: bool,
     chain_id: Option<u64>,
+    /// Zones charge challenges accept (`methodDetails.zones`), as JSON.
+    #[cfg(feature = "tempo")]
+    zones: Option<serde_json::Value>,
+    /// Whether a Tempo API relay verifies credentials, or the method otherwise
+    /// does not verify Zone credentials, so challenges must not advertise Zones.
+    #[cfg(feature = "tempo")]
+    relay: bool,
+    /// How long after expiry a `zone` Credential is still accepted.
+    #[cfg(feature = "tempo")]
+    zone_credential_grace: std::time::Duration,
+    /// Why charges are refused: the default in-memory replay store in
+    /// production or on a multi-instance platform. Sessions are unaffected.
+    #[cfg(feature = "tempo")]
+    charge_store_refusal: Option<String>,
     opaque: Option<Base64UrlJson>,
     credential_header: Option<String>,
     /// Whether issued challenges carry a random `_mpp_nonce` in `opaque`.
@@ -171,6 +269,14 @@ impl Config {
             can_sponsor: true,
             machine_token_enabled: false,
             chain_id: None,
+            #[cfg(feature = "tempo")]
+            zones: None,
+            #[cfg(feature = "tempo")]
+            relay: false,
+            #[cfg(feature = "tempo")]
+            zone_credential_grace: std::time::Duration::ZERO,
+            #[cfg(feature = "tempo")]
+            charge_store_refusal: None,
             opaque: None,
             credential_header: None,
             nonce: true,
@@ -186,9 +292,11 @@ where
     ///
     /// For a simpler API, use [`Mpp::create()`] with [`tempo()`](super::tempo).
     ///
-    /// `secret_key` must be at least 32 bytes. This constructor cannot fail:
-    /// with a shorter key, issuing a challenge returns an error and every
-    /// credential is refused. Use [`Mpp::try_new()`] to check it up front.
+    /// `secret_key` must be at least 32 bytes and `realm` printable ASCII.
+    /// This constructor cannot fail: with a shorter key, issuing a challenge
+    /// returns an error and every credential is refused. Use
+    /// [`Mpp::try_new()`] to check the key up front; [`Mpp::create()`] checks
+    /// both.
     pub fn new(method: M, realm: impl Into<String>, secret_key: impl Into<String>) -> Mpp<M, ()> {
         Self::from_config(method, Config::new(realm.into(), secret_key.into()))
     }
@@ -226,6 +334,16 @@ where
     }
 
     fn from_config(method: M, config: Config) -> Self {
+        // The method's own Zone settings hold under every constructor, as
+        // mppx's method registers its Credential expiry grace itself.
+        #[cfg(feature = "tempo")]
+        let config = Config {
+            relay: config.relay || !method.verifies_zone_credentials(),
+            zone_credential_grace: config
+                .zone_credential_grace
+                .max(method.zone_credential_grace()),
+            ..config
+        };
         Mpp {
             method: Arc::new(method),
             session_method: None,
@@ -257,6 +375,10 @@ where
 
     /// Pin the route `opaque` for issuance and verification: challenge helpers
     /// emit it, and verification rejects any credential that doesn't match.
+    ///
+    /// Pass a JSON object, as mppx's string-keyed `meta`: issuance adds
+    /// reserved keys to it, such as the Zone Credential grace marker, which a
+    /// value of any other type can't carry.
     pub fn with_opaque(mut self, opaque: Base64UrlJson) -> Self {
         Arc::make_mut(&mut self.config).opaque = Some(opaque);
         self
@@ -438,7 +560,26 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
     ///
     /// let challenges = mpp.charge("1.00")?;
     /// ```
-    pub fn create(mut builder: super::TempoBuilder) -> Result<Self> {
+    ///
+    /// Without a `store` in production or on a multi-instance platform (see
+    /// [`TempoBuilder::store`](super::TempoBuilder::store)), the handler is
+    /// still created, so it can serve sessions, but issuing or verifying a
+    /// charge returns an error, and the refusal is logged at warn level with
+    /// [`tracing`](https://docs.rs/tracing).
+    pub fn create(builder: super::TempoBuilder) -> Result<Self> {
+        Self::create_with_env(builder, process_env)
+    }
+
+    /// [`create()`](Self::create), reading production and platform markers
+    /// with `lookup`.
+    pub(crate) fn create_with_env(
+        mut builder: super::TempoBuilder,
+        lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<Self> {
+        let charge_store_refusal = default_store_refusal(&builder, lookup);
+        if let Some(refusal) = &charge_store_refusal {
+            tracing::warn!("mpp: charges will be refused: {refusal}");
+        }
         builder
             .chain_id
             .get_or_insert_with(|| super::tempo::chain_id_from_rpc_url(&builder.rpc_url));
@@ -482,6 +623,38 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 )));
             }
         }
+        let zones = match builder.zones {
+            Some(crate::protocol::methods::tempo::zone::Zones::Ids(ref ids))
+                if ids.is_empty()
+                    || ids.iter().any(|id| {
+                        !crate::protocol::methods::tempo::zone::is_id(u64::from(*id))
+                    }) =>
+            {
+                return Err(crate::error::MppError::InvalidConfig(
+                    "zones must be Zones::Any or a non-empty list of valid Zone IDs".into(),
+                ));
+            }
+            Some(ref zones) => Some(serde_json::to_value(zones).map_err(|e| {
+                crate::error::MppError::InvalidConfig(format!("invalid zones: {e}"))
+            })?),
+            None => None,
+        };
+        // A relay verifies every credential itself, and one that does not
+        // know Zone credentials would reject them only after the payer's
+        // withdrawal settled to the recipient.
+        // Nor can it honor `zone_credential_grace`: it verifies credentials
+        // without the check that a late `zone` Credential settled before
+        // its challenge expired.
+        if !builder.zone_credential_grace.is_zero() && builder.relay.is_some() {
+            return Err(crate::error::MppError::InvalidConfig(
+                "zone_credential_grace is not supported with relay(...)".into(),
+            ));
+        }
+        if zones.is_some() && builder.relay.is_some() {
+            return Err(crate::error::MppError::InvalidConfig(
+                "zones(...) cannot be combined with relay(...): the relay does not verify Zone credentials".into(),
+            ));
+        }
         // Resolve accepted currencies (explicit list, legacy single currency,
         // or chain defaults) before moving fields out of the builder.
         let currencies = super::tempo::resolve_currencies(&builder)?;
@@ -496,9 +669,11 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 ))
             })?;
         crate::protocol::core::validate_secret_key(&secret_key)?;
+        crate::protocol::core::validate_realm(&builder.realm)?;
 
         let provider = super::tempo_provider(&builder.rpc_url)?;
-        let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider);
+        let mut method = crate::protocol::methods::tempo::ChargeMethod::new(provider)
+            .with_zone_credential_grace(builder.zone_credential_grace)?;
         if let Some(signer) = builder.fee_payer_signer {
             method = method.with_fee_payer_arc(signer);
         }
@@ -515,6 +690,7 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
             Some(store) => method.with_store(store),
             None => method.without_store(),
         };
+        let relay = builder.relay.is_some();
         if let Some(relay) = builder.relay {
             method = method.with_relay(relay)?;
         }
@@ -533,6 +709,10 @@ impl Mpp<super::TempoChargeMethod<super::TempoProvider>> {
                 can_sponsor,
                 machine_token_enabled: builder.machine_token_enabled,
                 chain_id: builder.chain_id,
+                zones,
+                relay,
+                zone_credential_grace: builder.zone_credential_grace,
+                charge_store_refusal,
                 credential_header: advertised_builder_credential_header(builder.requires_auth),
                 ..Config::new(builder.realm, secret_key)
             },
@@ -570,6 +750,7 @@ impl Mpp<crate::protocol::methods::stripe::method::ChargeMethod> {
                 ))
             })?;
         crate::protocol::core::validate_secret_key(&secret_key)?;
+        crate::protocol::core::validate_realm(&builder.realm)?;
 
         let mut method = crate::protocol::methods::stripe::method::ChargeMethod::new(
             &builder.secret_key,

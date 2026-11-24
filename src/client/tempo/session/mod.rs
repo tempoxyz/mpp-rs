@@ -7,6 +7,7 @@
 //! Ported from the TypeScript SDK's `Session.ts`.
 
 pub mod channel_ops;
+pub mod configurable;
 pub mod recovery;
 pub mod store;
 use std::collections::{HashMap, HashSet};
@@ -24,15 +25,18 @@ use tempo_alloy::TempoNetwork;
 
 use self::channel_ops::{
     build_credential, create_close_payload, create_open_payload,
-    create_precompile_close_payload_with_descriptor_primitive, create_precompile_open_payload,
+    create_precompile_close_payload_with_descriptor_configurable,
+    create_precompile_close_payload_with_descriptor_primitive,
+    create_precompile_open_payload_with_voucher_signer,
     create_precompile_top_up_transaction_payload,
+    create_precompile_voucher_payload_with_descriptor_configurable,
     create_precompile_voucher_payload_with_descriptor_primitive, create_voucher_payload,
     is_precompile_escrow, resolve_chain_id, resolve_escrow_with_policy, try_recover_channel,
     ChannelEntry, OpenPayloadOptions, OpenPrecompilePayloadOptions, TopUpPrecompilePayloadOptions,
 };
 use self::recovery::{
-    can_sign_descriptor, hydrate_session_snapshot, read_on_chain_channel_state,
-    recover_stored_channel, validate_settlement_route, RecoveryScope,
+    can_sign_descriptor, hydrate_session_snapshot_with_opening_commitment,
+    read_on_chain_channel_state, recover_stored_channel, validate_settlement_route, RecoveryScope,
 };
 use self::store::{
     ChannelStore, ChannelStoreLease, MemoryChannelStore, OriginBoundChannelStore,
@@ -123,6 +127,8 @@ pub struct TempoSessionProvider {
     allow_custom_escrow: bool,
     /// Address authorized to sign vouchers. Defaults to signer address.
     authorized_signer: Option<Address>,
+    /// TIP-1166 configurable account that signs TIP-1034 vouchers, if any.
+    configurable_voucher_signer: Option<configurable::ConfigurableVoucherSigner>,
     /// Signing mode (direct or keychain).
     signing_mode: crate::client::tempo::signing::TempoSigningMode,
     /// Maximum deposit in atomic units. Caps the server's `suggestedDeposit`
@@ -312,6 +318,9 @@ struct SessionPaymentLease {
     /// Channel the leased credential pays from, so commit and rollback are
     /// routed to the provider whose lease matches the credential's channel.
     channel_id: Option<String>,
+    /// Payload of the leased credential, so settling another credential for
+    /// the same challenge (one it replaced) leaves this lease held.
+    payload: Option<serde_json::Value>,
     _process: tokio::sync::OwnedMutexGuard<()>,
     _store: Box<dyn ChannelStoreLease>,
 }
@@ -380,6 +389,7 @@ impl TempoSessionProvider {
             escrow_contract: None,
             allow_custom_escrow: false,
             authorized_signer: None,
+            configurable_voucher_signer: None,
             signing_mode: crate::client::tempo::signing::TempoSigningMode::Direct,
             max_deposit: None,
             default_deposit: None,
@@ -574,6 +584,26 @@ impl TempoSessionProvider {
         self
     }
 
+    /// Sign TIP-1034 vouchers with a TIP-1166 configurable account (`0x05`
+    /// signatures, settled from T15), which becomes the channels' authorized
+    /// signer. The payer still signs transactions and close authorizations.
+    ///
+    /// New channels open with the account's on-chain configuration
+    /// commitment as salt when it has one. Opening fails unless the server's
+    /// challenge advertises `methodDetails.configurableVouchers: true`, since
+    /// other servers would reject the vouchers after the deposit is locked.
+    /// A top-up after the account's configuration changed fails with an error
+    /// [`configurable::is_signer_config_changed`] recognizes: close the
+    /// channel and open a new one.
+    pub fn with_configurable_voucher_signer(
+        mut self,
+        signer: configurable::ConfigurableVoucherSigner,
+    ) -> Self {
+        self.authorized_signer = Some(signer.account());
+        self.configurable_voucher_signer = Some(signer);
+        self
+    }
+
     /// Set the signing mode (direct or keychain).
     ///
     /// Default is [`TempoSigningMode::Direct`](crate::client::tempo::signing::TempoSigningMode::Direct).
@@ -711,6 +741,9 @@ impl TempoSessionProvider {
     }
 
     fn check_policy(&self, challenge: &PaymentChallenge) -> Result<(), MppError> {
+        // Every direct session path (voucher, top-up, close) checks policy
+        // first: refuse a legacy-escaped Challenge before anything is signed.
+        challenge.ensure_not_legacy_escaped()?;
         if self.currencies.is_none()
             && self.expected_recipients.is_none()
             && self.max_amount.is_none()
@@ -1014,10 +1047,35 @@ impl TempoSessionProvider {
             challenge_id.to_owned(),
             SessionPaymentLease {
                 channel_id: channel_id.map(str::to_owned),
+                payload: None,
                 _process: process,
                 _store: store,
             },
         );
+    }
+
+    /// Removes the payment lease for `challenge` that `credential` holds.
+    ///
+    /// A Challenge offered again may be paid again while its previous
+    /// credential, already released, is still unsettled: settling that
+    /// previous credential must not free the new one's lease.
+    fn take_lease(
+        &self,
+        challenge: &PaymentChallenge,
+        credential: &PaymentCredential,
+    ) -> Option<SessionPaymentLease> {
+        let mut leases = self.pending_payment_leases.lock().unwrap();
+        let held = leases.get(&challenge.id).is_some_and(|lease| {
+            lease
+                .payload
+                .as_ref()
+                .is_none_or(|payload| *payload == credential.payload)
+        });
+        if held {
+            leases.remove(&challenge.id)
+        } else {
+            None
+        }
     }
 
     /// Whether a payment lease for `challenge_id` is pending.
@@ -1744,7 +1802,12 @@ impl TempoSessionProvider {
                 ));
             }
             let state = read_on_chain_channel_state(provider, snapshot_channel_id).await?;
-            let mut recovered = hydrate_session_snapshot(snapshot, scope, state)?;
+            let mut recovered = hydrate_session_snapshot_with_opening_commitment(
+                snapshot,
+                scope,
+                state,
+                self.opening_commitment_for(&snapshot.descriptor),
+            )?;
             let spent = snapshot.spent.parse::<u128>().map_err(|error| {
                 MppError::InvalidConfig(format!("invalid snapshot spent: {error}"))
             })?;
@@ -1767,6 +1830,11 @@ impl TempoSessionProvider {
                 return Err(MppError::InvalidConfig(
                     "recovered session cumulative amount exceeds channel deposit".into(),
                 ));
+            }
+            // Loading an already authorized obligation must remain possible for close.
+            // Payment recovery checks the cap before persisting any new request amount.
+            if request_amount != 0 {
+                self.assert_within_max_deposit(recovered.cumulative_amount)?;
             }
             self.channel_store
                 .set(&recovered)
@@ -1811,6 +1879,9 @@ impl TempoSessionProvider {
             return Ok(None);
         }
         let recovered = recover_stored_channel(stored, scope, state)?;
+        if request_amount != 0 {
+            self.assert_within_max_deposit(recovered.cumulative_amount)?;
+        }
         let pending = recovered.pending_open.clone();
         if let Some(challenge_id) = &pending {
             self.pending_opens.lock().unwrap().insert(
@@ -1952,7 +2023,7 @@ impl TempoSessionProvider {
                 .await
             {
                 if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-                    let refreshed = crate::protocol::core::parse_www_authenticate_all_bytes(
+                    let refreshed = crate::protocol::core::parse_payable_challenges(
                         response
                             .headers()
                             .get_all(WWW_AUTHENTICATE)
@@ -2010,7 +2081,7 @@ impl TempoSessionProvider {
             .mpp_http("session bootstrap challenge request failed")?;
 
         let response = if challenge_response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-            let challenge = crate::protocol::core::parse_www_authenticate_all_bytes(
+            let challenge = crate::protocol::core::parse_payable_challenges(
                 challenge_response
                     .headers()
                     .get_all(WWW_AUTHENTICATE)
@@ -2139,7 +2210,7 @@ impl TempoSessionProvider {
             .parse()
             .mpp_config("invalid snapshot channelId")?;
         let state = read_on_chain_channel_state(&self.rpc_provider, channel_id).await?;
-        let recovered = hydrate_session_snapshot(
+        let recovered = hydrate_session_snapshot_with_opening_commitment(
             &snapshot,
             RecoveryScope {
                 payer,
@@ -2151,6 +2222,7 @@ impl TempoSessionProvider {
                 chain_id: snapshot.chain_id,
             },
             state,
+            self.opening_commitment_for(&snapshot.descriptor),
         )?;
         // A channel kept in another namespace is not copied into this one.
         if self
@@ -2386,7 +2458,7 @@ impl TempoSessionProvider {
                     chain_id,
                 },
                 session_req.session_snapshot().as_ref(),
-                session_req.parse_amount()?,
+                0,
                 Self::settlement_binding(&session_req)?,
             )
             .await?;
@@ -2455,7 +2527,11 @@ impl TempoSessionProvider {
         if entry.descriptor.as_ref() != Some(&snapshot.descriptor)
             || entry.chain_id != snapshot.chain_id
             || snapshot.escrow.parse::<Address>().ok() != Some(entry.escrow_contract)
-            || recovery::validate_snapshot_voucher(&snapshot).is_err()
+            || recovery::validate_snapshot_voucher(
+                &snapshot,
+                self.opening_commitment_for(&snapshot.descriptor),
+            )
+            .is_err()
             || spent > entry.cumulative_amount
             || !self.price_within_caps(price)
             || self.check_policy(challenge).is_err()
@@ -2566,9 +2642,9 @@ impl TempoSessionProvider {
             ));
         }
 
+        self.assert_within_max_deposit(entry.cumulative_amount)?;
         let mut payload = if is_precompile_escrow(entry.escrow_contract) {
-            create_precompile_voucher_payload_with_descriptor_primitive(
-                &self.signer,
+            self.precompile_voucher_payload(
                 entry.descriptor.clone().ok_or_else(|| {
                     MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
                 })?,
@@ -2602,12 +2678,104 @@ impl TempoSessionProvider {
         Ok(build_credential(challenge, payload, entry.chain_id, payer))
     }
 
+    /// The configurable voucher signer, when it is `descriptor`'s
+    /// authorized signer.
+    fn configurable_signer_for(
+        &self,
+        descriptor: &crate::protocol::methods::tempo::session::ChannelDescriptor,
+    ) -> Option<&configurable::ConfigurableVoucherSigner> {
+        self.configurable_voucher_signer.as_ref().filter(|signer| {
+            descriptor.authorized_signer.parse::<Address>().ok() == Some(signer.account())
+        })
+    }
+
+    /// The opening commitment this client's vouchers for a channel with
+    /// `descriptor` settle against: its salt when the configurable voucher
+    /// signer commits to it (the only salt this client opens such a channel
+    /// with), else zero, the only commitment a primitive or derived version-0
+    /// voucher settles under.
+    fn opening_commitment_for(
+        &self,
+        descriptor: &crate::protocol::methods::tempo::session::ChannelDescriptor,
+    ) -> B256 {
+        let salt = descriptor.salt.parse::<B256>().unwrap_or_default();
+        self.configurable_signer_for(descriptor)
+            .filter(|signer| !salt.is_zero() && signer.commitment() == salt)
+            .map_or(B256::ZERO, |_| salt)
+    }
+
+    /// A TIP-1034 voucher payload, signed by the configurable voucher signer
+    /// when it is the channel's authorized signer, else by the primitive signer.
+    async fn precompile_voucher_payload(
+        &self,
+        descriptor: crate::protocol::methods::tempo::session::ChannelDescriptor,
+        cumulative_amount: u128,
+        chain_id: u64,
+    ) -> Result<SessionCredentialPayload, MppError> {
+        match self.configurable_signer_for(&descriptor) {
+            Some(voucher_signer) => {
+                create_precompile_voucher_payload_with_descriptor_configurable(
+                    voucher_signer,
+                    descriptor,
+                    cumulative_amount,
+                    chain_id,
+                )
+                .await
+            }
+            None => {
+                create_precompile_voucher_payload_with_descriptor_primitive(
+                    &self.signer,
+                    descriptor,
+                    cumulative_amount,
+                    chain_id,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Fails before an open with a configurable voucher signer that the
+    /// server or the channel could not settle: the escrow must be the TIP-1034
+    /// precompile and the challenge must advertise
+    /// `methodDetails.configurableVouchers: true`.
+    fn ensure_configurable_vouchers_supported(
+        &self,
+        session_req: &SessionRequest,
+        precompile: bool,
+    ) -> Result<(), MppError> {
+        let Some(signer) = &self.configurable_voucher_signer else {
+            return Ok(());
+        };
+        if !precompile {
+            return Err(MppError::InvalidConfig(format!(
+                "configurable account {} can only sign TIP-1034 channel reserve vouchers",
+                signer.account()
+            )));
+        }
+        let advertised = session_req
+            .method_details
+            .as_ref()
+            .and_then(|details| details.get("configurableVouchers"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !advertised {
+            return Err(MppError::InvalidConfig(format!(
+                "server does not accept configurable account vouchers \
+                 (methodDetails.configurableVouchers is not true); refusing to open a channel \
+                 signed by configurable account {}",
+                signer.account()
+            )));
+        }
+        Ok(())
+    }
+
     async fn top_up_credential_for_challenge(
         &self,
         challenge: &PaymentChallenge,
         entry: &ChannelEntry,
         additional_deposit: u128,
     ) -> Result<PaymentCredential, MppError> {
+        challenge.ensure_not_legacy_escaped()?;
         let session_req: SessionRequest = challenge
             .request
             .decode()
@@ -2629,6 +2797,15 @@ impl TempoSessionProvider {
                 additional_deposit,
             )
             .await?;
+        if let Some(voucher_signer) = self.configurable_signer_for(descriptor) {
+            let salt = descriptor
+                .salt
+                .parse::<B256>()
+                .mpp_config("invalid TIP-1034 descriptor salt")?;
+            voucher_signer
+                .ensure_unchanged(&self.rpc_provider, salt)
+                .await?;
+        }
         let payload = create_precompile_top_up_transaction_payload(
             &self.rpc_provider,
             &self.signer,
@@ -2761,7 +2938,10 @@ impl TempoSessionProvider {
         // A transport failure after the credential may have been delivered
         // leaves the outcome unknown, as on HTTP; a definite rejection does not.
         let receipt = receipt.map_err(|error| {
-            if matches!(error, MppError::Http(_)) {
+            if matches!(
+                error,
+                MppError::Http(_) | MppError::UnknownPaymentOutcome { .. }
+            ) {
                 self.uncertain_top_ups
                     .lock()
                     .unwrap()
@@ -2986,7 +3166,7 @@ impl TempoSessionProvider {
             )
             .await?;
         if response.status() == reqwest::StatusCode::PAYMENT_REQUIRED {
-            let fresh_challenge = crate::protocol::core::parse_www_authenticate_all_bytes(
+            let fresh_challenge = crate::protocol::core::parse_payable_challenges(
                 response
                     .headers()
                     .get_all(WWW_AUTHENTICATE)
@@ -3060,7 +3240,44 @@ impl TempoSessionProvider {
     /// signed while the top-up was submitted may have advanced.
     /// `previous` is the deposit before the top-up when it was already raised
     /// in memory, so the deposit is still reported.
+    ///
+    /// The server already accepted the deposit, so a failure to record it
+    /// reports an unknown outcome rather than a configuration error a caller
+    /// could answer by paying another offer. The deposit is raised in memory
+    /// before it is stored, so a failed store write leaves the channel usable;
+    /// only a top-up that could not be applied in memory blocks further
+    /// top-ups of the channel.
     async fn record_top_up(
+        &self,
+        url: &str,
+        prepared: &PreparedTopUp,
+        previous: Option<u128>,
+    ) -> Result<(), MppError> {
+        self.store_top_up(url, prepared, previous)
+            .await
+            .map_err(|error| {
+                let applied = self
+                    .channels
+                    .lock()
+                    .unwrap()
+                    .get(&prepared.key)
+                    .is_some_and(|entry| {
+                        entry.channel_id == prepared.channel_id
+                            && entry.deposit >= prepared.new_deposit
+                    });
+                if !applied {
+                    self.uncertain_top_ups
+                        .lock()
+                        .unwrap()
+                        .insert(prepared.channel_id);
+                }
+                MppError::SessionPaymentOutcomeUnknown {
+                    context: format!("accepted top-up could not be recorded: {error}"),
+                }
+            })
+    }
+
+    async fn store_top_up(
         &self,
         url: &str,
         prepared: &PreparedTopUp,
@@ -3080,11 +3297,13 @@ impl TempoSessionProvider {
         let amount = prepared.new_deposit.saturating_sub(previous);
         entry.cumulative_amount = entry.cumulative_amount.max(prepared.cumulative_amount);
         entry.opened = true;
-        self.persist_channel(&entry).await?;
+        // The server accepted the deposit, so memory takes it even if the
+        // store write below fails.
         self.channels
             .lock()
             .unwrap()
             .insert(prepared.key.clone(), entry.clone());
+        self.persist_channel(&entry).await?;
         self.notify_update(&entry);
         if amount > 0 {
             self.report_deposit(url, &entry, amount, false);
@@ -3280,6 +3499,7 @@ impl TempoSessionProvider {
         channel_id_hex: &str,
         requested_cumulative: Option<u128>,
     ) -> Result<PaymentCredential, MppError> {
+        challenge.ensure_not_legacy_escaped()?;
         let key = self
             .channel_id_to_key
             .lock()
@@ -3319,17 +3539,34 @@ impl TempoSessionProvider {
             )));
         }
 
+        // Closing settles an existing authorization; it never increases it, even
+        // when the caller lowered the cap after that authorization was issued.
         let payload = if is_precompile_escrow(entry.escrow_contract) {
-            create_precompile_close_payload_with_descriptor_primitive(
-                &self.signer,
-                entry.channel_id,
-                entry.descriptor.ok_or_else(|| {
-                    MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
-                })?,
-                cumulative_amount,
-                entry.chain_id,
-            )
-            .await?
+            let descriptor = entry.descriptor.ok_or_else(|| {
+                MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
+            })?;
+            match self.configurable_signer_for(&descriptor) {
+                Some(voucher_signer) => {
+                    create_precompile_close_payload_with_descriptor_configurable(
+                        voucher_signer,
+                        entry.channel_id,
+                        descriptor,
+                        cumulative_amount,
+                        entry.chain_id,
+                    )
+                    .await?
+                }
+                None => {
+                    create_precompile_close_payload_with_descriptor_primitive(
+                        &self.signer,
+                        entry.channel_id,
+                        descriptor,
+                        cumulative_amount,
+                        entry.chain_id,
+                    )
+                    .await?
+                }
+            }
         } else {
             create_close_payload(
                 self.secp256k1_signer()?,
@@ -3380,12 +3617,23 @@ impl TempoSessionProvider {
     /// Reads a management error response's body within the management
     /// deadline, so a server that stalls after its headers cannot hold the
     /// payment lock. A body that does not arrive in time is left out.
-    async fn management_body(&self, response: reqwest::Response) -> String {
-        tokio::time::timeout(self.management_timeout, response.text())
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
+    async fn management_body(&self, mut response: reqwest::Response) -> String {
+        const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+        tokio::time::timeout(self.management_timeout, async {
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                let remaining = MAX_ERROR_BODY_BYTES - body.len();
+                body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if body.len() == MAX_ERROR_BODY_BYTES {
+                    break;
+                }
+            }
+            Ok::<_, reqwest::Error>(String::from_utf8_lossy(&body).into_owned())
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
     }
 
     /// POSTs a management credential that answers `challenge` to `url`.
@@ -3412,7 +3660,7 @@ impl TempoSessionProvider {
         if response.status() != reqwest::StatusCode::PAYMENT_REQUIRED {
             return None;
         }
-        crate::protocol::core::parse_www_authenticate_all_bytes(
+        crate::protocol::core::parse_payable_challenges(
             response
                 .headers()
                 .get_all(reqwest::header::WWW_AUTHENTICATE)
@@ -3854,6 +4102,7 @@ impl TempoSessionProvider {
             challenge.id.clone(),
             SessionPaymentLease {
                 channel_id: Self::credential_channel_id(&credential),
+                payload: Some(credential.payload.clone()),
                 _process: process_lease,
                 _store: store_lease,
             },
@@ -4151,6 +4400,15 @@ impl TempoSessionProvider {
                                 || state.close_requested_at != 0
                         };
                         if !funded {
+                            // Clones share pending opens: one signed for another
+                            // wallet is not replayed under this one.
+                            if channel_ops::descriptor_payer(&payload)
+                                .is_some_and(|descriptor_payer| descriptor_payer != payer)
+                            {
+                                return Err(MppError::InvalidConfig(
+                                    "pending channel open belongs to another wallet".into(),
+                                ));
+                            }
                             return Ok(build_credential(challenge, payload, chain_id, payer));
                         }
                         if let Some(open) = self
@@ -4222,21 +4480,28 @@ impl TempoSessionProvider {
                                 .await?;
                             }
                         }
-                        entry.deposit = self
+                        let deposit = self
                             .channels
                             .lock()
                             .unwrap()
                             .get(&key)
-                            .ok_or_else(|| {
-                                MppError::InvalidConfig("channel disappeared after top-up".into())
-                            })?
-                            .deposit;
+                            .map(|entry| entry.deposit);
+                        // The top-up was accepted: never report it as a
+                        // configuration error another offer could answer.
+                        entry.deposit = deposit.ok_or_else(|| {
+                            self.uncertain_top_ups
+                                .lock()
+                                .unwrap()
+                                .insert(entry.channel_id);
+                            MppError::SessionPaymentOutcomeUnknown {
+                                context: "channel disappeared after an accepted top-up".into(),
+                            }
+                        })?;
                     }
                 }
 
                 let payload = if precompile {
-                    create_precompile_voucher_payload_with_descriptor_primitive(
-                        &self.signer,
+                    self.precompile_voucher_payload(
                         entry.descriptor.clone().ok_or_else(|| {
                             MppError::InvalidConfig("TIP-1034 channel descriptor is missing".into())
                         })?,
@@ -4322,6 +4587,7 @@ impl TempoSessionProvider {
         }
 
         // No existing channel — open a new one
+        self.ensure_configurable_vouchers_supported(&session_req, precompile)?;
         let deposit = self.resolve_deposit(session_req.suggested_deposit.as_deref())?;
         if deposit < amount {
             return Err(MppError::InvalidConfig(format!(
@@ -4329,11 +4595,28 @@ impl TempoSessionProvider {
             )));
         }
 
+        if let (Some(voucher_signer), true) = (
+            self.configurable_voucher_signer.as_ref(),
+            settlement_route.is_some(),
+        ) {
+            // A settlement route fixes the salt, but from T15 a signer with a
+            // configuration commitment must open with it as salt.
+            if voucher_signer
+                .open_salt(&self.rpc_provider)
+                .await?
+                .is_some()
+            {
+                return Err(MppError::InvalidConfig(format!(
+                    "configurable account {} has a configuration commitment, which cannot be combined with a settlement route's salt",
+                    voucher_signer.account()
+                )));
+            }
+        }
         let (mut entry, mut payload) = if precompile {
             let (prefix_calls, route) = self
                 .autoswap_calls(&self.rpc_provider, chain_id, payer, currency, deposit)
                 .await?;
-            create_precompile_open_payload(
+            create_precompile_open_payload_with_voucher_signer(
                 &self.rpc_provider,
                 &self.signer,
                 Some(&self.signing_mode),
@@ -4357,6 +4640,7 @@ impl TempoSessionProvider {
                         )
                     }),
                 },
+                self.configurable_voucher_signer.as_ref(),
             )
             .await?
         } else {
@@ -4528,11 +4812,7 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
-        let lease = self
-            .pending_payment_leases
-            .lock()
-            .unwrap()
-            .remove(&challenge.id);
+        let lease = self.take_lease(challenge, credential);
         if let Some(id) = Self::credential_channel_id(credential) {
             let entry = {
                 let key = self.channel_id_to_key.lock().unwrap().get(&id).cloned();
@@ -4556,11 +4836,7 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
-        let lease = self
-            .pending_payment_leases
-            .lock()
-            .unwrap()
-            .remove(&challenge.id);
+        let lease = self.take_lease(challenge, credential);
         let result = self.rollback_credential(challenge, credential).await;
         drop(lease);
         result
@@ -4571,21 +4847,14 @@ impl PaymentProvider for TempoSessionProvider {
         challenge: &PaymentChallenge,
         credential: &PaymentCredential,
     ) -> Result<(), MppError> {
-        let lease = self
-            .pending_payment_leases
-            .lock()
-            .unwrap()
-            .remove(&challenge.id);
+        let lease = self.take_lease(challenge, credential);
         let result = self.invalidate_credential(challenge, credential).await;
         drop(lease);
         result
     }
 
-    fn abandon_payment(&self, challenge: &PaymentChallenge, _credential: &PaymentCredential) {
-        self.pending_payment_leases
-            .lock()
-            .unwrap()
-            .remove(&challenge.id);
+    fn abandon_payment(&self, challenge: &PaymentChallenge, credential: &PaymentCredential) {
+        drop(self.take_lease(challenge, credential));
     }
 
     async fn prepaid_credential(
@@ -4620,7 +4889,7 @@ impl PaymentProvider for TempoSessionProvider {
         ) {
             return None;
         }
-        // Fail closed: an \`expires\` that does not read as a date counts as expired.
+        // Fail closed: an `expires` that does not read as a date counts as expired.
         if state.challenge.is_expired() {
             self.prepaid.lock().unwrap().remove(context.url.as_str());
             return None;
@@ -4844,6 +5113,33 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let result = TempoSessionProvider::new(signer, "not a url");
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_direct_session_paths_refuse_a_legacy_escaped_challenge() {
+        let provider =
+            TempoSessionProvider::new(PrivateKeySigner::random(), "https://rpc.example.com")
+                .unwrap();
+        let mut challenge = make_scoped_challenge(
+            Address::repeat_byte(1),
+            Address::repeat_byte(2),
+            Address::repeat_byte(3),
+        );
+        challenge.legacy_unicode_escape = true;
+        let channel_id = format!("{:#x}", B256::repeat_byte(4));
+        let errors = [
+            provider
+                .voucher_credential_for_challenge(&challenge, &channel_id, 100)
+                .await
+                .unwrap_err(),
+            provider
+                .close_credential_at_for_challenge(&challenge, &channel_id, 100)
+                .await
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(error.is_legacy_unicode_escape(), "{error}");
+        }
     }
 
     #[test]
@@ -5878,6 +6174,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_preserves_authorized_close_without_allowing_over_cap_payments() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        for limit in [300, 400, 2_000] {
+            let mut provider = make_test_provider()
+                .with_channel_store(Arc::new(MemoryChannelStore::default()))
+                .with_max_deposit(limit);
+            let payee = Address::repeat_byte(0x11);
+            let currency = Address::repeat_byte(0x22);
+            let channel_id = seed_precompile_channel(&provider, payee, currency, 400, 10_000);
+            let entry = provider.channels().into_values().next().unwrap();
+            provider.channels.lock().unwrap().clear();
+            provider.channel_id_to_key.lock().unwrap().clear();
+            let signature = crate::protocol::methods::tempo::precompile_voucher::sign_precompile_voucher_primitive(
+                &provider.signer, channel_id, 400, 42431,
+            ).await.unwrap();
+            let mut challenge =
+                make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            let mut request: serde_json::Value = challenge.request.decode().unwrap();
+            request["methodDetails"]["sessionSnapshot"] = serde_json::json!({
+                "acceptedCumulative": "400", "chainId": 42431, "channelId": channel_id.to_string(),
+                "deposit": "10000", "descriptor": entry.descriptor,
+                "escrow": TIP20_CHANNEL_RESERVE_ADDRESS.to_string(),
+                "highestVoucher": {
+                    "channelId": channel_id.to_string(), "cumulativeAmount": "400",
+                    "signature": alloy::hex::encode_prefixed(signature)
+                },
+                "requiredCumulative": "1300", "settled": "0", "spent": "300"
+            });
+            challenge.request = crate::protocol::core::Base64UrlJson::from_value(&request).unwrap();
+            if limit <= 400 {
+                mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+                let error = provider.pay(&challenge).await.unwrap_err();
+                assert!(error.to_string().contains("max_deposit"));
+                assert!(provider.channels().is_empty());
+                let key = provider.expected_channel_key(&challenge).unwrap().0;
+                assert!(provider.channel_store.get(&key).await.unwrap().is_none());
+            }
+            mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+            let result = provider.restore(&challenge).await;
+            assert!(result.unwrap());
+            assert_eq!(provider.cumulative(), 400);
+            assert!(provider.restore(&challenge).await.unwrap());
+            assert_eq!(provider.cumulative(), 400);
+            provider.channels.lock().unwrap().clear();
+            provider.channel_id_to_key.lock().unwrap().clear();
+            let stored_challenge =
+                make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+            mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+            assert!(provider.restore(&stored_challenge).await.unwrap());
+            assert_eq!(provider.cumulative(), 400);
+            if limit < 400 {
+                let error = provider
+                    .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 100)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("max_deposit"));
+            }
+            provider
+                .close_credential_for_challenge_inner(&challenge, &channel_id.to_string(), None)
+                .await
+                .unwrap();
+            if limit == 2_000 {
+                provider.pay(&challenge).await.unwrap();
+                assert_eq!(provider.cumulative(), 1_400);
+            } else {
+                let error = provider.pay(&challenge).await.unwrap_err();
+                assert!(error.to_string().contains("max_deposit"));
+                assert_eq!(provider.cumulative(), 400);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn close_settles_a_cached_authorization_above_a_lowered_cap() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let provider = make_test_provider().with_max_deposit(300);
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let channel_id = seed_precompile_channel(&provider, payee, currency, 400, 10_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        provider
+            .close_credential_for_challenge_inner(&challenge, &channel_id.to_string(), None)
+            .await
+            .unwrap();
+        let error = provider
+            .close_credential_for_challenge_inner(&challenge, &channel_id.to_string(), Some(401))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds locally authorized"));
+    }
+
+    #[tokio::test]
+    async fn management_error_bodies_are_byte_bounded() {
+        use tokio::io::AsyncWriteExt;
+        for chunked in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let headers = if chunked {
+                    "HTTP/1.1 500 Internal Server Error\r\ntransfer-encoding: chunked\r\n\r\n20000\r\n"
+                } else {
+                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 131072\r\n\r\n"
+                };
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                let _ = socket.write_all(&vec![b'x'; 131_072]).await;
+                // The client must stop at the byte limit without waiting for EOF.
+                std::future::pending::<()>().await;
+            });
+            let provider = make_test_provider();
+            let response = reqwest::get(url).await.unwrap();
+            let body =
+                tokio::time::timeout(Duration::from_secs(2), provider.management_body(response))
+                    .await
+                    .unwrap();
+            assert_eq!(body, "x".repeat(64 * 1024));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn snapshot_recovery_requires_a_configured_origin() {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
@@ -6232,6 +6649,31 @@ mod tests {
             .is_none());
         assert!(provider.channels().is_empty());
         provider = provider.with_origin(&url.parse().unwrap()).unwrap();
+        provider.max_deposit = Some(300);
+        mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
+        assert!(provider
+            .bootstrap(&reqwest::Client::new(), &url)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(provider.cumulative(), 1_000);
+        let challenge = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let key = provider.expected_channel_key(&challenge).unwrap().0;
+        assert!(provider.channel_store.get(&key).await.unwrap().is_some());
+        let error = provider
+            .voucher_credential_for_challenge(&challenge, &channel_id.to_string(), 100)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("max_deposit"));
+        let error = provider.pay(&challenge).await.unwrap_err();
+        assert!(error.to_string().contains("max_deposit"));
+        assert_eq!(provider.cumulative(), 1_000);
+        assert_eq!(provider.channels().len(), 1);
+        provider
+            .close_credential_for_challenge_inner(&challenge, &channel_id.to_string(), None)
+            .await
+            .unwrap();
+        provider.max_deposit = Some(1_000);
         mock_rpc(&mut provider, &[&channel_state_response(10_000)]);
         assert!(provider
             .bootstrap(&reqwest::Client::new(), &url)
@@ -7455,9 +7897,20 @@ mod tests {
 
     #[tokio::test]
     async fn failed_management_top_up_blocks_another_top_up() {
+        failed_management_top_up_blocks_another_top_up_on(|| {
+            MppError::Http("MCP payment management call failed".into())
+        })
+        .await;
+        failed_management_top_up_blocks_another_top_up_on(|| MppError::UnknownPaymentOutcome {
+            reference: Some("req-1".into()),
+        })
+        .await;
+    }
+
+    async fn failed_management_top_up_blocks_another_top_up_on(fail: fn() -> MppError) {
         use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
 
-        struct Failing(Arc<Mutex<usize>>);
+        struct Failing(Arc<Mutex<usize>>, fn() -> MppError);
         impl ManagementTransport for Failing {
             fn send<'a>(
                 &'a self,
@@ -7465,7 +7918,8 @@ mod tests {
                 _credential: &'a PaymentCredential,
             ) -> crate::client::ManagementFuture<'a> {
                 *self.0.lock().unwrap() += 1;
-                Box::pin(async { Err(MppError::Http("MCP payment management call failed".into())) })
+                let error = (self.1)();
+                Box::pin(async move { Err(error) })
             }
         }
 
@@ -7480,7 +7934,7 @@ mod tests {
             &[&channel_state_response(10_000), "0x4a817c800", "0x5208"],
         );
         let sends = Arc::new(Mutex::new(0));
-        let transport = Failing(sends.clone());
+        let transport = Failing(sends.clone(), fail);
 
         let error = provider
             .top_up_with_management(
@@ -7508,6 +7962,134 @@ mod tests {
         assert!(error.to_string().contains("reconcile the pending payment"));
         assert_eq!(*sends.lock().unwrap(), 1);
         assert_eq!(provider.channels().values().next().unwrap().deposit, 10_000);
+    }
+
+    #[tokio::test]
+    async fn unrecorded_top_up_stops_mcp_offer_fallback() {
+        use tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+
+        use crate::client::tempo::session::store::{ChannelStoreError, ChannelStoreResult};
+        use crate::mcp::client::McpPayment;
+
+        /// Reads nothing back and refuses every write, so an accepted top-up
+        /// cannot be recorded.
+        struct ReadOnlyStore;
+
+        #[async_trait::async_trait]
+        impl ChannelStore for ReadOnlyStore {
+            async fn get(&self, _: &str) -> ChannelStoreResult<Option<StoredChannelEntry>> {
+                Ok(None)
+            }
+
+            async fn set(&self, _: &StoredChannelEntry) -> ChannelStoreResult<()> {
+                Err(ChannelStoreError::Io("read-only".into()))
+            }
+
+            async fn set_at(&self, _: &str, _: &StoredChannelEntry) -> ChannelStoreResult<()> {
+                Err(ChannelStoreError::Io("read-only".into()))
+            }
+
+            async fn find_channel(&self, _: B256) -> ChannelStoreResult<Option<String>> {
+                Ok(None)
+            }
+
+            async fn delete(&self, _: &str) -> ChannelStoreResult<()> {
+                Ok(())
+            }
+        }
+
+        /// Accepts every management credential, as a server that applied the top-up.
+        struct Accepting(Arc<Mutex<usize>>);
+        impl ManagementTransport for Accepting {
+            fn send<'a>(
+                &'a self,
+                _challenge: &'a PaymentChallenge,
+                _credential: &'a PaymentCredential,
+            ) -> crate::client::ManagementFuture<'a> {
+                *self.0.lock().unwrap() += 1;
+                Box::pin(async { Ok(None) })
+            }
+        }
+
+        /// The fallback charge offer's provider, which must never be asked to pay.
+        #[derive(Clone)]
+        struct Charge(Arc<Mutex<usize>>);
+        impl PaymentProvider for Charge {
+            fn supports(&self, method: &str, intent: &str) -> bool {
+                method == "tempo" && intent == "charge"
+            }
+            async fn pay(&self, _: &PaymentChallenge) -> Result<PaymentCredential, MppError> {
+                *self.0.lock().unwrap() += 1;
+                Err(MppError::InvalidConfig("fallback offer was paid".into()))
+            }
+        }
+
+        let payee = Address::repeat_byte(0x11);
+        let currency = Address::repeat_byte(0x22);
+        let mut session = make_test_provider().with_channel_store(Arc::new(ReadOnlyStore));
+        // The channel's deposit is spent, so the call needs a top-up first.
+        let channel_id = seed_precompile_channel(&session, payee, currency, 1_000, 1_000);
+        mock_rpc(
+            &mut session,
+            &[&channel_state_response(1_000), "0x4a817c800", "0x5208"],
+        );
+        let offer = make_scoped_challenge(payee, currency, TIP20_CHANNEL_RESERVE_ADDRESS);
+        let charge_offer = PaymentChallenge::new(
+            "charge-offer",
+            "test-realm",
+            "tempo",
+            "charge",
+            crate::protocol::core::Base64UrlJson::from_value(&serde_json::json!({
+                "amount": "1000",
+                "currency": format!("{:#x}", currency),
+                "recipient": format!("{:#x}", payee),
+                "methodDetails": { "chainId": 42431 }
+            }))
+            .unwrap(),
+        );
+        let sends = Arc::new(Mutex::new(0));
+        let charges = Arc::new(Mutex::new(0));
+        let payment = McpPayment::new(
+            crate::client::MultiProvider::new()
+                .with(session.clone())
+                .with(Charge(charges.clone())),
+            PaymentContext {
+                // The offers' realm, so the session offer is not refused as cross-realm.
+                url: "https://test-realm/mcp".parse().unwrap(),
+                headers: reqwest::header::HeaderMap::new(),
+                http_client: None,
+            },
+        );
+
+        let error = payment
+            .prepare_with_management(&[offer, charge_offer], &Accepting(sends.clone()))
+            .await
+            .err()
+            .unwrap();
+
+        assert!(
+            matches!(error, MppError::SessionPaymentOutcomeUnknown { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("could not be recorded"),
+            "{error}"
+        );
+        assert_eq!(*sends.lock().unwrap(), 1);
+        assert_eq!(*charges.lock().unwrap(), 0);
+        // The accepted deposit is kept in memory, so the channel stays usable
+        // and later top-ups are not blocked by the failed store write.
+        assert!(!session
+            .uncertain_top_ups
+            .lock()
+            .unwrap()
+            .contains(&channel_id));
+        let entry = session
+            .channels()
+            .into_values()
+            .find(|entry| entry.channel_id == channel_id)
+            .unwrap();
+        assert!(entry.deposit > 1_000, "deposit {}", entry.deposit);
     }
 
     #[tokio::test]
@@ -9120,6 +9702,47 @@ mod tests {
         provider.abandon_payment(&challenge, &next);
     }
 
+    #[tokio::test]
+    async fn clone_for_another_wallet_does_not_replay_a_pending_native_open() {
+        use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+        let escrow = tempo_alloy::contracts::precompiles::TIP20_CHANNEL_RESERVE_ADDRESS;
+        let mut provider = make_test_provider()
+            .with_allow_custom_escrow(true)
+            .with_default_deposit(10_000);
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x4a817c800"); // eth_gasPrice
+        asserter.push_success(&"0x5208"); // eth_estimateGas
+        for _ in 0..3 {
+            asserter.push_success(&channel_state_response(0));
+        }
+        provider.rpc_provider =
+            ProviderBuilder::<_, _, TempoNetwork>::default().connect_mocked_client(asserter);
+        let challenge = make_scoped_challenge(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            escrow,
+        );
+
+        let credential = provider.pay(&challenge).await.unwrap();
+        provider.abandon_payment(&challenge, &credential);
+
+        let mut other = provider.clone();
+        other.signer = make_test_provider().signer;
+        let error = other.pay(&challenge).await.unwrap_err();
+        assert!(
+            error.to_string().contains("belongs to another wallet"),
+            "{error}"
+        );
+        assert_eq!(provider.pending_opens.lock().unwrap().len(), 1);
+
+        // The wallet that signed it still replays its own open.
+        let retry = provider.pay(&challenge).await.unwrap();
+        assert_eq!(retry.payload, credential.payload);
+        assert_eq!(retry.source, credential.source);
+        provider.abandon_payment(&challenge, &retry);
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn unbound_provider_commits_a_native_open_to_an_origin_stamping_store() {
@@ -9264,6 +9887,43 @@ mod tests {
             if cumulative_amount.parse::<u128>().unwrap() > channel.cumulative_amount)
         );
         provider.abandon_payment(&challenge, &next);
+    }
+
+    /// A Challenge offered again may be paid again after its previous
+    /// credential was released: settling the previous credential leaves the
+    /// new one's payment lease held.
+    #[tokio::test]
+    async fn settling_a_replaced_credential_keeps_the_replacement_lease() {
+        let provider = make_test_provider();
+        let challenge = make_scoped_challenge(
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+            Address::repeat_byte(0x33),
+        );
+        let replaced = PaymentCredential::new(challenge.to_echo(), serde_json::json!({ "n": 1 }));
+        let replacement =
+            PaymentCredential::new(challenge.to_echo(), serde_json::json!({ "n": 2 }));
+        provider.hold_test_lease(&challenge.id, None).await;
+        provider
+            .pending_payment_leases
+            .lock()
+            .unwrap()
+            .get_mut(&challenge.id)
+            .unwrap()
+            .payload = Some(replacement.payload.clone());
+
+        provider.abandon_payment(&challenge, &replaced);
+        provider
+            .rollback_payment(&challenge, &replaced)
+            .await
+            .unwrap();
+        assert!(provider.has_pending_lease(&challenge.id));
+
+        provider
+            .commit_payment(&challenge, &replacement)
+            .await
+            .unwrap();
+        assert!(!provider.has_pending_lease(&challenge.id));
     }
 
     #[tokio::test]
@@ -10715,5 +11375,63 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn configurable_voucher_signer_requires_server_support_before_open() {
+        use crate::protocol::methods::tempo::configurable_account::{
+            ConfigurableAccountConfig, ConfigurableAccountOwner,
+        };
+        let owner = PrivateKeySigner::random();
+        let config = ConfigurableAccountConfig {
+            salt: B256::repeat_byte(1),
+            version: 0,
+            threshold: 1,
+            owners: vec![ConfigurableAccountOwner {
+                owner: owner.address(),
+                weight: 1,
+            }],
+        };
+        let account = config.account_address().unwrap();
+        let signer =
+            configurable::ConfigurableVoucherSigner::new(account, config, [owner]).unwrap();
+        let request = |details: serde_json::Value| SessionRequest {
+            amount: "1".into(),
+            method_details: Some(details),
+            ..Default::default()
+        };
+
+        let plain =
+            TempoSessionProvider::new(PrivateKeySigner::random(), "https://rpc.test.invalid")
+                .unwrap();
+        // Without a configurable signer nothing changes.
+        plain
+            .ensure_configurable_vouchers_supported(&request(serde_json::json!({})), true)
+            .unwrap();
+
+        let provider = plain.with_configurable_voucher_signer(signer);
+        assert_eq!(provider.authorized_signer, Some(account));
+        let err = provider
+            .ensure_configurable_vouchers_supported(&request(serde_json::json!({})), true)
+            .unwrap_err();
+        assert!(err.to_string().contains("configurableVouchers"), "{err}");
+        assert!(provider
+            .ensure_configurable_vouchers_supported(
+                &request(serde_json::json!({ "configurableVouchers": false })),
+                true,
+            )
+            .is_err());
+        assert!(provider
+            .ensure_configurable_vouchers_supported(
+                &request(serde_json::json!({ "configurableVouchers": true })),
+                false,
+            )
+            .is_err());
+        provider
+            .ensure_configurable_vouchers_supported(
+                &request(serde_json::json!({ "configurableVouchers": true })),
+                true,
+            )
+            .unwrap();
     }
 }

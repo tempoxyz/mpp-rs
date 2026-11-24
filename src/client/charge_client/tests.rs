@@ -675,10 +675,12 @@ async fn paid_retries_stop_at_cap_and_do_not_repay_same_challenge() {
             )
             .await
             .unwrap();
-        let expected = if repeat { 1 } else { 2 };
+        // The same Challenge again gets its Credential resent, not paid twice;
+        // either way at most two Credentials are sent.
+        let paid = if repeat { 1 } else { 2 };
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-        assert_eq!(provider.paid.lock().unwrap().len(), expected);
-        assert_eq!(requests.load(Ordering::SeqCst), expected + 1);
+        assert_eq!(provider.paid.lock().unwrap().len(), paid);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
     }
 }
 

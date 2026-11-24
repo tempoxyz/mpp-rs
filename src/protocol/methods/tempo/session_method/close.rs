@@ -383,6 +383,7 @@ where
         // the amount checks report the channel's spent amount, which only the
         // payer may learn.
         let sig_bytes = precompile::parse_signature_for::<P>(escrow, signature_str)?;
+        let opening_commitment = self.resolve_opening_commitment(&channel).await?;
         let is_valid = precompile::verify_voucher_for(
             escrow,
             chain_id,
@@ -390,6 +391,7 @@ where
             cumulative_amount,
             &sig_bytes,
             channel.authorized_signer,
+            &self.voucher_options(opening_commitment),
         );
 
         if !is_valid {
@@ -417,6 +419,12 @@ where
             if !precompile::verify_close_authorization(
                 &close_sig,
                 &[channel.payer, channel.authorized_signer],
+                self.configurable_vouchers().then(|| {
+                    (
+                        channel.authorized_signer,
+                        opening_commitment.unwrap_or_default(),
+                    )
+                }),
                 channel_id_b256,
                 cumulative_amount,
                 escrow,

@@ -137,21 +137,77 @@ pub fn advertised_credential_header(header: Option<&str>) -> Option<String> {
     is_payment_authorization_header(name).then(|| name.to_string())
 }
 
-/// Parse an advertised credential header from the wire, rejecting any value
-/// other than `Payment-Authorization`.
+/// Reason given when a challenge selects a credential header other than
+/// `Payment-Authorization`. The received value is never echoed.
+const UNSUPPORTED_CREDENTIAL_HEADER: &str =
+    "Unsupported credential header: challenges may only select Payment-Authorization";
+
+/// Returns the credential header a locally built challenge advertises.
+///
+/// `Authorization` (any case) is accepted as shorthand for the default and is
+/// not emitted. `Payment-Authorization` (any case) is emitted as stored, since
+/// the challenge id binds that spelling. Servers must not emit any other
+/// value, so it is an error.
+pub(super) fn local_credential_header(
+    header: Option<&str>,
+) -> crate::error::Result<Option<String>> {
+    match header {
+        Some(name) if is_authorization_shorthand(name) => Ok(None),
+        _ => parse_advertised_credential_header(header),
+    }
+}
+
+/// Returns whether a locally set credential header is the `Authorization`
+/// shorthand (any case) for the default, which is never emitted.
+pub(super) fn is_authorization_shorthand(header: &str) -> bool {
+    header.eq_ignore_ascii_case(super::AUTHORIZATION_HEADER)
+}
+
+/// Serde `skip_serializing_if` for a `header` field: omits it when absent or
+/// the `Authorization` shorthand, as `WWW-Authenticate` formatting does.
+pub(super) fn omit_credential_header(header: &Option<String>) -> bool {
+    header.as_deref().is_none_or(is_authorization_shorthand)
+}
+
+/// Serde `serialize_with` for a `header` field: emits
+/// `Payment-Authorization` in the spelling stored, which the challenge id
+/// binds, and fails for any other value instead of sending a header that
+/// receivers reject.
+pub(super) fn serialize_credential_header<S>(
+    header: &Option<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match local_credential_header(header.as_deref()).map_err(serde::ser::Error::custom)? {
+        Some(name) => serializer.serialize_some(&name),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Parse the `header` auth-param of a received challenge or Credential echo.
+///
+/// Validates the raw value before any normalization, as
+/// [draft-httpauth-payment-01](https://paymentauth.org) requires: an absent
+/// value selects the `Authorization` default and returns `None`, and
+/// `Payment-Authorization` (compared ASCII case-insensitively) is returned
+/// unchanged, in the spelling received: clients echo it as sent, and the
+/// challenge id binds it. Any other value, including an explicit
+/// `Authorization` or an empty string, makes the challenge unrecognized and
+/// is rejected, so no Credential is created for it.
 pub fn parse_advertised_credential_header(
     header: Option<&str>,
 ) -> crate::error::Result<Option<String>> {
-    if is_default_credential_header(header) {
+    let Some(name) = header else {
         return Ok(None);
+    };
+    if is_payment_authorization_header(name) {
+        return Ok(Some(name.to_string()));
     }
-    let name = header.unwrap_or("");
-    if !is_payment_authorization_header(name) {
-        return Err(crate::error::MppError::invalid_challenge_reason(
-            "Unsupported credential header: must be Payment-Authorization",
-        ));
-    }
-    Ok(Some(name.to_string()))
+    Err(crate::error::MppError::invalid_challenge_reason(
+        UNSUPPORTED_CREDENTIAL_HEADER,
+    ))
 }
 
 /// Constant-time string comparison to prevent timing attacks.

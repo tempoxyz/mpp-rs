@@ -388,6 +388,9 @@ impl MppChargeRejection {
         error: MppError,
         offers: impl FnOnce() -> Result<Vec<PaymentChallenge>, String>,
     ) -> Self {
+        if let MppError::InvalidConfig(reason) = &error {
+            tracing::error!("mpp: payment route misconfigured: {reason}");
+        }
         if !error.is_payment_problem() || !sends_challenges(&error.to_problem_details(None)) {
             return Self::Problem(PaymentProblem::new(&error, Vec::new()));
         }
@@ -408,7 +411,11 @@ impl IntoResponse for MppChargeRejection {
             MppChargeRejection::VerificationFailed(pr) => {
                 PaymentProblem::new(&MppError::VerificationFailed(None), vec![pr.0]).into_response()
             }
-            MppChargeRejection::InternalError(_) => internal_error_response(),
+            MppChargeRejection::InternalError(reason) => {
+                // Clients get a bare 500; the reason is for the operator.
+                tracing::error!("mpp: payment route failed: {reason}");
+                internal_error_response()
+            }
             MppChargeRejection::Offers(offers) => offers.into_response(),
             MppChargeRejection::VerificationFailedOffers(offers) => {
                 PaymentProblem::new(&MppError::VerificationFailed(None), offers.0).into_response()
@@ -1335,6 +1342,23 @@ async fn verify_route(
         return Err(rejection);
     };
 
+    // Identity needs the parsed Credential after settlement: parse it first, so a
+    // Credential the SDK can't read (such as an old-grammar method) is refused
+    // before a custom challenger settles it.
+    #[cfg(feature = "identity")]
+    let parsed = match call {
+        None => None,
+        Some(_) => match parse_authorization(&credential_str) {
+            Ok(credential) => Some(credential),
+            Err(error) => {
+                let rejection = MppChargeRejection::from_error(error, || {
+                    route_offers(challenger.as_ref(), amount, options, body)
+                });
+                return Err(identity_required(rejection, &mut call));
+            }
+        },
+    };
+
     #[cfg(feature = "identity")]
     let verified = match call
         .as_ref()
@@ -1392,8 +1416,9 @@ async fn verify_route(
         let identified = match call {
             None => crate::identity::IdentityResults::default(),
             Some(call) => {
-                let credential = parse_authorization(&credential_str)
-                    .map_err(|e| MppChargeRejection::InternalError(e.to_string()))?;
+                let credential = parsed.ok_or_else(|| {
+                    MppChargeRejection::InternalError("credential was not parsed".into())
+                })?;
                 // The payment check's memoized outcome: a refusal is sent as is.
                 call.accept(&credential)
                     .await

@@ -51,6 +51,7 @@ pub use error::HttpError;
 pub use flow::{
     is_cross_realm_proof, is_cross_realm_proof_with_trust, send_with_exchange, Exchange, FlowError,
 };
+pub(crate) use provider::resume_pending_settlement;
 pub use provider::{
     ManagementFuture, ManagementTransport, MultiProvider, PaymentContext, PaymentEventFuture,
     PaymentProvider, PendingPayment,
@@ -86,7 +87,9 @@ pub use middleware::PaymentMiddleware;
 #[cfg(feature = "tempo")]
 pub use tempo::session::{channel_ops, TempoSessionProvider};
 #[cfg(feature = "tempo")]
-pub use tempo::{AutoswapConfig, TempoAccountsProvider, TempoClientError, TempoProvider};
+pub use tempo::{
+    AutoswapConfig, TempoAccountsProvider, TempoClientError, TempoProvider, TempoZone,
+};
 #[cfg(feature = "tempo")]
 pub use tempo_alloy::TempoNetwork;
 

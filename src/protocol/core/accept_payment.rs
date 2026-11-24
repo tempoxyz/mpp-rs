@@ -144,7 +144,9 @@ fn parse_entry(part: &str, index: usize) -> Result<Entry, MppError> {
 }
 
 /// Validate that a token is `[a-z0-9-]+` or `*`. Method tokens may also
-/// contain `:` and `_`, which the method name grammar allows.
+/// contain `:` and `_`. This is the preference header's own token syntax:
+/// an entry naming a method outside the Challenge grammar (`1*LOWERALPHA`)
+/// simply matches no Challenge.
 fn validate_token(token: &str, is_method: bool, entry: &str) -> Result<(), MppError> {
     if token == "*" {
         return Ok(());
@@ -375,7 +377,6 @@ fn matches_entry<T: HasMethodIntent>(offer: &T, pref: &Entry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::core::MethodName;
 
     struct Offer {
         method: String,
@@ -473,7 +474,7 @@ mod tests {
         let e = parse("eip155:8453_usdc/charge;q=0.5").unwrap();
         assert_eq!(e[0].method, "eip155:8453_usdc");
         // Accept-Payment keeps its wider token grammar; challenges don't.
-        assert!(!MethodName::new(e[0].method.as_str()).is_valid());
+        assert!(!crate::protocol::core::MethodName::new(e[0].method.as_str()).is_valid());
 
         // The intent token grammar has neither.
         assert!(parse("tempo/char:ge").is_err());

@@ -722,6 +722,11 @@ impl PaymentLayer<ChargeVerifier> {
         M: crate::protocol::traits::ChargeMethod + Clone + Send + Sync + 'static,
         S: Clone + Send + Sync + 'static,
     {
+        // A realm a Challenge header can't carry would make every unpaid
+        // request answer 500 instead of 402: refuse it while the layer is
+        // built. `Mpp::new` and `Mpp::new_with_config` cannot fail.
+        crate::protocol::core::validate_realm(mpp.realm())?;
+
         // Capture route-scoped expected request once so credential verification
         // compares against endpoint configuration, not echoed credential data.
         let expected_request = mpp.expected_charge_request(amount, Default::default())?;
@@ -1627,6 +1632,21 @@ mod tests {
             fn call(&mut self, _req: Request<()>) -> Self::Future {
                 Box::pin(async { Ok(Response::new(())) })
             }
+        }
+
+        #[test]
+        fn test_charge_layer_refuses_a_realm_headers_cannot_carry() {
+            for realm in ["Caf\u{e9} API", "bell\u{7}"] {
+                let mpp = Mpp::new_with_config(
+                    SuccessChargeMethod,
+                    realm,
+                    "test-secret-key-at-least-32-bytes",
+                    "0x20c0000000000000000000000000000000000000",
+                    "0x742d35Cc6634C0532925a3b844Bc9e7595f1B0F2",
+                );
+                assert!(PaymentLayer::charge(&mpp, "0.10").is_err(), "{realm:?}");
+            }
+            assert!(PaymentLayer::charge(&create_mpp_with_mock(), "0.10").is_ok());
         }
 
         #[tokio::test]

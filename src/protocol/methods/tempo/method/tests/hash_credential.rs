@@ -432,12 +432,9 @@ async fn test_store_dedup_different_hashes_independent() {
     assert!(seen.is_some(), "original hash should still be recorded");
 }
 
-/// `ChargeMethod::new` protects against replays without `with_store`: the
-/// same transaction hash is accepted once.
-#[tokio::test]
-async fn test_new_rejects_replayed_hash_by_default() {
-    use alloy::providers::mock::Asserter;
-
+/// A hash Credential for a 1000-unit transfer, and the receipt its lookups
+/// return.
+fn hash_replay_fixture() -> (ChargeRequest, PaymentCredential, serde_json::Value) {
     let currency = Address::repeat_byte(0x20);
     let payer = Address::repeat_byte(0x11);
     let recipient = Address::repeat_byte(0x33);
@@ -486,22 +483,39 @@ async fn test_new_rejects_replayed_hash_by_default() {
         "feePayer": format!("{payer:#x}"),
         "feeToken": format!("{currency:#x}"),
     });
-    let asserter = Asserter::new();
-    // Answer every RPC lookup of both verifications, so only the replay check
-    // can reject the second.
-    for _ in 0..4 {
-        asserter.push_success(&receipt);
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        crate::protocol::core::PaymentPayload::hash(format!("{tx_hash:#x}")),
+    );
+    (request, credential, receipt)
+}
+
+/// A `ChargeMethod::new` whose provider answers `lookups` receipt lookups.
+fn mocked_hash_method(
+    receipt: &serde_json::Value,
+    lookups: usize,
+) -> ChargeMethod<impl alloy::providers::Provider<tempo_alloy::TempoNetwork> + Clone + 'static> {
+    let asserter = alloy::providers::mock::Asserter::new();
+    for _ in 0..lookups {
+        asserter.push_success(receipt);
     }
     let provider =
         alloy::providers::ProviderBuilder::new_with_network::<tempo_alloy::TempoNetwork>()
             .connect_mocked_client(asserter);
     let method = ChargeMethod::new(provider);
     method.cached_chain_id.set(MODERATO_CHAIN_ID).unwrap();
+    method
+}
 
-    let credential = PaymentCredential::new(
-        challenge.to_echo(),
-        crate::protocol::core::PaymentPayload::hash(format!("{tx_hash:#x}")),
-    );
+/// `ChargeMethod::new` protects against replays without `with_store`: the
+/// same transaction hash is accepted once.
+#[tokio::test]
+async fn test_new_rejects_replayed_hash_by_default() {
+    let (request, credential, receipt) = hash_replay_fixture();
+    // Answer every RPC lookup of both verifications, so only the replay check
+    // can reject the second.
+    let method = mocked_hash_method(&receipt, 4);
+
     method.verify(&credential, &request).await.unwrap();
     // A clone shares the default store.
     let err = method
@@ -514,4 +528,30 @@ async fn test_new_rejects_replayed_hash_by_default() {
         Some(crate::protocol::traits::ErrorCode::CredentialReplayed),
         "got: {err}"
     );
+}
+
+/// Instances sharing a store reject a hash replayed on another instance, as in
+/// mppx. Instance-local stores cannot see each other's claims, which is why
+/// `Mpp::create` refuses the default in-memory store in production.
+#[tokio::test]
+async fn test_instances_sharing_a_store_reject_a_replayed_hash() {
+    use crate::store::{MemoryStore, Store};
+
+    let (request, credential, receipt) = hash_replay_fixture();
+
+    let shared: Arc<dyn Store> = Arc::new(MemoryStore::new());
+    let first = mocked_hash_method(&receipt, 2).with_store(Arc::clone(&shared));
+    let second = mocked_hash_method(&receipt, 2).with_store(shared);
+    first.verify(&credential, &request).await.unwrap();
+    let err = second.verify(&credential, &request).await.unwrap_err();
+    assert_eq!(
+        err.code,
+        Some(crate::protocol::traits::ErrorCode::CredentialReplayed),
+        "got: {err}"
+    );
+
+    let first = mocked_hash_method(&receipt, 2);
+    let second = mocked_hash_method(&receipt, 2);
+    first.verify(&credential, &request).await.unwrap();
+    second.verify(&credential, &request).await.unwrap();
 }
