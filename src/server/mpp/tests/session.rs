@@ -717,3 +717,44 @@ async fn test_session_accepts_every_offered_currency_including_existing_channels
         err.message
     );
 }
+
+/// Sessions do not read the charge replay store, so a session handler built
+/// with `Mpp::create` works in production without one.
+#[cfg(feature = "tempo")]
+#[tokio::test]
+async fn test_session_only_handler_needs_no_charge_store_in_production() {
+    let vercel = |name: &str| (name == "VERCEL").then(|| std::ffi::OsString::from("1"));
+    let created = Mpp::create_with_env(
+        tempo(TempoConfig {
+            recipient: TEST_RECIPIENT,
+        })
+        .secret_key(TEST_SECRET),
+        vercel,
+    )
+    .expect("session handler");
+    let base: Mpp<TempoSuccessMethod> = Mpp {
+        method: Arc::new(TempoSuccessMethod),
+        session_method: None,
+        config: created.config,
+        events: created.events,
+    };
+    let mpp = base.with_session_method(MockSessionMethod::success());
+    assert!(mpp.charge("1.00").is_err());
+
+    let challenge = mpp
+        .session_challenge("1000", mpp.currency().unwrap(), TEST_RECIPIENT)
+        .expect("session challenge");
+    let credential = PaymentCredential::new(
+        challenge.to_echo(),
+        serde_json::json!({
+            "action": "open",
+            "type": "transaction",
+            "channelId": "0xabc",
+            "transaction": "0x1234",
+            "cumulativeAmount": "5000",
+            "signature": "0xdef"
+        }),
+    );
+    let verified = mpp.verify_session(&credential).await;
+    assert!(verified.is_ok(), "{:?}", verified.err());
+}

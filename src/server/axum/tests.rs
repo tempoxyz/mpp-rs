@@ -216,6 +216,38 @@ fn test_rejection_internal_error() {
     );
 }
 
+/// A server-side failure is logged for the operator but not sent to the client.
+#[tokio::test]
+async fn test_rejection_internal_error_logs_reason_without_sending_it() {
+    use http_body_util::BodyExt;
+
+    let reason = "tempo has no store configured";
+    let mut resp = None;
+    let logs = crate::server::capture_logs(|| {
+        resp = Some(MppChargeRejection::InternalError(reason.into()).into_response());
+    });
+    assert!(
+        logs.iter()
+            .any(|(level, message)| *level == tracing::Level::ERROR && message.contains(reason)),
+        "{logs:?}"
+    );
+    let resp = resp.unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(!String::from_utf8_lossy(&body).contains(reason));
+
+    let logs = crate::server::capture_logs(|| {
+        let _ = MppChargeRejection::from_error(MppError::InvalidConfig(reason.into()), || {
+            Ok(Vec::new())
+        });
+    });
+    assert!(
+        logs.iter()
+            .any(|(level, message)| *level == tracing::Level::ERROR && message.contains(reason)),
+        "{logs:?}"
+    );
+}
+
 #[test]
 fn test_payment_problem_new_drops_offers_for_final_403() {
     let error = MppError::CredentialReplayed(Some("Transaction hash has already been used".into()));

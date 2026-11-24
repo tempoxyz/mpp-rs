@@ -48,6 +48,9 @@ pub struct TempoBuilder {
     pub(crate) fee_payer_fee_token: Option<Address>,
     pub(crate) remote_fee_payer: Option<TempoRemoteFeePayer>,
     pub(crate) store: Option<std::sync::Arc<dyn crate::store::Store>>,
+    /// Whether [`store`](Self::store) or [`without_store`](Self::without_store)
+    /// was called, so `store` is not the default in-memory one.
+    pub(crate) store_configured: bool,
     pub(crate) relay: Option<TempoRelayConfig>,
     pub(crate) requires_auth: bool,
     pub(crate) zones: Option<crate::protocol::methods::tempo::zone::Zones>,
@@ -221,17 +224,32 @@ impl TempoBuilder {
 
     /// Set the replay-protection store (default: in-memory).
     ///
-    /// Provide a shared backend (Redis, SQL, etc.) for multi-instance deployments.
-    /// The store, the default one included, also makes zero-amount proof
-    /// credentials single-use per challenge.
+    /// Provide a shared backend (Redis, SQL, etc.) so consumed hashes and proofs
+    /// are visible across all server instances. The store, the default one
+    /// included, also makes zero-amount proof credentials single-use per
+    /// challenge.
+    ///
+    /// If omitted, a handler from [`Mpp::create()`](super::Mpp::create)
+    /// logs a warning and refuses to issue or verify charges (mppx refuses to
+    /// start) when `MPP_ENV` or `NODE_ENV` is `production` or one of these
+    /// platform variables is set: `AWS_LAMBDA_FUNCTION_NAME`,
+    /// `DENO_DEPLOYMENT_ID`, `DYNO`, `FLY_APP_NAME`, `K_SERVICE`, `NETLIFY`,
+    /// `RAILWAY_ENVIRONMENT`, `RENDER` or `VERCEL`, unless a relay is
+    /// configured. Sessions, whose method has its own store, are unaffected.
+    /// Otherwise it falls back to an in-memory store, so other multi-instance
+    /// deployments, such as Kubernetes replicas, are not detected and must
+    /// pass a shared store themselves. Pass `Arc::new(MemoryStore::new())`
+    /// explicitly to accept replay protection scoped to one instance.
     pub fn store(mut self, store: std::sync::Arc<dyn crate::store::Store>) -> Self {
         self.store = Some(store);
+        self.store_configured = true;
         self
     }
 
     /// Disable replay-protection storage (removes the default in-memory store).
     pub fn without_store(mut self) -> Self {
         self.store = None;
+        self.store_configured = true;
         self
     }
 
@@ -361,7 +379,9 @@ pub fn tempo(config: TempoConfig<'_>) -> TempoBuilder {
         fee_payer_fee_token: None,
         remote_fee_payer: None,
         // Default in-memory store; replay protection on by default.
+        // Charges refuse it in production (see `default_store_refusal`).
         store: Some(std::sync::Arc::new(crate::store::MemoryStore::new())),
+        store_configured: false,
         relay: None,
         requires_auth: false,
         zones: None,

@@ -386,6 +386,9 @@ impl MppChargeRejection {
         error: MppError,
         offers: impl FnOnce() -> Result<Vec<PaymentChallenge>, String>,
     ) -> Self {
+        if let MppError::InvalidConfig(reason) = &error {
+            tracing::error!("mpp: payment route misconfigured: {reason}");
+        }
         if !error.is_payment_problem() || matches!(error, MppError::CredentialReplayed(_)) {
             return Self::Problem(PaymentProblem::new(&error, Vec::new()));
         }
@@ -406,7 +409,11 @@ impl IntoResponse for MppChargeRejection {
             MppChargeRejection::VerificationFailed(pr) => {
                 PaymentProblem::new(&MppError::VerificationFailed(None), vec![pr.0]).into_response()
             }
-            MppChargeRejection::InternalError(_) => internal_error_response(),
+            MppChargeRejection::InternalError(reason) => {
+                // Clients get a bare 500; the reason is for the operator.
+                tracing::error!("mpp: payment route failed: {reason}");
+                internal_error_response()
+            }
             MppChargeRejection::Offers(offers) => offers.into_response(),
             MppChargeRejection::VerificationFailedOffers(offers) => {
                 PaymentProblem::new(&MppError::VerificationFailed(None), offers.0).into_response()
