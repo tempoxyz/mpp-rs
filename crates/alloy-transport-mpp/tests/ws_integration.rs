@@ -295,6 +295,47 @@ async fn receipt_object_not_acknowledging_payment_does_not_commit() {
 }
 
 #[tokio::test]
+async fn unacknowledged_payment_is_abandoned_at_the_receipt_deadline() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            send_text(&mut ws, json!({ "type": "receipt", "receipt": {} })).await;
+            // Another non-acknowledging Receipt does not extend the deadline.
+            sleep(Duration::from_millis(150)).await;
+            send_text(&mut ws, json!({ "type": "receipt", "receipt": {} })).await;
+            sleep(Duration::from_secs(2)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect =
+        MppWsConnect::new(url, provider.clone()).with_handshake_timeout(Duration::from_millis(300));
+    let mut events = connect.mpp_handle().events;
+    let _connection = connect.connect().await.unwrap();
+
+    let started = Instant::now();
+    loop {
+        let error = next_error(&mut events).await;
+        if error.contains("in time") {
+            break;
+        }
+        assert!(error.contains("does not acknowledge"), "{error}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    timeout(TIMEOUT, async {
+        while provider.abandons.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn unreadable_receipt_keeps_payment_and_connection() {
     let url = spawn_server(|mut ws| {
         Box::pin(async move {
