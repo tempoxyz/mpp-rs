@@ -300,11 +300,52 @@ async fn unacknowledged_payment_is_abandoned_at_the_receipt_deadline() {
         Box::pin(async move {
             send_text(&mut ws, challenge_frame()).await;
             let _credential = recv_value(&mut ws).await;
-            send_text(&mut ws, json!({ "type": "receipt", "receipt": {} })).await;
-            // Another non-acknowledging Receipt does not extend the deadline.
-            sleep(Duration::from_millis(150)).await;
-            send_text(&mut ws, json!({ "type": "receipt", "receipt": {} })).await;
+            // A non-acknowledging Receipt every 150ms for 2s: if each one
+            // extended the deadline, it would fire only ~500ms after the last.
+            for _ in 0..14 {
+                send_text(&mut ws, json!({ "type": "receipt", "receipt": {} })).await;
+                sleep(Duration::from_millis(150)).await;
+            }
             sleep(Duration::from_secs(2)).await;
+        })
+    })
+    .await;
+
+    let provider = LifecycleProvider::default();
+    let connect =
+        MppWsConnect::new(url, provider.clone()).with_handshake_timeout(Duration::from_millis(500));
+    let mut events = connect.mpp_handle().events;
+    let started = Instant::now();
+    let _connection = connect.connect().await.unwrap();
+
+    loop {
+        let error = next_error(&mut events).await;
+        if error.contains("in time") {
+            break;
+        }
+        assert!(error.contains("does not acknowledge"), "{error}");
+    }
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_millis(450), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+    assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
+    timeout(TIMEOUT, async {
+        while provider.abandons.load(Ordering::SeqCst) == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn payment_without_any_receipt_is_abandoned_at_the_receipt_deadline() {
+    let url = spawn_server(|mut ws| {
+        Box::pin(async move {
+            send_text(&mut ws, challenge_frame()).await;
+            let _credential = recv_value(&mut ws).await;
+            sleep(Duration::from_secs(3)).await;
         })
     })
     .await;
@@ -313,17 +354,13 @@ async fn unacknowledged_payment_is_abandoned_at_the_receipt_deadline() {
     let connect =
         MppWsConnect::new(url, provider.clone()).with_handshake_timeout(Duration::from_millis(300));
     let mut events = connect.mpp_handle().events;
+    let started = Instant::now();
     let _connection = connect.connect().await.unwrap();
 
-    let started = Instant::now();
-    loop {
-        let error = next_error(&mut events).await;
-        if error.contains("in time") {
-            break;
-        }
-        assert!(error.contains("does not acknowledge"), "{error}");
-    }
-    assert!(started.elapsed() < Duration::from_secs(1));
+    let error = next_error(&mut events).await;
+    assert!(error.contains("in time"), "{error}");
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     assert_eq!(provider.commits.load(Ordering::SeqCst), 0);
     assert_eq!(provider.rollbacks.load(Ordering::SeqCst), 0);
     timeout(TIMEOUT, async {

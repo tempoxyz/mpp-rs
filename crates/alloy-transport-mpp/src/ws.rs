@@ -338,8 +338,9 @@ impl<P, V> MppWsConnect<P, V> {
     /// Sets the per-phase handshake timeout.
     ///
     /// Bounds the time spent waiting for the server's `challenge` /
-    /// `needVoucher` and for the local `pay()` / `next_voucher()` to complete.
-    /// On expiry the connection is closed with a fatal error and not
+    /// `needVoucher`, for the local `pay()` / `next_voucher()` to complete,
+    /// and for a Receipt that acknowledges a payment after its credential is
+    /// sent. On expiry the connection is closed with a fatal error and not
     /// reconnected.
     pub const fn with_handshake_timeout(mut self, handshake_timeout: Duration) -> Self {
         self.handshake_timeout = handshake_timeout;
@@ -497,13 +498,13 @@ async fn run_translator<P, V>(
     let handshake_deadline = sleep(handshake_timeout);
     pin!(handshake_deadline);
 
-    // Bounds how long a payment may stay pending after the server sent a
-    // Receipt that does not acknowledge it. Armed on the first such Receipt
-    // and never extended by later ones, so a server cannot hold the payment
-    // (and any lease its provider keeps) open indefinitely.
+    // Bounds how long a payment may stay pending without a Receipt that
+    // acknowledges it. Armed when the payment's credential is sent and never
+    // extended by later frames (Receipts that acknowledge nothing included),
+    // so a server cannot hold the payment (and any lease its provider keeps)
+    // open indefinitely. It only fires while a payment is pending.
     let receipt_deadline = sleep(handshake_timeout);
     pin!(receipt_deadline);
-    let mut receipt_deadline_armed = false;
 
     // Off-loop tasks: spawning `pay`/`next_voucher` keeps the keepalive arm
     // responsive while signing/broadcasting takes place.
@@ -521,10 +522,7 @@ async fn run_translator<P, V>(
         let payment_in_flight = pending_pay.is_some() || pending_voucher.is_some();
         let frontend_open = handshake_complete && !payment_in_flight;
         let can_flush = frontend_open && !pending_outbound.is_empty();
-        if payment_awaiting_receipt.is_none() {
-            receipt_deadline_armed = false;
-        }
-        let receipt_deadline_live = receipt_deadline_armed && payment_awaiting_receipt.is_some();
+        let receipt_deadline_live = payment_awaiting_receipt.is_some();
 
         select! {
             biased;
@@ -568,6 +566,9 @@ async fn run_translator<P, V>(
                         handshake_complete = true;
                         credential_awaiting_receipt = true;
                         payment_awaiting_receipt = Some(payment);
+                        receipt_deadline
+                            .as_mut()
+                            .reset(Instant::now() + handshake_timeout);
                     }
                     Ok(Err(err)) => {
                         error!(?err, "MPP payment provider failed");
@@ -645,9 +646,8 @@ async fn run_translator<P, V>(
                 break;
             }
 
-            // 7. A payment the server answered with a non-acknowledging
-            //    Receipt is still unsettled at the deadline: end the
-            //    connection, which abandons the pending payment.
+            // 7. A pending payment is still unacknowledged at the Receipt
+            //    deadline: end the connection, which abandons it.
             _ = &mut receipt_deadline, if receipt_deadline_live => {
                 error!("MPP payment not acknowledged before the Receipt deadline");
                 let _ = events_tx.send(MppEvent::Error(
@@ -662,7 +662,6 @@ async fn run_translator<P, V>(
             resp = socket.next() => {
                 let pay_was_pending = pending_pay.is_some();
                 let voucher_was_pending = pending_voucher.is_some();
-                let mut receipt_skipped = false;
                 match resp {
                     Some(Ok(item)) => {
                         if item.is_pong() {
@@ -680,17 +679,10 @@ async fn run_translator<P, V>(
                             &mut pending_voucher,
                             &mut payment_awaiting_receipt,
                             &mut credential_awaiting_receipt,
-                            &mut receipt_skipped,
                             max_payments,
                             &mut payments_left,
                         ).await {
                             Ok(()) => {
-                                if receipt_skipped && !receipt_deadline_armed {
-                                    receipt_deadline_armed = true;
-                                    receipt_deadline
-                                        .as_mut()
-                                        .reset(Instant::now() + handshake_timeout);
-                                }
                                 // Reset the handshake deadline when a new
                                 // pay()/next_voucher() task is spawned.
                                 let entered_pay = !pay_was_pending && pending_pay.is_some();
@@ -828,7 +820,6 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
     pending_voucher: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
     payment_awaiting_receipt: &mut Option<PendingPayment<P>>,
     credential_awaiting_receipt: &mut bool,
-    receipt_skipped: &mut bool,
     max_payments: usize,
     payments_left: &mut usize,
 ) -> Result<(), TerminationReason> {
@@ -846,7 +837,6 @@ async fn handle_message<P: PaymentProvider + 'static, V: VoucherProvider>(
                 pending_voucher,
                 payment_awaiting_receipt,
                 credential_awaiting_receipt,
-                receipt_skipped,
                 max_payments,
                 payments_left,
             )
@@ -885,7 +875,6 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
     pending_voucher: &mut Option<JoinHandle<Result<PaymentCredential, MppError>>>,
     payment_awaiting_receipt: &mut Option<PendingPayment<P>>,
     credential_awaiting_receipt: &mut bool,
-    receipt_skipped: &mut bool,
     max_payments: usize,
     payments_left: &mut usize,
 ) -> Result<(), TerminationReason> {
@@ -1042,7 +1031,7 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
             // (an empty one, a failed status, another method) acknowledges
             // nothing: it is reported and skipped, and the payment stays
             // pending until a Receipt or an error frame settles it, or the
-            // Receipt deadline the caller arms ends the connection.
+            // Receipt deadline ends the connection.
             if let Some(payment) = payment_awaiting_receipt.as_ref() {
                 if !acknowledges_payment(&receipt, payment.challenge()) {
                     error!("Receipt frame does not acknowledge the pending payment");
@@ -1050,7 +1039,6 @@ async fn handle_text<P: PaymentProvider + 'static, V: VoucherProvider>(
                         "Receipt does not acknowledge the pending payment; payment not committed"
                             .to_owned(),
                     ));
-                    *receipt_skipped = true;
                     return Ok(());
                 }
             }
