@@ -148,7 +148,57 @@ pub(crate) fn is_loopback(url: &str) -> bool {
         .is_ok_and(|url| matches!(url.host_str(), Some("localhost" | "127.0.0.1")))
 }
 
+/// Sends no request for a [loopback](is_loopback) URL through a proxy, and
+/// resolves `localhost` only to this host's loopback addresses, whatever
+/// resolver `builder` or the system sets: such a URL is trusted with
+/// plaintext because it never leaves this host.
+#[cfg(feature = "identity-tempo-id")]
+pub(crate) fn loopback_only(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    // Port 0 keeps the URL's port.
+    builder.no_proxy().resolve_to_addrs(
+        "localhost",
+        &[
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+        ],
+    )
+}
+
 /// The origin of `url`, as `new URL(url).origin` serializes it.
 pub(crate) fn origin_of(url: &reqwest::Url) -> String {
     url.origin().ascii_serialization()
+}
+
+#[cfg(all(test, feature = "identity-tempo-id"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn loopback_only_resolves_localhost_to_this_host() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.read(&mut [0; 1024]);
+                let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n");
+            }
+        });
+        // A resolver that sends localhost off this host is overridden.
+        let elsewhere = std::net::SocketAddr::from(([192, 0, 2, 1], port));
+        let client = loopback_only(
+            reqwest::Client::builder()
+                .resolve("localhost", elsewhere)
+                .timeout(std::time::Duration::from_secs(5)),
+        )
+        .build()
+        .unwrap();
+        let response = client
+            .get(format!("http://localhost:{port}/"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 204);
+    }
 }

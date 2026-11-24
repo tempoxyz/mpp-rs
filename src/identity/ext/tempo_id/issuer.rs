@@ -14,8 +14,8 @@ use super::server::{self, AllowFn, Config, TempoId};
 use super::Payer;
 use crate::identity::ext::attestation::issuer::json_response;
 use crate::identity::ext::attestation::{
-    canonical_issuer, decode, is_issuer, is_loopback, origin_of, AttestationIssuer, IdentityError,
-    SignParameters, SigningKey,
+    canonical_issuer, decode, is_issuer, is_loopback, loopback_only, origin_of, AttestationIssuer,
+    IdentityError, SignParameters, SigningKey,
 };
 use crate::identity::{IdentityRequest, RejectionStatus, Verification, Verifier};
 use crate::store::Store;
@@ -281,9 +281,8 @@ pub fn create(config: IssuerConfig) -> Result<TempoIdIssuer, IdentityError> {
     let tempo_id = config.issuer.as_deref().unwrap_or(super::constants::ISSUER);
     // Plaintext key discovery is safe only on this host, through a client that
     // never sends it to a proxy; an injected client may have one.
-    let plaintext = tempo_id
-        .get(..7)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
+    // Read from the parsed URL, so every spelling the parser accepts counts.
+    let plaintext = reqwest::Url::parse(tempo_id).is_ok_and(|url| url.scheme() == "http");
     let http = match &config.http {
         Some(_) if plaintext => {
             return Err(IdentityError::InvalidConfig(
@@ -294,7 +293,7 @@ pub fn create(config: IssuerConfig) -> Result<TempoIdIssuer, IdentityError> {
         None => {
             let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
             let builder = if is_loopback(tempo_id) {
-                builder.no_proxy()
+                loopback_only(builder)
             } else {
                 builder
             };

@@ -301,6 +301,22 @@ async fn create_checks_urls_and_audiences() {
     // An injected client may use a proxy, so plaintext key discovery refuses one.
     assert!(tempo.url.starts_with("http://"));
     assert!(create_issuer(config(&tempo, ATTEST_URL).http_client(reqwest::Client::new())).is_err());
+    // However the plaintext origin is spelled.
+    for loose in [
+        "http:localhost:8080",
+        "HTTP://localhost:8080",
+        "http:/localhost:8080",
+    ] {
+        assert!(
+            create_issuer(
+                config(&tempo, ATTEST_URL)
+                    .issuer(loose)
+                    .http_client(reqwest::Client::new())
+            )
+            .is_err(),
+            "{loose}"
+        );
+    }
     assert!(create_issuer(
         config(&tempo, ATTEST_URL)
             .issuer("https://id.example")

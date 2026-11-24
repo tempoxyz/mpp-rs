@@ -21,8 +21,8 @@ use crate::identity::client::{
 };
 #[cfg(feature = "identity-attestation")]
 use crate::identity::ext::attestation::{
-    canonical_issuer, decode, is_loopback, origin_of, parse_header, requirements, trim_issuer,
-    AttestationProver, IdentityError, HEADER as ATTESTATION_HEADER, MAX_LENGTH,
+    canonical_issuer, decode, is_loopback, loopback_only, origin_of, parse_header, requirements,
+    trim_issuer, AttestationProver, IdentityError, HEADER as ATTESTATION_HEADER, MAX_LENGTH,
 };
 use crate::identity::BoxFuture;
 use crate::protocol::core::headers::extract_payment_scheme;
@@ -278,7 +278,7 @@ impl AttestConfig {
 
 /// The client for exchanges with `issuer`: it follows no redirects, and a
 /// localhost exchange, allowed over plaintext because the tokens stay on
-/// this host, never goes through a proxy.
+/// this host, never goes through a proxy nor to an address off this host.
 #[cfg(feature = "identity-attestation")]
 fn exchange_client(
     builder: reqwest::ClientBuilder,
@@ -286,7 +286,7 @@ fn exchange_client(
 ) -> Result<reqwest::Client, IdentityError> {
     let builder = builder.redirect(reqwest::redirect::Policy::none());
     let builder = if is_loopback(issuer) {
-        builder.no_proxy()
+        loopback_only(builder)
     } else {
         builder
     };
