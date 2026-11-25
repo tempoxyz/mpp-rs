@@ -37,6 +37,7 @@ impl Token<'_> {
 /// - A word followed by `=` is an auth-param, also where it could start a list
 ///   element: in `a b=c, d = e` the scheme `a` has two auth-params. Only the
 ///   first word of the field value is a scheme whatever follows it.
+#[derive(Clone)]
 pub(super) struct Tokenizer<'a> {
     input: &'a str,
     pos: usize,
@@ -77,6 +78,14 @@ impl<'a> Tokenizer<'a> {
     /// before it.
     pub(super) fn after_comma(&self) -> bool {
         self.after_comma
+    }
+
+    /// Whether another token follows the one returned last with no comma
+    /// between them, such as text right after a closing quote. Reads ahead
+    /// without consuming anything.
+    pub(super) fn glued(&self) -> bool {
+        let mut probe = self.clone();
+        probe.next().is_some() && !probe.after_comma
     }
 
     /// Whether the value of the auth-param returned last was a quoted-string
