@@ -162,16 +162,18 @@ pub trait Prover: Send + Sync {
         Box::pin(std::future::ready(Ok(())))
     }
 
-    /// Inspects a rejected (non-402) response to an unpaid attempt and decides
-    /// whether to resend the request once.
+    /// Inspects a rejected (non-402) response and decides whether to resend
+    /// the request once.
     ///
     /// Return headers to resend with: they are set on the request before
     /// every in-scope prover proves it again. Payment credential headers are
-    /// ignored. Return `None` not to resend. A paid attempt is asked only
-    /// after a 401 with no receipt, and resent with the same Payment
-    /// credential while its Challenge has not expired: servers check other
-    /// authentication before verifying a Payment credential, so a 401 means
-    /// nothing settled.
+    /// ignored. Return `None` not to resend. An unpaid attempt is asked after
+    /// any rejection. A paid attempt is asked only after a 401 with no
+    /// receipt, and resent with the same Payment credential while its
+    /// Challenge has not expired: servers check other authentication before
+    /// verifying a Payment credential, so a 401 means nothing settled. For a
+    /// paid 401, `response` is the head of a bounded copy taken when it
+    /// arrived.
     fn retry<'a>(
         &'a self,
         response: &'a ResponseParts,
@@ -612,13 +614,21 @@ where
         let (Some(original), Some(sent), true) = (original, sent, rejected) else {
             return Ok(response);
         };
+        // A paid 401 is copied, bounded, before the retry hooks run, so its
+        // read deadline starts when it arrives and a slow hook (such as one
+        // waiting for an email OTP) cannot leave an empty copy. The provers
+        // inspect the copy, which is returned if the request is not resent.
+        let response = match &paid_challenge {
+            Some(_) => detach(response).await,
+            None => response,
+        };
         let Some(resend) = resend_headers(self.identity, &response, &sent).await else {
             return Ok(response);
         };
         // The rejected response is released before the provers run again. A
-        // paid attempt keeps a bounded copy to return if it is not resent.
+        // paid attempt keeps its bounded copy to return if it is not resent.
         let fallback = match &paid_challenge {
-            Some(_) => Some(detach(response).await),
+            Some(_) => Some(response),
             None => {
                 drop(response);
                 None
@@ -971,6 +981,68 @@ mod tests {
         assert!(!exchange.unsent());
         assert_eq!(exchange.inner.sent.len(), 1);
         assert_eq!(response.text().await.unwrap(), "token expired");
+    }
+
+    /// Answers with a 401 whose body is past the copy's bound.
+    struct Oversized;
+
+    impl Exchange for Oversized {
+        type Error = HttpError;
+
+        async fn send(&mut self, _request: Request) -> Result<Response, HttpError> {
+            let response = http_types::Response::builder()
+                .status(401)
+                .body(vec![b'x'; MAX_FALLBACK_BYTES + 1])
+                .unwrap();
+            Ok(Response::from(response))
+        }
+    }
+
+    /// Records the response heads its retry hook inspects, and never resends.
+    struct Inspecting(Mutex<Vec<ResponseParts>>);
+
+    impl Prover for Inspecting {
+        fn scope(&self) -> &Scope {
+            &Scope::Any
+        }
+
+        fn prove<'a>(
+            &'a self,
+            _request: &'a mut Request,
+            _context: &'a ProveContext,
+        ) -> BoxFuture<'a, Result<(), ProverError>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn retry<'a>(
+            &'a self,
+            response: &'a ResponseParts,
+            _context: RetryContext<'a>,
+        ) -> BoxFuture<'a, Option<HeaderMap>> {
+            self.0.lock().unwrap().push(response.clone());
+            Box::pin(std::future::ready(None))
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_401_is_copied_before_the_retry_hooks_run() {
+        let inspecting = Arc::new(Inspecting(Mutex::default()));
+        let identity = IdentityClient::new(vec![inspecting.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(Oversized, &identity);
+        let response = exchange
+            .send(paid_get("https://api.example/paid", 300))
+            .await
+            .unwrap();
+        // The hook saw the bounded copy, not the live response.
+        {
+            let seen = inspecting.0.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].headers["mppx-body-truncated"], "true");
+        }
+        // Not resent: the copy is returned.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["mppx-body-truncated"], "true");
+        assert_eq!(response.bytes().await.unwrap().len(), MAX_FALLBACK_BYTES);
     }
 
     /// Refuses every request.
