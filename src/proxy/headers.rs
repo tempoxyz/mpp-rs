@@ -24,6 +24,16 @@ const PAYMENT_HEADERS: &[&str] = &[
     "www-authenticate",
 ];
 
+/// Client-supplied forwarding headers: a client could claim any address or
+/// path through them. `X-Forwarded-*` is stripped by prefix.
+const FORWARDING_HEADERS: &[&str] = &[
+    "cf-connecting-ip",
+    "forwarded",
+    "true-client-ip",
+    "via",
+    "x-real-ip",
+];
+
 /// Identity proofs a client sends the proxy (`Identity.Headers` request
 /// headers, Tempo ID's DPoP proof and ID token), which name the user to the
 /// proxy and never go upstream.
@@ -56,6 +66,9 @@ pub fn is_request_header_stripped(name: &str) -> bool {
         return true;
     }
     if IDENTITY_HEADERS.iter().any(|h| eq_ascii_lower(name, h)) {
+        return true;
+    }
+    if FORWARDING_HEADERS.iter().any(|h| eq_ascii_lower(name, h)) {
         return true;
     }
     if eq_ascii_lower(name, "host")
@@ -455,6 +468,42 @@ mod tests {
     fn test_scrub_request_drops_bare_x_forwarded() {
         assert!(is_request_header_stripped("X-Forwarded-"));
         assert!(is_request_header_stripped("x-forwarded-"));
+    }
+
+    #[test]
+    fn test_scrub_request_drops_client_forwarding_headers() {
+        let mut headers = vec![
+            ("CF-Connecting-IP".into(), "1.2.3.4".into()),
+            ("Forwarded".into(), "for=1.2.3.4".into()),
+            ("True-Client-IP".into(), "1.2.3.4".into()),
+            ("Via".into(), "1.1 client".into()),
+            ("X-Real-IP".into(), "1.2.3.4".into()),
+            ("X-Public".into(), "value".into()),
+        ];
+
+        scrub_request_headers(&mut headers);
+
+        assert_eq!(names(&headers), vec!["x-public".to_string()]);
+    }
+
+    #[test]
+    fn test_client_forwarding_headers_stripped_case_insensitively() {
+        for name in [
+            "forwarded",
+            "FORWARDED",
+            "x-real-ip",
+            "X-REAL-IP",
+            "true-client-ip",
+            "True-Client-Ip",
+            "cf-connecting-ip",
+            "Cf-Connecting-Ip",
+            "via",
+            "VIA",
+        ] {
+            assert!(is_request_header_stripped(name), "{name}");
+        }
+        assert!(!is_request_header_stripped("X-Public"));
+        assert!(!is_request_header_stripped("Viaduct"));
     }
 
     #[test]
