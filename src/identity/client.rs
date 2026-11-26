@@ -162,12 +162,18 @@ pub trait Prover: Send + Sync {
         Box::pin(std::future::ready(Ok(())))
     }
 
-    /// Inspects a rejected (non-402) response to an unpaid attempt and decides
-    /// whether to resend the request once.
+    /// Inspects a rejected (non-402) response and decides whether to resend
+    /// the request once.
     ///
     /// Return headers to resend with: they are set on the request before
     /// every in-scope prover proves it again. Payment credential headers are
-    /// ignored. Return `None` not to resend. Paid attempts are never resent.
+    /// ignored. Return `None` not to resend. An unpaid attempt is asked after
+    /// any rejection. A paid attempt is asked only after a 401 with no
+    /// receipt, and resent with the same Payment credential while its
+    /// Challenge has not expired: servers check other authentication before
+    /// verifying a Payment credential, so a 401 means nothing settled. For a
+    /// paid 401, `response` is the head of a bounded copy taken when it
+    /// arrived.
     fn retry<'a>(
         &'a self,
         response: &'a ResponseParts,
@@ -188,6 +194,16 @@ const CREDENTIAL_HEADERS: &[&str] = &[
 
 /// x402 credential headers; a request carrying one is a paid attempt.
 const X402_CREDENTIAL_HEADERS: &[&str] = &["payment-signature", "x-payment"];
+
+/// Response headers that report a settled payment (MPP receipt, x402
+/// settlement response).
+const SETTLEMENT_HEADERS: &[&str] = &["payment-receipt", "payment-response", "x-payment-response"];
+
+/// The most of a rejected paid attempt's body kept while it is resent.
+const MAX_FALLBACK_BYTES: usize = 64 * 1024;
+
+/// How long reading a rejected paid attempt's body may take.
+const FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Provers applied to every attempt of a request, as mppx's `Identity.Client.from`.
 ///
@@ -277,6 +293,13 @@ impl IdentityClient {
     }
 }
 
+/// An attempt that was not sent although nothing stopped it; never happens.
+fn unsent_resend() -> HttpError {
+    HttpError::Payment(MppError::Internal(
+        "identity attempt was not sent".to_owned(),
+    ))
+}
+
 fn prover_failed(error: ProverError) -> HttpError {
     HttpError::Payment(MppError::Internal(format!(
         "identity prover failed: {error}"
@@ -306,6 +329,105 @@ fn is_paid(request: &Request) -> bool {
                 .and_then(extract_payment_scheme)
                 .is_some()
         })
+}
+
+/// The Challenge a paid attempt may be resent for: the Challenge of the
+/// Payment credential the request carries. A request carrying an x402
+/// credential header is never resent.
+fn resendable_challenge(request: &Request) -> Option<ChallengeEcho> {
+    if X402_CREDENTIAL_HEADERS
+        .iter()
+        .any(|name| request.headers().contains_key(*name))
+    {
+        return None;
+    }
+    credential_challenge(request.headers())
+}
+
+/// Whether a Challenge has an `expires` still in the future.
+fn is_unexpired(challenge: &ChallengeEcho) -> bool {
+    challenge
+        .expires
+        .as_deref()
+        .and_then(|expires| {
+            time::OffsetDateTime::parse(expires, &time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .is_some_and(|expires| expires > time::OffsetDateTime::now_utc())
+}
+
+/// Whether a paid attempt's response may be resent: a 401, which never
+/// follows settlement, carrying no receipt or other settlement header, while
+/// the credential's Challenge has not expired. A 403 can follow a settled
+/// payment, so it is never resent.
+fn can_resend_paid(response: &Response, challenge: &ChallengeEcho) -> bool {
+    response.status() == StatusCode::UNAUTHORIZED
+        && !SETTLEMENT_HEADERS
+            .iter()
+            .any(|name| response.headers().contains_key(*name))
+        && is_unexpired(challenge)
+}
+
+/// Reads a rejected response into a copy, within a size and time bound, and
+/// releases its connection. A body larger than 64 KiB, or still arriving
+/// after 2 seconds, is cut off to what arrived and marked with an
+/// `Mppx-Body-Truncated: true` header, as mppx does.
+async fn detach(mut response: Response) -> Response {
+    use reqwest::ResponseBuilderExt;
+
+    let mut builder = http_types::Response::builder()
+        .status(response.status())
+        .version(response.version())
+        .url(response.url().clone());
+    let mut headers = response.headers().clone();
+    let mut body: Vec<u8> = Vec::new();
+    let mut deadline = fallback_deadline();
+    let read = tokio::select! {
+        biased;
+        read = async {
+            while let Some(chunk) = response.chunk().await? {
+                body.extend_from_slice(&chunk);
+                if body.len() > MAX_FALLBACK_BYTES {
+                    return Ok::<bool, reqwest::Error>(true);
+                }
+            }
+            Ok(false)
+        } => Some(read),
+        _ = &mut deadline => None,
+    };
+    drop(response);
+    if !matches!(read, Some(Ok(false))) {
+        body.truncate(MAX_FALLBACK_BYTES);
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        // A header map already at its size limit returns the copy unmarked
+        // rather than panicking.
+        let _ = headers.try_insert(
+            HeaderName::from_static("mppx-body-truncated"),
+            HeaderValue::from_static("true"),
+        );
+    }
+    if let Some(slot) = builder.headers_mut() {
+        *slot = headers;
+    }
+    match builder.body(body) {
+        Ok(copy) => Response::from(copy),
+        // Every part came from a valid response.
+        Err(_) => Response::from(http_types::Response::new(Vec::new())),
+    }
+}
+
+/// Resolves once [`FALLBACK_TIMEOUT`] passes. It is timed on a thread of its
+/// own rather than a Tokio timer, so a runtime built without one does not
+/// panic; it resolves at once if the thread cannot start.
+fn fallback_deadline() -> tokio::sync::oneshot::Receiver<()> {
+    let (elapsed, deadline) = tokio::sync::oneshot::channel();
+    let _ = std::thread::Builder::new()
+        .name("mpp-identity-fallback".to_owned())
+        .spawn(move || {
+            std::thread::sleep(FALLBACK_TIMEOUT);
+            let _ = elapsed.send(());
+        });
+    deadline
 }
 
 /// An [`Exchange`] that proves every request it sends with an
@@ -341,15 +463,23 @@ where
     X::Error: From<HttpError>,
 {
     /// Proves and sends one attempt, with `headers` set before the provers run.
+    ///
+    /// With `deadline`, the attempt is sent only if that Challenge has not
+    /// expired once the provers ran; otherwise nothing is sent and the result
+    /// is `None`.
     async fn send_once(
         &mut self,
         mut request: Request,
         headers: &[(HeaderName, HeaderValue)],
-    ) -> Result<(Option<Request>, Response), X::Error> {
+        deadline: Option<&ChallengeEcho>,
+    ) -> Result<Option<(Option<Request>, Response)>, X::Error> {
         let scoped = self.identity.in_scope(request.url());
         if scoped.is_empty() {
+            if deadline.is_some_and(|challenge| !is_unexpired(challenge)) {
+                return Ok(None);
+            }
             let sent = request.try_clone();
-            return Ok((sent, self.inner.send(request).await?));
+            return Ok(Some((sent, self.inner.send(request).await?)));
         }
         let challenge = credential_challenge(request.headers());
         // Retry headers never replace a payment credential: the fixed credential
@@ -385,8 +515,12 @@ where
                 return Err(X::Error::from(prover_failed(error)));
             }
         }
+        // The Challenge may expire while provers refresh identity.
+        if deadline.is_some_and(|challenge| !is_unexpired(challenge)) {
+            return Ok(None);
+        }
         let sent = request.try_clone();
-        Ok((sent, self.inner.send(request).await?))
+        Ok(Some((sent, self.inner.send(request).await?)))
     }
 }
 
@@ -468,28 +602,96 @@ where
     async fn send(&mut self, request: Request) -> Result<Response, Self::Error> {
         self.unsent = false;
         let paid = is_paid(&request);
-        // Keep a copy only when the attempt may be resent: paid attempts never are.
-        let original = if paid { None } else { request.try_clone() };
+        // A paid attempt may be resent once, after a 401, only with the
+        // Payment credential for its Challenge and while that Challenge has
+        // not expired: servers check other authentication before verifying a
+        // Payment credential, so a 401 means nothing settled.
+        let paid_challenge = if paid {
+            resendable_challenge(&request).filter(is_unexpired)
+        } else {
+            None
+        };
+        // Keep a copy only when the attempt may be resent.
+        let original = if !paid || paid_challenge.is_some() {
+            request.try_clone()
+        } else {
+            None
+        };
         let carried = self.carried.clone();
-        let (sent, response) = self.send_once(request, &carried).await?;
+        // Without a deadline, an attempt is always sent.
+        let Some((sent, response)) = self.send_once(request, &carried, None).await? else {
+            return Err(X::Error::from(unsent_resend()));
+        };
         let status = response.status();
-        let rejected = (status.is_client_error() || status.is_server_error())
-            && status != StatusCode::PAYMENT_REQUIRED;
+        let rejected = match &paid_challenge {
+            Some(challenge) => can_resend_paid(&response, challenge),
+            None => {
+                !paid
+                    && (status.is_client_error() || status.is_server_error())
+                    && status != StatusCode::PAYMENT_REQUIRED
+            }
+        };
         let (Some(original), Some(sent), true) = (original, sent, rejected) else {
             return Ok(response);
+        };
+        // A paid 401 is copied, bounded, before the retry hooks run, so its
+        // read deadline starts when it arrives and a slow hook (such as one
+        // waiting for an email OTP) cannot leave an empty copy. The provers
+        // inspect the copy, which is returned if the request is not resent.
+        let response = match &paid_challenge {
+            Some(_) => detach(response).await,
+            None => response,
         };
         let Some(resend) = resend_headers(self.identity, &response, &sent).await else {
             return Ok(response);
         };
-        drop(response);
+        // The rejected response is released before the provers run again. A
+        // paid attempt keeps its bounded copy to return if it is not resent.
+        let fallback = match &paid_challenge {
+            Some(_) => Some(response),
+            None => {
+                drop(response);
+                None
+            }
+        };
         // Later headers replace same-named earlier ones.
         let mut headers = carried;
         for (name, value) in resend {
             headers.retain(|(seen, _)| *seen != name);
             headers.push((name, value));
         }
-        self.carried = headers.clone();
-        Ok(self.send_once(original, &headers).await?.1)
+        if fallback.is_none() {
+            self.carried = headers.clone();
+        }
+        match (
+            self.send_once(original, &headers, paid_challenge.as_ref())
+                .await,
+            fallback,
+        ) {
+            (Ok(Some((_, response))), fallback) => {
+                // A later paid attempt carries the headers this one was resent with.
+                self.carried = headers;
+                match fallback {
+                    // A 402 to the resent credential refuses it, possibly as a
+                    // replay of a payment the server settled before its 401.
+                    // Paying the Challenge it offers could pay twice, so the
+                    // 401 stands.
+                    Some(fallback) if response.status() == StatusCode::PAYMENT_REQUIRED => {
+                        Ok(fallback)
+                    }
+                    _ => Ok(response),
+                }
+            }
+            // The Challenge expired, or a prover failed, before the paid
+            // resend left: the 401 stands, and nothing was resent.
+            (Ok(None), Some(fallback)) => Ok(fallback),
+            (Err(_), Some(fallback)) if self.unsent => {
+                self.unsent = false;
+                Ok(fallback)
+            }
+            (Ok(None), None) => Err(X::Error::from(unsent_resend())),
+            (Err(error), _) => Err(error),
+        }
     }
 }
 
@@ -644,6 +846,326 @@ mod tests {
             contexts[0].challenge.as_ref().map(|c| c.id.as_str()),
             Some("challenge-1")
         );
+    }
+
+    /// A request carrying a Payment credential for a Challenge that expires
+    /// `expires_in` seconds from now.
+    fn paid_get(url: &str, expires_in: i64) -> Request {
+        let mut challenge = PaymentChallenge::new(
+            "challenge-1",
+            "api.example",
+            "tempo",
+            "charge",
+            Base64UrlJson::from_value(&serde_json::json!({"amount": "1"})).unwrap(),
+        );
+        challenge.expires = Some(
+            (time::OffsetDateTime::now_utc() + time::Duration::seconds(expires_in))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+        );
+        let credential = PaymentCredential::new(challenge.to_echo(), PaymentPayload::hash("0xabc"));
+        let mut request = get(url);
+        request.headers_mut().insert(
+            "authorization",
+            HeaderValue::from_str(&format_authorization(&credential).unwrap()).unwrap(),
+        );
+        request
+    }
+
+    /// Answers every request with `status` and `headers`, recording what it was sent.
+    struct Answering {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        sent: Vec<Request>,
+    }
+
+    impl Exchange for Answering {
+        type Error = HttpError;
+
+        async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
+            self.sent.push(request);
+            let mut response = http_types::Response::builder().status(self.status);
+            for (name, value) in &self.headers {
+                response = response.header(*name, *value);
+            }
+            Ok(Response::from(response.body("token expired").unwrap()))
+        }
+    }
+
+    fn answering(status: u16, headers: Vec<(&'static str, &'static str)>) -> Answering {
+        Answering {
+            status,
+            headers,
+            sent: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_attempt_is_resent_once_after_a_401_with_the_same_credential() {
+        let recorder = prover(Scope::Any);
+        let identity = IdentityClient::new(vec![recorder.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(answering(401, Vec::new()), &identity);
+        let response = exchange
+            .send(paid_get("https://api.example/paid", 300))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let sent = &exchange.inner.sent;
+        assert_eq!(sent.len(), 2, "resent once");
+        assert_eq!(
+            sent[0].headers()["authorization"],
+            sent[1].headers()["authorization"]
+        );
+        assert!(sent[0].headers().get("x-retry").is_none());
+        assert_eq!(sent[1].headers()["x-retry"], "1");
+        // Identity is proved again for the resend.
+        assert_ne!(sent[0].headers()["x-proof"], sent[1].headers()["x-proof"]);
+        assert_eq!(*recorder.retries.lock().unwrap(), 1);
+        // A later attempt carries the headers the paid attempt was resent with.
+        assert_eq!(exchange.carried.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn paid_attempt_stays_final_when_the_response_may_follow_settlement() {
+        for (status, headers, expires_in) in [
+            (403, Vec::new(), 300),
+            (500, Vec::new(), 300),
+            (401, vec![("payment-receipt", "receipt")], 300),
+            (401, vec![("x-payment-response", "settled")], 300),
+            // The Challenge has expired.
+            (401, Vec::new(), -1),
+        ] {
+            let recorder = prover(Scope::Any);
+            let identity = IdentityClient::new(vec![recorder.clone() as Arc<dyn Prover>]).unwrap();
+            let mut exchange = IdentityExchange::new(answering(status, headers.clone()), &identity);
+            let response = exchange
+                .send(paid_get("https://api.example/paid", expires_in))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(exchange.inner.sent.len(), 1, "{status} {headers:?}");
+            assert_eq!(*recorder.retries.lock().unwrap(), 0, "{status} {headers:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_attempt_with_an_x402_credential_is_never_resent() {
+        let recorder = prover(Scope::Any);
+        let identity = IdentityClient::new(vec![recorder.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(answering(401, Vec::new()), &identity);
+        let mut request = paid_get("https://api.example/paid", 300);
+        request
+            .headers_mut()
+            .insert("x-payment", HeaderValue::from_static("x402"));
+        exchange.send(request).await.unwrap();
+        assert_eq!(exchange.inner.sent.len(), 1);
+        assert_eq!(*recorder.retries.lock().unwrap(), 0);
+    }
+
+    /// Proves the first attempt, then fails, and always asks to resend.
+    struct FailsOnResend(Mutex<usize>);
+
+    impl Prover for FailsOnResend {
+        fn scope(&self) -> &Scope {
+            &Scope::Any
+        }
+
+        fn prove<'a>(
+            &'a self,
+            _request: &'a mut Request,
+            _context: &'a ProveContext,
+        ) -> BoxFuture<'a, Result<(), ProverError>> {
+            let mut proved = self.0.lock().unwrap();
+            *proved += 1;
+            let result = if *proved == 1 {
+                Ok(())
+            } else {
+                Err(ProverError::new("refresh failed"))
+            };
+            Box::pin(std::future::ready(result))
+        }
+
+        fn retry<'a>(
+            &'a self,
+            _response: &'a ResponseParts,
+            _context: RetryContext<'a>,
+        ) -> BoxFuture<'a, Option<HeaderMap>> {
+            Box::pin(std::future::ready(Some(HeaderMap::new())))
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_attempt_returns_the_401_when_reproving_fails() {
+        let identity = IdentityClient::new(vec![
+            Arc::new(FailsOnResend(Mutex::default())) as Arc<dyn Prover>
+        ])
+        .unwrap();
+        let mut exchange = IdentityExchange::new(answering(401, Vec::new()), &identity);
+        let response = exchange
+            .send(paid_get("https://api.example/paid", 300))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!exchange.unsent());
+        assert_eq!(exchange.inner.sent.len(), 1);
+        assert_eq!(response.text().await.unwrap(), "token expired");
+    }
+
+    /// Answers with a 401 whose body is past the copy's bound.
+    struct Oversized;
+
+    impl Exchange for Oversized {
+        type Error = HttpError;
+
+        async fn send(&mut self, _request: Request) -> Result<Response, HttpError> {
+            let response = http_types::Response::builder()
+                .status(401)
+                .body(vec![b'x'; MAX_FALLBACK_BYTES + 1])
+                .unwrap();
+            Ok(Response::from(response))
+        }
+    }
+
+    /// Records the response heads its retry hook inspects, and never resends.
+    struct Inspecting(Mutex<Vec<ResponseParts>>);
+
+    impl Prover for Inspecting {
+        fn scope(&self) -> &Scope {
+            &Scope::Any
+        }
+
+        fn prove<'a>(
+            &'a self,
+            _request: &'a mut Request,
+            _context: &'a ProveContext,
+        ) -> BoxFuture<'a, Result<(), ProverError>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn retry<'a>(
+            &'a self,
+            response: &'a ResponseParts,
+            _context: RetryContext<'a>,
+        ) -> BoxFuture<'a, Option<HeaderMap>> {
+            self.0.lock().unwrap().push(response.clone());
+            Box::pin(std::future::ready(None))
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_401_is_copied_before_the_retry_hooks_run() {
+        let inspecting = Arc::new(Inspecting(Mutex::default()));
+        let identity = IdentityClient::new(vec![inspecting.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(Oversized, &identity);
+        let response = exchange
+            .send(paid_get("https://api.example/paid", 300))
+            .await
+            .unwrap();
+        // The hook saw the bounded copy, not the live response.
+        {
+            let seen = inspecting.0.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].headers["mppx-body-truncated"], "true");
+        }
+        // Not resent: the copy is returned.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.headers()["mppx-body-truncated"], "true");
+        assert_eq!(response.bytes().await.unwrap().len(), MAX_FALLBACK_BYTES);
+    }
+
+    /// Answers the first request with a 401, and every later one with a 402
+    /// offering a fresh Challenge, as a server refusing a replayed credential.
+    struct RefusesTheResend {
+        sent: Vec<Request>,
+    }
+
+    impl Exchange for RefusesTheResend {
+        type Error = HttpError;
+
+        async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
+            self.sent.push(request);
+            let response = if self.sent.len() == 1 {
+                http_types::Response::builder()
+                    .status(401)
+                    .body("token expired")
+            } else {
+                http_types::Response::builder()
+                    .status(402)
+                    .header("www-authenticate", "Payment id=\"fresh\"")
+                    .body("")
+            };
+            Ok(Response::from(response.unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_resend_refused_with_a_402_returns_the_401() {
+        let recorder = prover(Scope::Any);
+        let identity = IdentityClient::new(vec![recorder.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(RefusesTheResend { sent: Vec::new() }, &identity);
+        let response = exchange
+            .send(paid_get("https://api.example/paid", 300))
+            .await
+            .unwrap();
+        // The flow is never handed the fresh Challenge to pay.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(exchange.inner.sent.len(), 2);
+        assert_eq!(response.text().await.unwrap(), "token expired");
+    }
+
+    #[test]
+    fn paid_401_recovery_needs_no_tokio_timer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let recorder = prover(Scope::Any);
+        let identity = IdentityClient::new(vec![recorder.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(answering(401, Vec::new()), &identity);
+        let response = runtime
+            .block_on(exchange.send(paid_get("https://api.example/paid", 300)))
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(exchange.inner.sent.len(), 2, "resent once");
+    }
+
+    /// Answers with an oversized 401 whose header map is already full.
+    struct Crowded;
+
+    impl Exchange for Crowded {
+        type Error = HttpError;
+
+        async fn send(&mut self, _request: Request) -> Result<Response, HttpError> {
+            let mut response = http_types::Response::builder()
+                .status(401)
+                .body(vec![b'x'; MAX_FALLBACK_BYTES + 1])
+                .unwrap();
+            let headers = response.headers_mut();
+            for index in 0.. {
+                let name = HeaderName::from_bytes(format!("x-filler-{index}").as_bytes()).unwrap();
+                if headers
+                    .try_insert(name, HeaderValue::from_static("1"))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Response::from(response))
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_401_copy_with_a_full_header_map_is_returned_unmarked() {
+        let inspecting = Arc::new(Inspecting(Mutex::default()));
+        let identity = IdentityClient::new(vec![inspecting.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(Crowded, &identity);
+        let response = exchange
+            .send(paid_get("https://api.example/paid", 300))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get("mppx-body-truncated").is_none());
+        assert_eq!(response.bytes().await.unwrap().len(), MAX_FALLBACK_BYTES);
     }
 
     /// Refuses every request.
