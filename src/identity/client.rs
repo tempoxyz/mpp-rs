@@ -381,21 +381,27 @@ async fn detach(mut response: Response) -> Response {
         .url(response.url().clone());
     let mut headers = response.headers().clone();
     let mut body: Vec<u8> = Vec::new();
-    let read = tokio::time::timeout(FALLBACK_TIMEOUT, async {
-        while let Some(chunk) = response.chunk().await? {
-            body.extend_from_slice(&chunk);
-            if body.len() > MAX_FALLBACK_BYTES {
-                return Ok::<bool, reqwest::Error>(true);
+    let mut deadline = fallback_deadline();
+    let read = tokio::select! {
+        biased;
+        read = async {
+            while let Some(chunk) = response.chunk().await? {
+                body.extend_from_slice(&chunk);
+                if body.len() > MAX_FALLBACK_BYTES {
+                    return Ok::<bool, reqwest::Error>(true);
+                }
             }
-        }
-        Ok(false)
-    })
-    .await;
+            Ok(false)
+        } => Some(read),
+        _ = &mut deadline => None,
+    };
     drop(response);
-    if !matches!(read, Ok(Ok(false))) {
+    if !matches!(read, Some(Ok(false))) {
         body.truncate(MAX_FALLBACK_BYTES);
         headers.remove(reqwest::header::CONTENT_LENGTH);
-        headers.insert(
+        // A header map already at its size limit returns the copy unmarked
+        // rather than panicking.
+        let _ = headers.try_insert(
             HeaderName::from_static("mppx-body-truncated"),
             HeaderValue::from_static("true"),
         );
@@ -408,6 +414,20 @@ async fn detach(mut response: Response) -> Response {
         // Every part came from a valid response.
         Err(_) => Response::from(http_types::Response::new(Vec::new())),
     }
+}
+
+/// Resolves once [`FALLBACK_TIMEOUT`] passes. It is timed on a thread of its
+/// own rather than a Tokio timer, so a runtime built without one does not
+/// panic; it resolves at once if the thread cannot start.
+fn fallback_deadline() -> tokio::sync::oneshot::Receiver<()> {
+    let (elapsed, deadline) = tokio::sync::oneshot::channel();
+    let _ = std::thread::Builder::new()
+        .name("mpp-identity-fallback".to_owned())
+        .spawn(move || {
+            std::thread::sleep(FALLBACK_TIMEOUT);
+            let _ = elapsed.send(());
+        });
+    deadline
 }
 
 /// An [`Exchange`] that proves every request it sends with an
@@ -648,10 +668,19 @@ where
                 .await,
             fallback,
         ) {
-            (Ok(Some((_, response))), _) => {
+            (Ok(Some((_, response))), fallback) => {
                 // A later paid attempt carries the headers this one was resent with.
                 self.carried = headers;
-                Ok(response)
+                match fallback {
+                    // A 402 to the resent credential refuses it, possibly as a
+                    // replay of a payment the server settled before its 401.
+                    // Paying the Challenge it offers could pay twice, so the
+                    // 401 stands.
+                    Some(fallback) if response.status() == StatusCode::PAYMENT_REQUIRED => {
+                        Ok(fallback)
+                    }
+                    _ => Ok(response),
+                }
             }
             // The Challenge expired, or a prover failed, before the paid
             // resend left: the 401 stands, and nothing was resent.
@@ -1042,6 +1071,100 @@ mod tests {
         // Not resent: the copy is returned.
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(response.headers()["mppx-body-truncated"], "true");
+        assert_eq!(response.bytes().await.unwrap().len(), MAX_FALLBACK_BYTES);
+    }
+
+    /// Answers the first request with a 401, and every later one with a 402
+    /// offering a fresh Challenge, as a server refusing a replayed credential.
+    struct RefusesTheResend {
+        sent: Vec<Request>,
+    }
+
+    impl Exchange for RefusesTheResend {
+        type Error = HttpError;
+
+        async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
+            self.sent.push(request);
+            let response = if self.sent.len() == 1 {
+                http_types::Response::builder()
+                    .status(401)
+                    .body("token expired")
+            } else {
+                http_types::Response::builder()
+                    .status(402)
+                    .header("www-authenticate", "Payment id=\"fresh\"")
+                    .body("")
+            };
+            Ok(Response::from(response.unwrap()))
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_resend_refused_with_a_402_returns_the_401() {
+        let recorder = prover(Scope::Any);
+        let identity = IdentityClient::new(vec![recorder.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(RefusesTheResend { sent: Vec::new() }, &identity);
+        let response = exchange
+            .send(paid_get("https://api.example/paid", 300))
+            .await
+            .unwrap();
+        // The flow is never handed the fresh Challenge to pay.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(exchange.inner.sent.len(), 2);
+        assert_eq!(response.text().await.unwrap(), "token expired");
+    }
+
+    #[test]
+    fn paid_401_recovery_needs_no_tokio_timer() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let recorder = prover(Scope::Any);
+        let identity = IdentityClient::new(vec![recorder.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(answering(401, Vec::new()), &identity);
+        let response = runtime
+            .block_on(exchange.send(paid_get("https://api.example/paid", 300)))
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(exchange.inner.sent.len(), 2, "resent once");
+    }
+
+    /// Answers with an oversized 401 whose header map is already full.
+    struct Crowded;
+
+    impl Exchange for Crowded {
+        type Error = HttpError;
+
+        async fn send(&mut self, _request: Request) -> Result<Response, HttpError> {
+            let mut response = http_types::Response::builder()
+                .status(401)
+                .body(vec![b'x'; MAX_FALLBACK_BYTES + 1])
+                .unwrap();
+            let headers = response.headers_mut();
+            for index in 0.. {
+                let name = HeaderName::from_bytes(format!("x-filler-{index}").as_bytes()).unwrap();
+                if headers
+                    .try_insert(name, HeaderValue::from_static("1"))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Response::from(response))
+        }
+    }
+
+    #[tokio::test]
+    async fn paid_401_copy_with_a_full_header_map_is_returned_unmarked() {
+        let inspecting = Arc::new(Inspecting(Mutex::default()));
+        let identity = IdentityClient::new(vec![inspecting.clone() as Arc<dyn Prover>]).unwrap();
+        let mut exchange = IdentityExchange::new(Crowded, &identity);
+        let response = exchange
+            .send(paid_get("https://api.example/paid", 300))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(response.headers().get("mppx-body-truncated").is_none());
         assert_eq!(response.bytes().await.unwrap().len(), MAX_FALLBACK_BYTES);
     }
 
