@@ -419,13 +419,21 @@ fn read_challenge_flagged(tokens: &mut Tokenizer<'_>) -> Result<(PaymentChalleng
             )));
         }
         // Checked after the length and duplicate checks, which reject cheaply.
-        // An empty unquoted value is still read as "", as mppx reads it.
-        if !tokens.quoted() && !value.is_empty() && !is_token(&value) {
+        // An unquoted value is a token, so it is never empty, as mppx reads it.
+        if !tokens.quoted() && !is_token(&value) {
             return Err(MppError::invalid_challenge_reason(
                 "Invalid auth-param value: expected a token or quoted-string",
             ));
         }
         params.insert(key, value.into_owned());
+    }
+    // A value ends at OWS, then "," or the end of the field value: text right
+    // after a closing quote, or a word after the last auth-param with no
+    // comma before it, is malformed, as mppx reads it.
+    if !params.is_empty() && tokens.glued() {
+        return Err(MppError::invalid_challenge_reason(
+            "Malformed auth-param: expected ',' after a value",
+        ));
     }
 
     let id = require_param!(params, "id").clone();
@@ -2152,16 +2160,58 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_www_authenticate_keeps_empty_trailing_param() {
-        for tail in ["description=", "description=,", "description=,\t"] {
-            let header = format!(
-                r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", {tail}"#
+    fn test_parse_www_authenticate_rejects_empty_unquoted_value() {
+        for header in [
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description="#,
+            r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description=,"#,
+            "Payment id=\"abc\", realm=\"api\", method=\"tempo\", intent=\"charge\", request=\"e30\", description=,\t",
+            r#"Payment id="a", realm=, method="tempo", intent="charge", request="e30""#,
+        ] {
+            let error = parse_www_authenticate(header).unwrap_err().to_string();
+            assert!(error.contains("Invalid auth-param value"), "{header:?}: {error}");
+            assert!(parse_www_authenticate_all([header])[0].is_err(), "{header:?}");
+        }
+        // An empty quoted value is still read as "".
+        let header = r#"Payment id="abc", realm="api", method="tempo", intent="charge", request="e30", description="""#;
+        let parsed = parse_www_authenticate(header).unwrap();
+        assert_eq!(parsed.description.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_rejects_text_after_a_value() {
+        for header in [
+            r#"Payment id="a", method="tempo", intent="charge", request="e30", realm="p"ay.example.com:8443""#,
+            r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30"x"#,
+            r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30" trailing"#,
+            r#"Payment id="a", realm="api", method="tempo", intent="charge", request=e30 Basic realm="x""#,
+        ] {
+            let error = parse_www_authenticate(header).unwrap_err().to_string();
+            assert!(
+                error.contains("Malformed auth-param"),
+                "{header:?}: {error}"
             );
-            let single = parse_www_authenticate(&header).unwrap();
-            assert_eq!(single.description.as_deref(), Some(""), "{header:?}");
-            let all = parse_www_authenticate_all([header.as_str()]);
-            let listed = all[0].as_ref().unwrap();
-            assert_eq!(listed.description.as_deref(), Some(""), "{header:?}");
+            let all = parse_www_authenticate_all([header]);
+            assert!(all[0].is_err(), "{header:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_reads_tokens_and_ows_around_commas() {
+        let header =
+            "Payment id=a ,realm=api.example.com ,  method=tempo,intent=charge , request=e30 ";
+        let parsed = parse_www_authenticate(header).unwrap();
+        assert_eq!(parsed.id, "a");
+        assert_eq!(parsed.realm, "api.example.com");
+        assert_eq!(parsed.method.as_str(), "tempo");
+        assert_eq!(parsed.intent.as_str(), "charge");
+        for header in [
+            r#"Payment id="a", realm="api", method="tempo", intent="charge", request="e30", Basic realm="x""#,
+            r#"Basic realm="x", Payment id="a", realm="api", method="tempo", intent="charge", request="e30""#,
+            "Payment id=a, realm=api, method=tempo, intent=charge, request=e30, Bearer token68==",
+        ] {
+            let all = parse_www_authenticate_all([header]);
+            assert_eq!(all.len(), 1, "{header:?}");
+            assert_eq!(all[0].as_ref().unwrap().realm, "api", "{header:?}");
         }
     }
 
